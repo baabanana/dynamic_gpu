@@ -94,7 +94,7 @@ Ultralytics YOLO：直接用 dgpu 仓库的 `examples/yolo/`，`train.py` 已经
 
 ## 4. 标准流程
 
-1. **报价**：`dgpu offers job.yaml`（AutoDL 加 `--backend autodl`）。把 GPU 型号、每小时价格、预估总价告诉用户，并说明最坏花费是 `offers` 打印的“费用上限”：价格上限 ×（启动最多 20 分钟 + `max_hours` + 收尾时间），2 小时的任务约按 3.4 小时算；每台启动失败被换掉的机器、每次重试还会额外花钱。
+1. **报价**：`dgpu offers job.yaml`（AutoDL 加 `--backend autodl`）。把 GPU 型号、每小时价格、预估总价告诉用户，并说明最坏花费是 `offers` 打印的“费用上限”：价格上限 ×（启动最多 20 分钟 + `max_hours` + 收尾时间），2 小时的任务约按 3.6 小时算；每台启动失败被换掉的机器、每次重试还会额外花钱。
 2. **确认上限**：和用户确认 `max_hours` 和价格上限，用户同意后才提交。新代码先用小的 epoch 和 `max_hours` 跑一次。
 3. **提交**：`dgpu submit job.yaml`。它要等机器启动、机器上的 dgpu 检查过 GPU、磁盘和存储才返回任务 ID（检查不过会自动换机），可能要十几分钟，所以用 Bash 的 `run_in_background: true` 运行。不要随手打断：打断（Ctrl-C，或结束后台任务发出的 SIGTERM）会销毁已创建的机器，任务也就结束了。**绝不** `kill -9` 它：那样没机会销毁机器，只能靠 `dgpu gc`。还没返回时，`dgpu list` 能看到正在启动的任务。
    - 本地数据超过 5 GB 时 `submit` 会要求确认，后台运行没法回答。先用 `du -sh <目录>` 看大小告诉用户，用户同意后加 `--yes`（它也会放行坏掉的符号链接，见第 2 节）。
@@ -117,7 +117,7 @@ Ultralytics YOLO：直接用 dgpu 仓库的 `examples/yolo/`，`train.py` 已经
 | 2 | — | 命令用错了（参数不对、任务不存在），检查命令 |
 | 3 | TIMED_OUT | 到了 `max_hours` 被停止。已上传的输出和 checkpoint 还在：先 `dgpu pull`。要接着训练就问用户，同意后 `dgpu retry <job>` |
 | 4 | CANCELLED | 任务被取消，告诉用户 |
-| 5 | LOST | 确认失联：心跳中断，且平台显示机器已退出或状态未知（或心跳停了约 42 分钟以上）。先 `dgpu gc --dry-run` 和 `dgpu doctor`（看余额），问用户后 `dgpu retry <job>` |
+| 5 | LOST | 确认失联：心跳中断，且平台显示机器已退出或状态未知（或心跳停的时间超过机器上 dgpu 的最坏收尾时间，默认配置下约 37 分钟）。先 `dgpu gc --dry-run` 和 `dgpu doctor`（看余额），问用户后 `dgpu retry <job>` |
 | 6 | SUCCEEDED，但清理遗留机器失败 | 机器可能仍在计费。把以 `!!` 开头的输出告诉用户，运行 `dgpu gc --dry-run`，问用户后 `dgpu gc`；结果照常 `dgpu pull` |
 | 7 | 不知道 | 连续 10 分钟连不上 R2。任务本身不受影响；告诉用户检查网络，恢复后再 `dgpu wait <job>` |
 

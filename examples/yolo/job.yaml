@@ -6,7 +6,11 @@ backend: vast                      # vast 或 autodl；提交时也可以用 --b
 
 image:
   # Vast：公开的 Docker 镜像，必须写固定 tag（不能用 latest）。镜像里要有 python3 和 bash。
-  vast: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+  # 这是 Vast 维护的 PyTorch 镜像（Docker Hub 上的 vastai/pytorch，2026-11-10 确认这个 tag
+  # 存在）。Vast 会在部分机器上预先缓存它的镜像，但不保证你租到的机器上已经有，第一次拉取
+  # 可能要几分钟。镜像里的 Python 是否让训练进程降权运行（还是退回 root）以 `dgpu status`
+  # 里“训练进程”那一行为准。
+  vast: vastai/pytorch:2.14.1-cu126-cuda-12.9-mini-py312-2026-10-23
   # AutoDL：只能用 AutoDL 平台上的镜像，填镜像 UUID。
   # >>> 用 AutoDL 时必须把下面这行换成你自己选的镜像 UUID <<<
   autodl: "<AutoDL 镜像 UUID>"

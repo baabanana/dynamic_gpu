@@ -1,6 +1,6 @@
 # dgpu 对抗式评审问题清单（2026-11-10）
 
-状态：已修复，待复核（A、B 两节已在 `feature/dgpu-mvp` 上修复并配回归测试，全量 1008 个测试通过；第二轮评审复核中；均未在真实平台验证）
+状态：两轮都已在本地修复（A、B 两节在 `feature/dgpu-mvp` 上修复；第二轮复核的 F1–F9 见 E 节，在 `wp/fix-round2` 上修复并配回归测试）；均未在真实平台验证，F7 和 F1 的容器 key 自毁要靠真实实例确认
 关联：[设计文档](dgpu-design.md)、[实施方案](dgpu-implementation-plan.md)
 
 评审对象是提交 `752978a`（7 个工作包合并后、集成之前）。所有问题都在本地模拟中发现，没有连接过真实平台。
@@ -83,3 +83,34 @@ B 组相关的缺口已补（`tests/test_runner_review.py`、`tests/test_runner_
 - 标签解析无歧义，标签查询是精确匹配；两个后端的 `list` 和 `destroy` 都强制 `dgpu-` 前缀。
 - Vast 把无效 key 和“不存在”区分开；`create` 不盲目重试；条件写的 ETag 处理正确。
 - 平台 key 只在请求头里，输出和事件都做了打码；配置文件强制 600 权限。
+
+## E. 第二轮复核（2026-11-10）
+
+复核对象是提交 `6c7a012`（A、B 两节修复之后）。复核者重跑了全部测试，另写了模拟世界里的复现（编排一侧）和真实 runner / watchdog 进程的复现（实例一侧），并逐项读了代码。下表每条都在 `wp/fix-round2` 上修复，回归测试在修复前失败、修复后通过。仍然都只在本地模拟中验证。
+
+| 编号 | 级别 | 问题 | 状态和测试 |
+|---|---|---|---|
+| F1 | 严重 | 结果未知的 `create` 之后换了下一台；先前的实例晚到时没人通知、也不会自毁（启动文档已删，bootstrap 失败后 `runtype=ssh` 的容器一直在），一直计费到 `wait` 收尾或 `gc`；紧接着收到 SIGTERM 时状态是 CANCELLED 且没有任何提示 | 已修复。编排：按标签查满 `create_lookup_s`（默认 120 秒，用户决定），窗口内出现就接管；查不到才记进 `attempt.json` 的 `suspect_labels`、换 attempt 换机；返回前和中止时再查一次，找到就销毁，查不到就提示 10 分钟后 `gc` 并写事件；`status` 列出可疑标签，`wait` 收尾和 `gc` 销毁晚到实例时说明；中止时再按一次 Ctrl-C 跳过等待。实例：bootstrap / boot 在 runner 起来之前放弃时，Vast 上用容器 key 自毁，AutoDL 上退出。`test_orchestrator_round2.py::test_f1_*`；`test_runner_bootstrap.py::test_bootstrap_self_destroys_when_the_launch_document_is_gone`、`test_bootstrap_refuses_a_bundle_with_the_wrong_checksum`、`test_bootstrap_self_destroys_when_the_bundle_code_cannot_be_imported`、`test_bootstrap_on_autodl_gives_up_by_exiting`、`test_bootstrap_self_destroy_retries_a_failing_api_and_stays_bounded`、`test_boot_gives_up_before_the_runner_starts`、`test_bootstrap_starts_the_runner_once_and_a_second_run_does_nothing`（“已有 runner”不自毁）；`test_bundle.py::test_bootstrap_command_fits_with_the_longest_job_id_and_bucket_name` |
+| F2 | 高 | 代码或数据下载失败、且存储对传输不可用时，最终同步对着空的 `output/`、`ckpt/` 重试到 `final_sync_timeout_min`，还写出多余的 `final_sync_failed`；第 5 节 B7 那一行在存储不可用时不成立 | 已修复：是否最终同步只看本地有没有结果；`sync_dir` 没有要传的东西时不调用 rclone。`test_runner_round2.py::test_f2_*` |
+| F3 | 中 | 平台明确拒绝创建（如 Vast 4xx 坏镜像）被当作“结果未知”：查 17 秒标签、作废 attempt、提示 `gc` | 已修复：`BackendError.created`（False = 确定没创建），两个后端在平台回答了拒绝或请求没发出时设置；编排不查标签、不提示 `gc`，直接报平台的原因；超时、断连、5xx 仍是未知。`test_orchestrator_round2.py::test_f3_*`、`test_backend_vast.py::test_f3_*`、`test_backend_autodl.py::test_f3_*` |
+| F4 | 低 | `attempt.json` / `status.json` 建好之后、换机循环之前的信号或异常让状态永远是 PROVISIONING，之后显示 LOST，`wait --retries` 会为用户中断的任务开机器 | 已修复：这段也走中止路径，写 CANCELLED（信号）或 FAILED（出错）。`test_orchestrator_round2.py::test_f4_*` |
+| F5 | 中 | `wait --retries` 确认 LOST 后换机在销毁之前就失败（没有机器、余额不够），已退出但仍按磁盘计费的旧实例没人管，也没有提示 | 已修复：确认失联后先销毁 attempt ≤ 失联 attempt 的实例，不管换机成不成功；销毁失败提示 `gc` 并写 `destroy_failed`。`test_orchestrator_round2.py::test_f5_*` |
+| F6 | 中 | 容器停机超过 watchdog 截止后重启，watchdog 抢先接手，用自己较短的同步时限（默认 10 分钟，runner 是 20 分钟），大结果可能被报成没上传 | 已修复：这种情况下 watchdog 给满 `final_sync_timeout_min` 并重试到时限；上限计入 `watchdog_teardown_worst_case_s` 和 `instance_lifetime_s`（`deadline_at` 随之一致，费用上限的 2 小时示例从约 3.4 小时变成约 3.6 小时）。`test_runner_round2.py::test_f6_*` |
+| F7 | 待真实平台 | 默认的 `vastai/pytorch` 镜像上降权是生效还是退回 root（venv 禁用用户 site 时会退回）不知道 | 行为不变，只让原因看得见：`dgpu status` 的“训练进程：”一行、attempt 日志一行、`run_as_root` 事件的 `reason_text`。YOLO 示例改用固定 tag `vastai/pytorch:2.14.1-cu126-cuda-12.9-mini-py312-2026-10-23`。`test_runner_round2.py::test_f7_fallback_reason_reaches_the_heartbeat_the_event_and_one_log_line`、`test_orchestrator_round2.py::test_f7_status_shows_whether_the_training_runs_as_root_and_why`、`test_examples.py::test_job_yaml_fills_in_both_backends`。真实结果看探针第 5 步 |
+| F8 | 中 | 降权的加固：大数据集上 `chown_tree` 不能被取消或截止打断，容器重启后还会再遍历一遍；CAP_KILL、CAP_DAC_OVERRIDE 是假设没有验证 | 已修复：chown 每 256 个条目检查取消和截止；`run/owner-<目录>.json` 标记让重启后不再遍历；降权前真的以训练用户起一个子进程，确认能读它的 0600 文件、能发信号 0 和 SIGKILL，不行就以 `capability_missing` 退回 root；每种原因都有 `reason_text`。`test_runner_privsep.py::test_f8_*` |
+| F9 | 低 | 文档漂移：4.3 说 `run_as_root` 的 CLI 解析待实现（已实现）；4.5、第 9 节写“约 42 分钟”（公式算出 37.2 分钟）；第 5 节 B7 那一行；4.6、4.8 说晚到的实例会自己隔离（启动文档已删，runner 起不来） | 已修复（设计 4.3–4.8、4.10、第 5、6、8、9 节，`docs/usage.md`、`skills/dgpu/SKILL.md`） |
+
+复核者的结论：**可以做有人值守的小额 Vast 探针；F1、F2 修复前不做无人值守运行。** F1、F2 现在已在本地修复，但容器 key 自毁、bootstrap 放弃路径都还没在真实实例上跑过，先按下面的顺序做探针。
+
+建议的探针顺序（每一步之后都看 Vast 控制台并跑 `dgpu gc --dry-run`）：
+
+0. `dgpu doctor`、`dgpu gc --dry-run`、`dgpu offers`。
+1. `submit` 一个 `sleep 600`、`max_hours: 0.05` 的任务，实例一创建就按 Ctrl-C：实例应该消失，状态 CANCELLED，说明里有实例 ID。
+2. 同样的任务，改用 SIGTERM：同上，退出码 143。
+3. 同样的任务，让它自己到 TIMED_OUT，**不要**跑 `dgpu wait`（它的收尾会掩盖自毁是否生效）；看 `dgpu status` 和控制台，实例应该自己消失。
+4. 记录：标签回读、`dph_total` 和上限的比较、`start_date`、心跳延迟、诊断日志（`logs/attempt-<n>.{runner,watchdog,bootstrap}.log`）。
+5. 降权检查任务：`id -u`、试着读 `launch.json`、`kill -0` runner 的 pid、`nvidia-smi`、在 `/etc/environment` 里 grep `CONTAINER_API_KEY`；看有没有 `run_as_root` 事件和 `dgpu status` 的“训练进程：”一行。
+6. `cancel`，然后 `cancel --force`。
+7. 实例创建后 `kill -9` 掉 `submit`：`gc --dry-run` 应该在启动窗口内保留它，20 分钟后 `gc` 销毁它。
+8. 以上都正常之后，再跑真实任务。
+

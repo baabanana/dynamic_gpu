@@ -127,6 +127,8 @@ def test_job_yaml_fills_in_both_backends(job):
     assert set(images) == set(contracts.BACKENDS)
     repo, _, tag = images["vast"].rpartition(":")
     assert repo and tag and tag != "latest", "Vast 镜像必须写固定 tag"
+    # Vast 维护的镜像，固定 tag（评审 F7；2026-11-10 在 Docker Hub 上确认存在）
+    assert images["vast"] == "vastai/pytorch:2.14.1-cu126-cuda-12.9-mini-py312-2026-10-23"
     assert isinstance(images["autodl"], str) and images["autodl"].strip()
 
     limits = contracts.Limits(**job["limits"])

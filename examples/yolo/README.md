@@ -9,6 +9,8 @@
 | `job.yaml` | 任务描述：镜像、数据、GPU、费用上限 |
 | `train.py` | 训练脚本：读 dgpu 的环境变量，保存 checkpoint，中断后接着跑 |
 
+Vast 上用的镜像是 Vast 维护的 `vastai/pytorch:2.14.1-cu126-cuda-12.9-mini-py312-2026-10-23`（固定 tag，2026-11-10 在 Docker Hub 上确认存在）。Vast 会在部分机器上预先缓存自己的镜像，但不保证租到的那台已经缓存，第一次拉取可能要几分钟。训练进程默认以无特权用户运行；这个镜像的 Python 如果装在 root 拥有、禁用用户 site 的 venv 里，dgpu 会退回 root 运行，`dgpu status` 的“训练进程”一行和日志里会写明原因（尚未在真实实例上确认是哪一种）。
+
 ## 1. 准备
 
 1. 装好 dgpu，`dgpu doctor` 全部通过。见 [使用说明](../../docs/usage.md)。
