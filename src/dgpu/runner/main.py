@@ -37,7 +37,6 @@ from dgpu.runner.logsink import LogSink, Pump
 from dgpu.runner.rclone import Rclone, RcloneError
 from dgpu.runner.util import (
     INTERNAL_ENV,
-    KILL_WAIT_S,
     RCLONE_ENV,
     WORK_ROOT_ENV,
     Clock,
@@ -1092,7 +1091,10 @@ class Runner:
         }
 
     def _child_env(self) -> Dict[str, str]:
+        """训练进程的环境：runner 的环境（去掉凭据和内部变量）→ 训练用户的 HOME、PATH 等
+        → job.yaml 的 env → DGPU_*。"""
         env = self._base_child_env()
+        env.update(self.identity.env)
         dropped = []
         for key, value in (self.spec.get("env") or {}).items():
             if scrubbed(str(key)):
@@ -1104,7 +1106,6 @@ class Runner:
                 "job.yaml 的 env 里这些变量匹配凭据前缀，没有传给训练进程：%s"
                 % ", ".join(sorted(dropped))
             )
-        env.update(self.identity.env)
         env.update(self._dgpu_env())
         env[PATH0_ENV] = env.get("PATH", "")
         return env
@@ -1174,21 +1175,36 @@ class Runner:
             if stop is not None:
                 self._record_stop(stop)
                 result = procs.terminate(
-                    proc.pid, proc.pid, self.settings["term_grace_s"], self.clock, reap=proc.poll
+                    proc.pid,
+                    proc.pid,
+                    self.settings["term_grace_s"],
+                    self.clock,
+                    reap=proc.poll,
+                    kill_wait=self.tuning["kill_wait_s"],
                 )
                 self._note("%s 已终止（%s，%s）" % (step, stop, result))
             elif procs.group_alive(proc.pid):
                 result = procs.terminate(
-                    proc.pid, proc.pid, self.tuning["lingering_grace_s"], self.clock, reap=proc.poll
+                    proc.pid,
+                    proc.pid,
+                    self.tuning["lingering_grace_s"],
+                    self.clock,
+                    reap=proc.poll,
+                    kill_wait=self.tuning["kill_wait_s"],
                 )
                 self._note("%s 结束后清理了残留的子进程（%s）" % (step, result))
-            rc = procs.wait_bounded(proc, KILL_WAIT_S, close_pipes=False)
+            rc = procs.wait_bounded(proc, self.tuning["kill_wait_s"], close_pipes=False)
         finally:
             if proc.poll() is None:
                 procs.terminate(
-                    proc.pid, proc.pid, self.settings["term_grace_s"], self.clock, reap=proc.poll
+                    proc.pid,
+                    proc.pid,
+                    self.settings["term_grace_s"],
+                    self.clock,
+                    reap=proc.poll,
+                    kill_wait=self.tuning["kill_wait_s"],
                 )
-                rc = procs.wait_bounded(proc, KILL_WAIT_S, close_pipes=False)
+                rc = procs.wait_bounded(proc, self.tuning["kill_wait_s"], close_pipes=False)
             self.sampler.stop()
             pump.join(self.tuning["thread_join_s"])
             if pump.is_alive():
@@ -1421,9 +1437,14 @@ class Runner:
         child = self.child
         if child is not None and child.poll() is None:
             procs.terminate(
-                child.pid, child.pid, self.settings["term_grace_s"], self.clock, reap=child.poll
+                child.pid,
+                child.pid,
+                self.settings["term_grace_s"],
+                self.clock,
+                reap=child.poll,
+                kill_wait=self.tuning["kill_wait_s"],
             )
-            procs.wait_bounded(child, KILL_WAIT_S, close_pipes=False)
+            procs.wait_bounded(child, self.tuning["kill_wait_s"], close_pipes=False)
         if self.sampler is not None:
             self.sampler.stop()
 

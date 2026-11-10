@@ -57,6 +57,7 @@ DEFAULT_TUNING = {
     "diag_log_tail_kb": 256.0,  # 上传 runner.log、watchdog.log、bootstrap.log 的最后多少 KB
     "events_flush_interval_s": 30.0,  # 后台上传事件的最长间隔（写事件时立即唤醒）
     "privsep_probe_timeout_s": 60.0,  # 以无特权用户试运行 python3 的时限（见 privsep.py）
+    "kill_wait_s": 5.0,  # 结束进程时 SIGKILL 之后最多等多久（之后放弃，见 procs.py）
 }
 
 # SIGKILL 之后最多等进程消失多久（进程卡在内核里时放弃等待，见 procs.py）
@@ -169,14 +170,14 @@ def short_op_s(tuning: Dict[str, Any]) -> float:
 def teardown_worst_case_s(settings: Dict[str, float], tuning: Dict[str, Any]) -> float:
     """runner 从决定停止（如到达 max_hours）到自毁结束最多用多久：各步骤时限之和。
 
-    结束训练进程（term_grace_s，SIGKILL 后最多等 KILL_WAIT_S，再最多等 KILL_WAIT_S 回收）、
+    结束训练进程（term_grace_s，SIGKILL 后最多等 kill_wait_s，再最多等 kill_wait_s 回收）、
     停后台线程（同步、心跳、事件上传）、写 UPLOADING 和最终同步前读 attempt.json、最终同步
     （final_sync_timeout，output/ 和 ckpt/ 共用）、传日志事件和写最终状态（teardown_budget_s）、
     自毁。没上传的文件按本地的同步记录计算，不访问存储。
     """
     return (
         settings["term_grace_s"]
-        + 2 * KILL_WAIT_S
+        + 2 * tuning["kill_wait_s"]
         + 3 * tuning["thread_join_s"]
         + 2 * short_op_s(tuning)
         + settings["final_sync_timeout_min"] * 60.0
@@ -214,7 +215,7 @@ def watchdog_teardown_worst_case_s(settings: Dict[str, float], tuning: Dict[str,
     """
     return (
         watchdog_kill_grace_s(settings)
-        + 2 * KILL_WAIT_S
+        + 2 * tuning["kill_wait_s"]
         + short_op_s(tuning)
         + watchdog_sync_s(settings, tuning)
         + 2.0  # 每个目录的复制至少给 1 秒

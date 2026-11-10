@@ -316,7 +316,9 @@ class Watchdog:
         except (TypeError, ValueError):
             return
         if pgid > 0 and (procs.group_alive(pgid) or procs.pid_alive(pid)):
-            result = procs.terminate(pgid, pid, grace, self.clock)
+            result = procs.terminate(
+                pgid, pid, grace, self.clock, kill_wait=self.tuning["kill_wait_s"]
+            )
             diag(COMPONENT, "training process group %d: %s" % (pgid, result))
 
     def _kill_runner_rclones(self) -> None:

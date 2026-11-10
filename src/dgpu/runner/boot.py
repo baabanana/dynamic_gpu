@@ -33,7 +33,6 @@ from typing import Any, List, Optional, Tuple
 from dgpu import states
 from dgpu.runner import procs
 from dgpu.runner.util import (
-    KILL_WAIT_S,
     WORK_ROOT_ENV,
     Paths,
     boot_hard_deadline_s,
@@ -369,12 +368,12 @@ class Supervisor:
         except (TypeError, ValueError):
             pgid = 0
         if pgid > 0:
-            procs.terminate(pgid, pgid, 0.0)
+            procs.terminate(pgid, pgid, 0.0, kill_wait=self.tuning["kill_wait_s"])
         for component in ("runner", "watchdog"):
             procs.kill_registered(self.paths.rclone_pids(component))
         for proc in (runner, watchdog):
             if proc is not None:
-                procs.wait_bounded(proc, KILL_WAIT_S)
+                procs.wait_bounded(proc, self.tuning["kill_wait_s"])
 
     def _exit_code(self, runner: subprocess.Popen) -> int:
         final = read_json(self.paths.final)

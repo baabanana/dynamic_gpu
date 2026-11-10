@@ -346,10 +346,11 @@ def terminate(
     clock: Optional[Clock] = None,
     reap: Optional[Callable[[], object]] = None,
     poll_s: float = 0.05,
+    kill_wait: float = KILL_WAIT_S,
 ) -> str:
     """结束进程组 pgid（组长 leader）及其全部后代。
 
-    先 SIGTERM，宽限 grace_s 秒后对还活着的发 SIGKILL，再最多等 KILL_WAIT_S 秒。reap 用来
+    先 SIGTERM，宽限 grace_s 秒后对还活着的发 SIGKILL，再最多等 kill_wait 秒。reap 用来
     回收自己的子进程（否则组长会作为僵尸一直“存在”）。返回 "exited"（本来就没有进程）、
     "terminated"（宽限内退出）、"killed"，或 "stuck"（SIGKILL 之后仍有进程，已放弃等待）。
     """
@@ -375,7 +376,7 @@ def terminate(
         return "terminated"
     targets |= descendants(list(targets), pgid)
     _send(pgid, targets, signal.SIGKILL)
-    end = clock.monotonic() + KILL_WAIT_S
+    end = clock.monotonic() + max(0.0, kill_wait)
     while clock.monotonic() < end:
         if not alive():
             return "killed"

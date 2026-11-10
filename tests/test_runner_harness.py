@@ -61,6 +61,7 @@ FAST_TUNING = {
     "watchdog_spec_wait_s": 30.0,
     "watchdog_sync_timeout_s": 5.0,
     "boot_watchdog_wait_s": 30.0,
+    "kill_wait_s": 1.0,
 }
 
 FAST_RUNNER = {

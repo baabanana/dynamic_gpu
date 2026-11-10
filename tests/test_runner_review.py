@@ -163,6 +163,14 @@ def test_b1_sync_record_rules(tmp_path):
 # ================================================================ B2 / B3
 
 
+def _started_long_ago(h: Harness) -> None:
+    """started.json from an hour ago: the watchdog's hard deadline has already passed."""
+    run_dir = h.work / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    doc = {"attempt": h.attempt, "wall": time.time() - 3600}
+    (run_dir / "started.json").write_text(json.dumps(doc))
+
+
 def _fake_runner(h: Harness) -> subprocess.Popen:
     """A live process that holds runner.alive like the runner does, and keeps 'uploading'."""
     code = textwrap.dedent(
@@ -227,6 +235,7 @@ def test_b2_b3_b12_watchdog_hard_deadline_with_live_slow_runner_and_hung_storage
     (harness.work / "output" / "model.pt").write_text("weights")
     (harness.work / "ckpt").mkdir(exist_ok=True)
     (harness.work / "ckpt" / "last.pt").write_text("ckpt")
+    _started_long_ago(harness)
     runner = _fake_runner(harness)
     rclone = _fake_registered_rclone(harness)
     harness.add_rule("copy", "", mode="hang")
@@ -237,11 +246,8 @@ def test_b2_b3_b12_watchdog_hard_deadline_with_live_slow_runner_and_hung_storage
     started = time.monotonic()
     watchdog.run()
     elapsed = time.monotonic() - started
-    settings = runner_settings(spec)
-    tuning = _tuning(harness)
-    hard = util.watchdog_hard_deadline_s(spec["max_hours"], settings, tuning)
-    worst = util.watchdog_teardown_worst_case_s(settings, tuning)
-    assert elapsed <= hard + worst + 3.0, (elapsed, hard, worst)
+    worst = util.watchdog_teardown_worst_case_s(runner_settings(spec), _tuning(harness))
+    assert elapsed <= worst + 3.0, (elapsed, worst)
     assert runner.wait(5) == -signal.SIGKILL
     assert rclone.wait(5) == -signal.SIGKILL, "the runner's rclone was killed (B12)"
     status = harness.status()  # status writes are not hung: rcat has no rule
@@ -268,6 +274,7 @@ def test_b2_watchdog_hard_deadline_uploads_results_when_storage_works(harness):
         destroy_attempts=1,
         destroy_http_timeout_s=1.0,
     )
+    _started_long_ago(harness)
     _fake_runner(harness)
     watchdog = _watchdog(harness, CountingDestroyer())
     watchdog.run()
@@ -792,6 +799,7 @@ def test_fencing_watchdog_hard_deadline_checks_attempt_json(harness):
         destroy_attempts=1,
         small_op_timeout_s=2.0,
     )
+    _started_long_ago(harness)
     _fake_runner(harness)
     destroyer = CountingDestroyer()
     _watchdog(harness, destroyer).run()
