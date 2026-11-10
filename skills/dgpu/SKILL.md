@@ -19,7 +19,7 @@ dgpu doctor          # 检查配置、R2 读写、平台 API、余额
 - 配置文件不存在：运行 `dgpu init` 生成模板（默认 `~/.config/dgpu/config.toml`，权限 600），然后请用户**自己**打开文件填写：R2 的 endpoint、bucket、access key；Vast API key；AutoDL token（只用一个平台就只填一个）。填完再跑 `dgpu doctor`。
 - 配置文件在别处：`dgpu --config <路径> doctor`，或设置环境变量 `DGPU_CONFIG=<路径>`。
 - **绝不**让用户把密钥贴到对话里；**绝不** `cat`、读取或打印配置文件；密钥不写进 job.yaml、`env`、命令行。
-- `dgpu doctor` 全部通过之前，不提交任务。
+- `dgpu doctor` 全部通过之前，不提交任务。`[警告]` 不算失败：比如 Vast 显示“余额无法查询（key 没有读取账户信息的权限）”时 key 是好的，只是查不到余额；告诉用户提交前要自己确认余额。
 
 ## 2. 写 job.yaml
 
@@ -45,11 +45,14 @@ limits:                         # 必填，没有默认值
   max_cny_per_hour: 2.50        # AutoDL，人民币
 env:                            # 可选，传给训练代码；值写成字符串，不放密钥
   EPOCHS: "100"
+# run_as_root: true             # 可选，默认 false，见下
 ```
+
+- 训练默认以无特权用户运行：`setup` 里 `pip install` 可以用，`apt install` 会失败。需要系统包时优先换一个装好的镜像；确实要 `apt install` 才写 `run_as_root: true`，并先告诉用户代价：训练代码能读到 R2 凭据、能杀掉负责销毁机器的进程。不经用户同意不打开它。
 
 - 必填：`version`、`name`、`backend`（或提交时 `--backend`）、`image`、`run`、`gpu`、`limits`。`code` 默认 `.`。`image` 和价格上限只填要用的后端即可；价格上限是整台机器每小时的总价（全部卡加磁盘；AutoDL 是整个容器，不是每卡）。
 - 镜像里要有 `python3`（3.8 或更新）和 `bash`。Vast 用公开 Docker 镜像，写固定 tag。AutoDL 填镜像 UUID；公共镜像较旧（如 CUDA 11.8、Python 3.8），要新环境得请用户在 AutoDL 网站保存私有镜像。
-- 代码打包：git 仓库里打包 git 跟踪的和没被忽略的文件，否则按 `.dgpuignore`；`.git`、`.env*`、`*.pem`、`*.key` 总是排除，`data` 里在代码目录中的本地目录也不进代码包。超过 200 MB 会报错，所以权重、输出不要放在代码目录里。
+- 代码打包：git 仓库里打包 git 跟踪的和没被忽略的文件，否则按 `.dgpuignore`；`.git`、`.env*`、`*.pem`、`*.key` 总是排除，`data` 里在代码目录中的本地目录也不进代码包。超过 200 MB 会报错，所以权重、输出不要放在代码目录里。代码目录里有坏掉或指向目录外的符号链接时 `submit` 会列出并停下：把列出的链接告诉用户，由用户修好；用户确认不需要它们才加 `--yes`。
 - `data` 每一项拷到 `$DGPU_DATA/<路径最后一段>`；这个名字只能用字母、数字、点、下划线、连字符。大量小文件最好先打成 tar，在 `setup` 里解压。
 - 本地数据里单个文件超过 5 GiB 时 `submit` 直接报错：请用户先用 rclone 传到 bucket，再写成 `r2://<bucket>/<目录>`。`r2://` 的 bucket 不是配置里的 bucket 时 dgpu 会提醒，转告用户确认 R2 token 能读它。
 - 写完先跑 `dgpu offers job.yaml`：它会检查 job.yaml，不花钱。
@@ -90,16 +93,17 @@ Ultralytics YOLO：直接用 dgpu 仓库的 `examples/yolo/`，`train.py` 已经
 
 ## 4. 标准流程
 
-1. **报价**：`dgpu offers job.yaml`（AutoDL 加 `--backend autodl`）。把 GPU 型号、每小时价格、预估总价告诉用户，并说明最坏花费约为“价格上限 × max_hours”。
+1. **报价**：`dgpu offers job.yaml`（AutoDL 加 `--backend autodl`）。把 GPU 型号、每小时价格、预估总价告诉用户，并说明最坏花费是 `offers` 打印的“费用上限”：价格上限 ×（启动最多 20 分钟 + `max_hours` + 收尾时间），2 小时的任务约按 3.4 小时算；每台启动失败被换掉的机器、每次重试还会额外花钱。
 2. **确认上限**：和用户确认 `max_hours` 和价格上限，用户同意后才提交。新代码先用小的 epoch 和 `max_hours` 跑一次。
-3. **提交**：`dgpu submit job.yaml`。它要等机器启动、机器上的 dgpu 检查过 GPU、磁盘和存储才返回任务 ID（检查不过会自动换机），可能要十几分钟，所以用 Bash 的 `run_in_background: true` 运行。不要随手打断：打断会销毁已创建的机器，任务也就结束了。还没返回时，`dgpu list` 能看到正在启动的任务。
-   - 本地数据超过 5 GB 时 `submit` 会要求确认，后台运行没法回答。先用 `du -sh <目录>` 看大小告诉用户，用户同意后加 `--yes`。
+3. **提交**：`dgpu submit job.yaml`。它要等机器启动、机器上的 dgpu 检查过 GPU、磁盘和存储才返回任务 ID（检查不过会自动换机），可能要十几分钟，所以用 Bash 的 `run_in_background: true` 运行。不要随手打断：打断（Ctrl-C，或结束后台任务发出的 SIGTERM）会销毁已创建的机器，任务也就结束了。**绝不** `kill -9` 它：那样没机会销毁机器，只能靠 `dgpu gc`。还没返回时，`dgpu list` 能看到正在启动的任务。
+   - 本地数据超过 5 GB 时 `submit` 会要求确认，后台运行没法回答。先用 `du -sh <目录>` 看大小告诉用户，用户同意后加 `--yes`（它也会放行坏掉的符号链接，见第 2 节）。
+   - 输出里出现“创建结果未知”时，把其中的机器名告诉用户，10 分钟后运行 `dgpu gc --dry-run` 确认，有就问用户后 `dgpu gc`。
 4. **等结果**：`dgpu wait <job>`，同样用 `run_in_background: true`，结束时会收到通知，按第 5 节的退出码处理。不要在前台反复轮询。
 5. **用户问进度时**：`dgpu status <job>`、`dgpu logs <job>`；`dgpu list` 列出所有任务。`dgpu logs <job> -f` 会一直跟随不退出，前台不要用。
 6. **取结果**：`dgpu pull <job> <本地目录>`，把 `$DGPU_OUTPUT` 里的内容下载到 `<本地目录>/output/`（不写目录时是 `./<job>/output/`）；要 checkpoint 加 `--ckpt`。
-7. **收尾**：`dgpu gc --dry-run`，确认没有遗留机器。列出了机器就告诉用户，用户同意后运行 `dgpu gc`。
+7. **收尾**：`dgpu gc --dry-run`，确认没有遗留机器。列出了机器就告诉用户，用户同意后运行 `dgpu gc`。列出“未知任务”（R2 上查不到任务的 dgpu 机器）时，它们可能是用户另一份配置或同事的：告诉用户机器名和存在多久，**只有用户确认是自己的**才运行 `dgpu gc --include-unknown --yes`。
 
-用户要停止任务：`dgpu cancel <job>`，机器上的 dgpu 会先上传已有结果再销毁机器。它不响应时 `dgpu cancel <job> --force` 直接销毁，没上传的结果会丢失，先告诉用户。
+用户要停止任务：`dgpu cancel <job>`，机器上的 dgpu 会先上传已有结果再销毁机器。它不响应时 `dgpu cancel <job> --force` 直接销毁，没上传的结果会丢失，先告诉用户。取消之后、任务结束之前，`dgpu retry` 会拒绝，`wait --retries` 也不会重试：取消优先。
 
 ## 5. 按结果处理
 
@@ -112,9 +116,13 @@ Ultralytics YOLO：直接用 dgpu 仓库的 `examples/yolo/`，`train.py` 已经
 | 2 | — | 命令用错了（参数不对、任务不存在），检查命令 |
 | 3 | TIMED_OUT | 到了 `max_hours` 被停止。已上传的输出和 checkpoint 还在：先 `dgpu pull`。要接着训练就问用户，同意后 `dgpu retry <job>` |
 | 4 | CANCELLED | 任务被取消，告诉用户 |
-| 5 | LOST | 心跳中断：机器宕机、断网或余额耗尽。先 `dgpu gc --dry-run` 和 `dgpu doctor`（看余额），问用户后 `dgpu retry <job>` |
+| 5 | LOST | 确认失联：心跳中断，且平台显示机器已退出或状态未知（或心跳停了约 42 分钟以上）。先 `dgpu gc --dry-run` 和 `dgpu doctor`（看余额），问用户后 `dgpu retry <job>` |
+| 6 | SUCCEEDED，但清理遗留机器失败 | 机器可能仍在计费。把以 `!!` 开头的输出告诉用户，运行 `dgpu gc --dry-run`，问用户后 `dgpu gc`；结果照常 `dgpu pull` |
+| 7 | 不知道 | 连续 10 分钟连不上 R2。任务本身不受影响；告诉用户检查网络，恢复后再 `dgpu wait <job>` |
 
-`retry` 会换一台机器，从 R2 上的 checkpoint 接着跑，用的是提交时打包的代码。用户事先同意自动重试时，可以用 `dgpu wait <job> --retries 1`，失联时自动重试一次。
+`wait` 期间提示“失联（实例仍在运行）”时不要做任何事：机器可能在做最后的上传或暂时连不上 R2，`wait` 会继续等，确认失联后才结束。
+
+`retry` 会换一台机器，从 R2 上的 checkpoint 接着跑，用的是提交时打包的代码。用户事先同意自动重试时，可以用 `dgpu wait <job> --retries 1`，确认失联时自动重试一次。
 
 FAILED 的原因：
 
@@ -164,6 +172,9 @@ FAILED 的原因：
 | `dgpu: command not found` | 在 dgpu 仓库里用 `uv run dgpu ...`，或请用户 `uv tool install .` |
 | `doctor` 说配置文件权限不是 600 | `chmod 600 <配置文件路径>` |
 | `doctor` 说 R2、Vast 或 AutoDL 认证失败 | 请用户检查配置里对应的项；不要读文件 |
+| `doctor` 警告 Vast 余额无法查询 | key 没有读取账户信息的权限（Vast 要求两步验证）。可以继续用；提交前请用户自己在 Vast 控制台看余额 |
+| 提交时说代码目录里有坏掉或指向目录外的符号链接 | 把列出的链接告诉用户；修好或确认不需要后才加 `--yes` |
+| `setup` 里 `apt install` 失败（Permission denied） | 训练默认不以 root 运行。换装好系统包的镜像；或经用户同意加 `run_as_root: true` |
 | `offers` 没有结果 | 价格上限太低、GPU 型号太少或没有库存。告诉用户，由用户决定是否放宽 |
 | 提交时说镜像 tag 不合法 | 写固定 tag，不用 `latest` |
 | 代码包超过 200 MB | 把数据、权重、输出移出代码目录，或写进 `.gitignore` / `.dgpuignore` |

@@ -648,7 +648,8 @@ def test_docs_list_wait_exit_codes_from_states(doc):
     for phase, code in states.EXIT_CODE_BY_PHASE.items():
         row = re.compile(rf"^\|\s*{code}\s*\|\s*{phase}\s*\|", re.MULTILINE)
         assert row.search(text), f"{doc.name} 缺少退出码 {code} = {phase}"
-    assert re.search(rf"^\|\s*{states.EXIT_USAGE}\s*\|", text, re.MULTILINE)
+    for code in (states.EXIT_USAGE, states.EXIT_CLEANUP_FAILED, states.EXIT_STORE_UNREACHABLE):
+        assert re.search(rf"^\|\s*{code}\s*\|", text, re.MULTILINE), f"{doc.name} 缺少退出码 {code}"
 
 
 @pytest.mark.parametrize("path", (*DOCS, TRAIN_PY), ids=lambda path: path.name)

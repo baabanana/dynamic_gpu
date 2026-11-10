@@ -12,26 +12,31 @@
 
 | 编号 | 级别 | 问题 | 位置 | 核实 | 修复方向 | 状态 |
 |---|---|---|---|---|---|---|
-| A1 | 严重 | `submit` / `retry` 启动阶段收到 SIGTERM 或 SIGHUP 时不做任何清理，实例留着计费；之后 `gc --dry-run` 还显示“在启动窗口内，保留” | `cli.py`（无信号处理）、`orchestrator.py` `_abort_launch` | 复现 | `main()` 把 SIGTERM、SIGHUP 转成和 Ctrl-C 相同的中止路径 | 待修 |
-| A2 | 严重 | 创建请求未返回时按 Ctrl-C：只查一次标签就认定没创建，状态写“实例已销毁”，启动文档被删，实例随后出现且不会自毁，也没有提示运行 `gc` | `orchestrator.py` `_abort_launch` | 复现 | 结果未知时按后端的延迟重复查询；查不到就如实写“创建结果未知”，提示 `gc` | 待修 |
-| A3 | 高 | `wait --retries` 在 LOST 时不看取消标记，`retry` 的 bump 还把 `cancel` 清掉，导致取消后又开新实例 | `orchestrator.py` `wait`、`retry` | 复现 | 有取消请求时 `wait` 不重试；`retry` 遇到未完成的取消时拒绝 | 待修 |
-| A4 | 高 | `gc` 的孤儿规则：存储里没有任务目录且实例超过 1 小时就销毁。另一份配置（另一个桶）或共用平台账户的同事的任务会被删；手工命名成 `dgpu-x-a1` 的实例也会被删 | `orchestrator.py` `_gc_decide` | 复现 | 孤儿只报告，不自动销毁（显式参数才销毁）；`gc` 只认 `new_job_id` 形状的任务 ID | 待修 |
-| A5 | 高 | 创建结果不明且标签查询为空后，换下一个 offer 时沿用同一个 attempt 和标签。先前的实例如果晚到，就有两个 runner 写同一个 attempt，`gc` 也分辨不出 | `orchestrator.py` `_try_offer` | 复现 | 只要创建结果不是明确的“被拒绝”，下一次创建前都 bump attempt | 待修 |
-| A6 | 中 | 按旧判断销毁所有 attempt：`wait` 的收尾会销毁并发 `retry` 刚启动的实例；两个 `retry` 并发时输的一方销毁赢的一方的实例 | `orchestrator.py` `_cleanup_after_end`、`_destroy_job_instances` | 复现 | 销毁时带上所依据的 attempt，只销毁不大于它的实例；`attempt.json` 已前进则跳过收尾 | 待修 |
-| A7 | 中 | `wait` 收尾清理遗留实例时吞掉平台错误，返回 SUCCEEDED 且无提示 | `orchestrator.py` `_cleanup_after_end` | 复现 | 清理失败时明确提示并指向 `gc`；`store.delete` 放进同一处理 | 待修 |
-| A8 | 中 | 本地数据大小估算不跟随软链接，上传却跟随：5 GB 确认、磁盘大小计算、AutoDL 50 GB 检查都被绕过 | `orchestrator.py` 数据大小估算、`packaging._walk_dataset` | 复现 | 大小取自 `hash_dataset` 的清单，并复用该清单上传 | 待修 |
-| A9 | 中 | LOST 和 `gc` 的过期判断比较的是本机时钟和实例时钟；10 分钟阈值与“运行中存储断连继续训练”“最终同步可重试 20 分钟”矛盾，`wait --retries` 会销毁仍在训练或上传的实例 | `orchestrator.py` `_view`、`_gc_decide` | 读代码 | 用存储的 `LastModified` 计算过期（`Store` 契约要加）；自动重试前要求平台也显示实例已死，或阈值大于最终同步时限 | 待修 |
-| A10 | 低 | 打包时跳过的文件（指向目录外的软链接等）不提示 | `orchestrator.py`（丢弃 `PackResult`） | 读代码 | 打印 `skipped` | 待修 |
-| A11 | 低 | 费用上限只算 `价格 × max_hours`，没算收尾宽限、失败的 offer 和重试 | `orchestrator.py` | 读代码 | 按截止时间公式和 `max_offers` 计算并说明 | 待修 |
-| A12 | 低 | `retry` 在新 attempt 启动即失败时仍退出 0；`wait` 把存储瞬时错误变成退出码 2（文档里是“用法错误”） | `cli.py` | 读代码 | 修正退出码；`wait` 对瞬时存储错误重试 | 待修 |
+| A1 | 严重 | `submit` / `retry` 启动阶段收到 SIGTERM 或 SIGHUP 时不做任何清理，实例留着计费；之后 `gc --dry-run` 还显示“在启动窗口内，保留” | `cli.py`（无信号处理）、`orchestrator.py` `_abort_launch` | 复现 | `main()` 把 SIGTERM、SIGHUP 转成和 Ctrl-C 相同的中止路径 | 已修复：`test_orchestrator_review.py::test_a1_*`、`test_cli.py::test_submit_destroys_the_instance_on_sigterm_or_sighup`、`test_cli.py::test_cancel_force_on_sigterm_still_destroys`、`test_integration_e2e.py::test_signal_to_a_real_dgpu_submit_destroys_its_instance`（真实 `dgpu submit` 进程）。退出码 143 / 129；SIGKILL 仍由 gc 兜底（已写进文档） |
+| A2 | 严重 | 创建请求未返回时按 Ctrl-C：只查一次标签就认定没创建，状态写“实例已销毁”，启动文档被删，实例随后出现且不会自毁，也没有提示运行 `gc` | `orchestrator.py` `_abort_launch` | 复现 | 结果未知时按后端的延迟重复查询；查不到就如实写“创建结果未知”，提示 `gc` | 已修复：`test_orchestrator_review.py::test_a2_unknown_create_outcome_is_reported_honestly_and_the_late_instance_is_collected`、`test_a2_instance_found_by_a_later_lookup_is_destroyed`。隔 0/2/5/10 秒查 4 次；查不到则写“结果未知”、作废该 attempt（晚到实例被隔离），提示 10 分钟后 `gc` |
+| A3 | 高 | `wait --retries` 在 LOST 时不看取消标记，`retry` 的 bump 还把 `cancel` 清掉，导致取消后又开新实例 | `orchestrator.py` `wait`、`retry` | 复现 | 有取消请求时 `wait` 不重试；`retry` 遇到未完成的取消时拒绝 | 已修复：`test_orchestrator_review.py::test_a3_*`。“未完成”= 有取消标志且当前 attempt 没有终态；任务已结束（含 CANCELLED）时显式 retry 清除标志 |
+| A4 | 高 | `gc` 的孤儿规则：存储里没有任务目录且实例超过 1 小时就销毁。另一份配置（另一个桶）或共用平台账户的同事的任务会被删；手工命名成 `dgpu-x-a1` 的实例也会被删 | `orchestrator.py` `_gc_decide` | 复现 | 孤儿只报告，不自动销毁（显式参数才销毁）；`gc` 只认 `new_job_id` 形状的任务 ID | 已修复：`test_orchestrator_gc.py::test_gc_never_auto_destroys_instances_of_unknown_jobs`、`test_gc_include_unknown_destroys_after_confirmation`、`test_gc_only_handles_labels_with_generated_job_ids`、`test_cli.py::test_gc_reports_unknown_jobs_and_include_unknown_asks_first`。新增 `layout.is_generated_job_id`、`gc --include-unknown [--yes]` |
+| A5 | 高 | 创建结果不明且标签查询为空后，换下一个 offer 时沿用同一个 attempt 和标签。先前的实例如果晚到，就有两个 runner 写同一个 attempt，`gc` 也分辨不出 | `orchestrator.py` `_try_offer` | 复现 | 只要创建结果不是明确的“被拒绝”，下一次创建前都 bump attempt | 已修复：`test_orchestrator_review.py::test_a5_unclear_create_bumps_the_attempt_so_a_late_instance_is_fenced` |
+| A6 | 中 | 按旧判断销毁所有 attempt：`wait` 的收尾会销毁并发 `retry` 刚启动的实例；两个 `retry` 并发时输的一方销毁赢的一方的实例 | `orchestrator.py` `_cleanup_after_end`、`_destroy_job_instances` | 复现 | 销毁时带上所依据的 attempt，只销毁不大于它的实例；`attempt.json` 已前进则跳过收尾 | 已修复：`test_orchestrator_review.py::test_a6_wait_cleanup_does_not_destroy_the_instance_of_a_concurrent_retry`、`test_a6_losing_retry_does_not_destroy_the_winners_instance`（两种交错都是确定性的） |
+| A7 | 中 | `wait` 收尾清理遗留实例时吞掉平台错误，返回 SUCCEEDED 且无提示 | `orchestrator.py` `_cleanup_after_end` | 复现 | 清理失败时明确提示并指向 `gc`；`store.delete` 放进同一处理 | 已修复：`test_orchestrator_review.py::test_a7_*`、`test_cli.py::test_wait_exit_code_6_when_the_job_succeeded_but_cleanup_failed`。任务成功时退出码 6（`states.EXIT_CLEANUP_FAILED`），失败时保持任务的退出码 |
+| A8 | 中 | 本地数据大小估算不跟随软链接，上传却跟随：5 GB 确认、磁盘大小计算、AutoDL 50 GB 检查都被绕过 | `orchestrator.py` 数据大小估算、`packaging._walk_dataset` | 复现 | 大小取自 `hash_dataset` 的清单，并复用该清单上传 | 已修复：`test_orchestrator_review.py::test_a8_size_estimate_follows_symlinks_like_the_upload`、`test_packaging.py::test_upload_from_a_scan_hashes_that_listing_without_walking_again`。新增 `packaging.scan_dataset` 和 `Deps.scan_data` |
+| A9 | 中 | LOST 和 `gc` 的过期判断比较的是本机时钟和实例时钟；10 分钟阈值与“运行中存储断连继续训练”“最终同步可重试 20 分钟”矛盾，`wait --retries` 会销毁仍在训练或上传的实例 | `orchestrator.py` `_view`、`_gc_decide` | 读代码 | 用存储的 `LastModified` 计算过期（`Store` 契约要加）；自动重试前要求平台也显示实例已死，或阈值大于最终同步时限 | 已修复：`test_orchestrator_review.py::test_a9_*`、`test_orchestrator_gc.py::test_gc_heartbeat_rule`、`test_gc_staleness_*`、`test_store.py::test_get_json_meta_*`。新增 `Store.get_json_meta` → `StoredJson`（`LastModified` 和响应的 `Date`，没有 `Date` 时写探针对象） |
+| A10 | 低 | 打包时跳过的文件（指向目录外的软链接等）不提示 | `orchestrator.py`（丢弃 `PackResult`） | 读代码 | 打印 `skipped` | 已修复：`test_orchestrator_review.py::test_a10_*`、`test_cli.py::test_submit_with_a_broken_symlink_needs_yes`、`test_packaging.py::test_symlinks_inside_are_kept_relative_and_outside_are_skipped`。新增 `PackResult.skipped_links` |
+| A11 | 低 | 费用上限只算 `价格 × max_hours`，没算收尾宽限、失败的 offer 和重试 | `orchestrator.py` | 读代码 | 按截止时间公式和 `max_offers` 计算并说明 | 已修复：`test_orchestrator_review.py::test_a11_ceiling_covers_startup_and_teardown_and_mentions_extra_machines`、`test_orchestrator.py::test_insufficient_balance_stops_before_anything_is_created`。上限 = 价格 ×（启动窗口 + `instance_lifetime_s`） |
+| A12 | 低 | `retry` 在新 attempt 启动即失败时仍退出 0；`wait` 把存储瞬时错误变成退出码 2（文档里是“用法错误”） | `cli.py` | 读代码 | 修正退出码；`wait` 对瞬时存储错误重试 | 已修复：`test_cli.py::test_retry_exits_with_the_phase_when_the_new_attempt_ends_before_running`、`test_wait_exit_code_7_when_storage_stays_unreachable`、`test_orchestrator_review.py::test_a12_*`。瞬时存储错误退避重试最多 10 分钟，之后退出码 7（`states.EXIT_STORE_UNREACHABLE`） |
 
 需要真实平台才能确认的怀疑（并入探针）：
 
 - 刚创建的实例短时间内查不到时会被当成已销毁（Vast 404、AutoDL 列表里没有）。建议创建后约 60 秒内忽略 GONE，销毁时总是发送 DELETE。
+  - 状态：本地已防护。创建后 90 秒内 GONE 按等待调度处理；销毁总是发请求（AutoDL 查不到记录也发 DELETE，只在查到记录时核对名称）；销毁后 `get` 和 `list` 都确认消失，平台还从没查到过的实例观察到 90 秒。测试：`test_orchestrator_review.py::test_suspicion_a_*`、`test_backend_autodl.py::test_destroy_sends_delete_for_a_deployment_not_yet_listed`。真实平台的延迟有多长仍需探针。
 - 标签长度或字符集被平台截断、改写。创建后回读标签。
+  - 状态：本地已防护。两个后端的 `get` 返回平台存的标签；不一致时按实例 ID 销毁并让 submit 报错。测试：`test_orchestrator_review.py::test_suspicion_b_altered_label_fails_loudly_and_destroys_by_id`、`test_backend_vast.py::test_get_reports_the_label_the_platform_actually_stored`、`test_backend_autodl.py::test_get_reports_the_name_the_platform_actually_stored`。平台是否真的改写仍需探针。
 - AutoDL Job 在 `cmd` 非 0 退出时是否重启容器（探针 A1）。
+  - 状态：未处理，需要真实平台（探针 A1）。
 - AutoDL 容器列表分页从 0 还是从 1 开始。
+  - 状态：本地已防护，不猜：第 1 页空而 `result_total` 不为 0 时改从 0 开始；翻完条数不够时补读第 0 页并去重。测试：`test_backend_autodl.py::test_list_handles_zero_based_paging_without_guessing`、`test_get_sees_containers_on_a_zero_based_container_list`。真实行为仍需探针。
 - Vast 搜索到创建之间价格变化。创建后比较实际价格，超过上限就销毁。
+  - 状态：本地已防护。启动轮询里第一次拿到实例价格时和上限比较，高于上限就销毁、写 `offer_rejected`、换下一台（attempt + 1）。测试：`test_orchestrator_review.py::test_suspicion_e_*`。Vast 实例行里 `dph_total` 的口径（是否含存储）仍需探针确认。
 
 ## B. 容器内 runner、watchdog、bundle
 

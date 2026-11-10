@@ -156,21 +156,31 @@ model.train(data=f"{os.environ['DGPU_DATA']}/coco8/data.yaml", epochs=100, exist
 |---|---|
 | `dgpu doctor` | 检查平台 API、存储读写、账户余额 |
 | `dgpu offers job.yaml` | 列出候选机器和预估费用，不花钱 |
-| `dgpu submit job.yaml [--backend vast\|autodl]` | 打包、创建实例，等到 runner 通过 preflight 后返回 job ID |
-| `dgpu wait <job> [--retries N]` | 前台等到结束，退出码反映结果；`LOST` 时自动重试 N 次 |
+| `dgpu submit job.yaml [--backend vast\|autodl] [--yes]` | 打包、创建实例，等到 runner 通过 preflight 后返回 job ID |
+| `dgpu wait <job> [--retries N]` | 前台等到结束，退出码反映结果；确认失联（`LOST`）时自动重试 N 次，有未完成的取消请求时不重试 |
 | `dgpu status` / `dgpu logs [-f]` / `dgpu list` | 查询 |
-| `dgpu retry <job>` | 确认旧实例已销毁，attempt + 1，换机重跑并恢复 checkpoint |
+| `dgpu retry <job>` | 确认旧实例已销毁，attempt + 1，换机重跑并恢复 checkpoint；取消请求未完成时拒绝 |
 | `dgpu cancel <job> [--force]` | 默认由 runner 收尾；`--force` 直接销毁 |
 | `dgpu pull <job> [dir]` | 下载 `output/` |
-| `dgpu gc [--dry-run]` | 清理两个平台上的遗留实例 |
+| `dgpu gc [--dry-run] [--include-unknown [--yes]]` | 清理两个平台上的遗留实例；存储里查不到任务的实例默认只报告 |
 
-代码打包：git 仓库用 `git ls-files -co --exclude-standard`，否则按 `.dgpuignore`。始终排除 `.git`、`.env*`、`*.pem`、`*.key`。超过 200 MB 报错，提示把数据放存储。
+代码打包：git 仓库用 `git ls-files -co --exclude-standard`，否则按 `.dgpuignore`。始终排除 `.git`、`.env*`、`*.pem`、`*.key`。超过 200 MB 报错，提示把数据放存储。代码在花钱和写存储之前先在本地打包；跳过的条目（指向代码目录之外或不存在的符号链接、设备和管道）逐个列出，其中坏掉或指向目录外的符号链接默认让 `submit` 报错（训练代码用到时会在实例上失败），`--yes` 放行。
 
-本地数据路径（用户 2026-11-10 确认）：`data:` 里的本地目录在 `submit` 时上传到 `dgpu/datasets/<内容哈希>/`，实例再从那里拉取，拷到 `$DGPU_DATA/<目录名>`。内容哈希由相对路径、大小和文件 sha256 算出，已存在 `.complete` 标记时不重传。超过 5 GB 时先打印上传量并要求确认（`--yes` 跳过）。不做电脑到实例的 SSH 直传。位于代码目录里的本地数据目录不再打进代码包。
+本地数据路径（用户 2026-11-10 确认）：`data:` 里的本地目录在 `submit` 时上传到 `dgpu/datasets/<内容哈希>/`，实例再从那里拉取，拷到 `$DGPU_DATA/<目录名>`。内容哈希由相对路径、大小和文件 sha256 算出，已存在 `.complete` 标记时不重传。超过 5 GB 时先打印上传量并要求确认（`--yes` 跳过）。不做电脑到实例的 SSH 直传。位于代码目录里的本地数据目录不再打进代码包。本地目录只遍历一次（跟随符号链接，规则和上传相同）：大小估算、5 GB 确认、磁盘估算、AutoDL 50 GB 检查都用这份清单，上传时按同一份清单算哈希，清单之后有文件变了就拒绝上传。
 
 单个文件最大 5 GiB：存储只做单段上传（R2 的分段上传 ETag 不可靠，条件写和完整性都依赖单段 ETag），本地数据里有超过 5 GiB 的文件时，`submit` 在上传任何东西之前报错，提示用户先用 rclone 传到 bucket，再用 `r2://` 引用。目录名（`$DGPU_DATA` 下的名字）只能用 `[A-Za-z0-9._-]`。`r2://` 引用的 bucket 不是存储 profile 的 bucket 时，`offers` 和 `submit` 提醒用户确认 token 能读它（实例用同一个 token），不拒绝。
 
-`submit` 前打印费用上限：`每小时价格上限 × max_hours + 流量估算`，并检查余额够覆盖上限。
+`submit` 前打印费用上限：`每小时价格上限 ×（启动窗口 + 实例存活时限）`，实例存活时限就是 `runner/util.py` 的 `instance_lifetime_s`（`max_hours` + runner 最坏收尾时间 + watchdog 余量和收尾），默认配置下 2 小时的任务约按 3.4 小时算；不含流量费。另外说明每台启动失败而被换掉的机器最多再花“价格 × 启动窗口”，每次重试再算一次上限。余额要够覆盖上限；平台给不出余额（如 Vast 的 key 没有读取账户信息的权限）时提示“未检查余额”后继续。
+
+失联的判断：心跳“多久没更新”按存储的时钟算（`Store.get_json_meta`：对象的 `LastModified` 和这次响应的 `Date` 头；存储不给 `Date` 时写一个探针对象读它的 `LastModified`），不比较电脑和租来的实例的时钟。心跳过期超过 `lost_after_min` 时 `status` 显示 `LOST`；但心跳过期不等于机器挂了（runner 可能在最终上传，或暂时连不上存储而继续训练），所以 `wait` 先查平台：平台显示实例已退出、消失或状态未知，或者心跳停的时间超过 runner 最坏收尾时间（`teardown_worst_case_s`，默认约 42 分钟），才确认失联（退出码 5，`--retries` 时换机重试）；平台显示仍在运行时只报告“失联（实例仍在运行）”，不销毁任何东西，继续等。本 attempt 从没有过心跳（启动阶段超时）直接算失联。
+
+取消优先：`attempt.json` 有取消标志、而当前 attempt 还没有终态时（取消还没完成），`wait --retries` 不自动重试，`retry` 拒绝并提示先 `cancel --force`；任务已结束（包括 `CANCELLED`）时，显式的 `retry` 清除取消标志。`retry` 在检查之后、推进 attempt 之前发现有人刚取消，同样放弃。
+
+信号：`submit`、`retry`、`wait --retries`、`cancel --force` 收到 Ctrl-C、SIGTERM、SIGHUP 都走同一条中止路径：销毁本进程创建（或可能创建）的实例，写 `CANCELLED`，删启动文档；`cancel --force` 先把销毁做完。退出码 130（Ctrl-C）、143（SIGTERM）、129（SIGHUP）。清理期间再来的 SIGTERM / SIGHUP 不打断清理；SIGKILL 无法处理，留下的实例由 `gc` 清理。
+
+`wait` 的退出码：0 成功、1 失败、3 超时、4 取消、5 确认失联、6 任务成功但结束后清理遗留实例失败（实例可能仍在计费，问题已大声输出并写了 `destroy_failed`）、7 连续 10 分钟读不到存储（瞬时错误按 5 秒起、最长 60 秒的间隔退避重试，任务本身不受影响但结果未知）、2 用法或环境错误。任务本身失败时，清理问题照样大声输出，退出码仍是任务的结果。`retry` 的新 attempt 在第一次心跳前就结束时，退出码同 `wait`。
+
+并发安全：每个销毁决定都带着它依据的 attempt（“attempt N 已结束”“attempt N 要被替换”），只销毁标签里 attempt ≤ N 的实例；`wait` 看到终态后若 `attempt.json` 已经前进（并发的 `retry` 启动了新 attempt），跳过收尾。所以 `wait` 的收尾不会销毁并发 `retry` 刚开的机器，两个并发 `retry` 中输的一方也不会销毁赢的一方的机器。
 
 ### 4.6 Vast 后端（`src/dgpu/backends/vast.py`）
 
@@ -187,10 +197,13 @@ class Backend(Protocol):
 - 创建：`PUT /api/v0/asks/{id}/`，`runtype=ssh`、`cancel_unavail=true`、`label=dgpu-<job_id>-a<attempt>`。实例 ID 取响应的 `new_contract`。
 - 查询和销毁：`GET` / `DELETE /api/v0/instances/{id}/`；创建时间取 `start_date`（gc 的年龄判断用）。
 - 列出实例（gc、按标签查找）：`GET /api/v1/instances/`（分页，`next_token`），v1 返回 400/404/405 时退回 `GET /api/v0/instances/`。前缀必须以 `dgpu-` 开头，否则拒绝。
-- 轮询 `actual_status`：`loading` 超 15 分钟，或进入 `exited`/`unknown`/`offline` 时销毁并换机。
+- 轮询 `actual_status`：`loading` 超 15 分钟，或进入 `exited`/`unknown`/`offline` 时销毁并换机。创建成功后 90 秒内查不到（404）按“等待调度”处理，不当作已销毁。
+- 创建后回读：`get` 返回平台上存的 `label`，和创建时不一致（被截断或改写）就按实例 ID 销毁并停止提交，因为 `gc` 靠标签识别 dgpu 的实例；实例的实际价格（`dph_total`）高于上限时销毁、写 `offer_rejected`、换下一台。
+- 销毁总是发 `DELETE`（平台查不到也发），之后用 `get` 和按标签 `list` 都确认实例消失才算完成；刚创建、平台还从没查到过的实例，查不到也观察到创建后 90 秒。
+- 余额：`GET /api/v0/users/current/` 返回 401 且说明是权限不够或需要两步验证（2026-11-10 在真实 API 上看到：“Your key lacks proper privileges … Two Factor Authentication”）时，余额未知（`balance()` 返回 None，`balance_note` 写明原因，只警告一次）：`doctor` 报警告并用列出实例验证 key，`submit` 提示“未检查余额”后继续。key 无效仍然是硬错误。
 - 已知怪点集中在这个文件里处理：`gpu_ram` 在 REST 中单位是 MB；`onstart` 上限 4048 字符。
 
-创建请求超时时，先按标签查询，接管已有实例，避免重复创建。
+创建请求超时时，先按标签查询，接管已有实例，避免重复创建。只要 `create` 的结果不是平台明确的拒绝（`OfferUnavailable`），下一次创建前都把 attempt + 1，换新标签：之前的请求如果其实生效了，晚到的实例就是旧 attempt，它的 runner 读到更大的 attempt 自行退出，`gc` 把它当作旧 attempt 销毁。放弃这次启动（Ctrl-C、信号、出错）时 `create` 结果未知，就按标签隔 0、2、5、10 秒查 4 次；仍查不到就如实写“创建结果未知”，作废这个 attempt，提示 10 分钟后运行 `gc`，绝不声称“已销毁”。
 
 ### 4.7 容器内 runner（`src/dgpu/runner/`，只用 Python 标准库，兼容 3.8）
 
@@ -216,9 +229,11 @@ runner 以 `RCLONE_CONFIG_*` 环境变量把存储凭据交给 rclone，不传�
 |---|---|---|---|
 | 1 | runner | 所有退出路径 | 正常结束、失败、超时、取消 |
 | 2 | watchdog（独立进程，用单调时钟） | runner 进程消失；或到达硬截止 = `max_hours` + runner 最坏收尾时间 + 余量（默认 5 分钟） | runner 崩溃、收尾卡住 |
-| 3 | `submit` 前台 | 启动超时、心跳未出现、preflight 失败、Ctrl-C | 镜像坏、runner 没跑起来、机器有问题 |
-| 4 | `dgpu gc` | 任务已结束、超过截止时间、心跳过期 30 分钟、启动卡住；销毁后确认实例消失 | 电脑中途关机、自毁 API 失败 |
+| 3 | `submit` / `retry` / `wait --retries` 前台 | 启动超时、心跳未出现、preflight 失败、标签被改写、价格高于上限、Ctrl-C / SIGTERM / SIGHUP | 镜像坏、runner 没跑起来、机器有问题、终端关闭、进程被系统停止 |
+| 4 | `dgpu gc` | 任务已结束、更旧的 attempt、超过截止时间、心跳过期 30 分钟且平台显示实例已退出或状态未知（或心跳停满 runner 最坏收尾时间）、启动卡住；销毁后用详情和列表确认实例消失 | 电脑中途关机、submit 被 SIGKILL、自毁 API 失败 |
 | 5 | 账户设置 | 余额耗尽时实例被停止 | 以上全失效时的最终上限 |
+
+`gc` 只处理标签能解析、且任务 ID 是 `layout.new_job_id` 生成的形状（`<名字>-<12 位时间>-<4 位十六进制>`，`layout.is_generated_job_id`）的实例；手工起名的 `dgpu-x-a1` 不碰。存储里查不到对应任务的实例（可能属于另一份配置的 bucket，或共用平台账户的同事）只报告为“未知任务”（附年龄和标签），`gc --include-unknown` 确认后（`--yes` 跳过确认）才销毁。心跳过期按存储的时钟算（见 4.5）；平台显示实例仍在运行时报告“失联（实例仍在运行）”并保留。
 
 runner 最坏收尾时间是各步骤时限之和：`term_grace_s` + 停后台线程 + `UPLOADING` 和列出未上传文件的存储操作 + `final_sync_timeout_min` + 写日志、事件和最终状态的预算 + 自毁的全部重试（`runner/util.py` 的 `teardown_worst_case_s`）。watchdog 的硬截止总比它多出一个余量，所以 watchdog 不会杀掉还在时限内收尾的 runner。`attempt.json` 的 `deadline_at`（gc 用）= 创建时间 + 启动窗口（`startup_timeout_min + runner_timeout_min`）+ watchdog 硬截止 + watchdog 自己收尾的时间 + 30 分钟，和 watchdog 用同一个公式。watchdog 的每个存储操作都有时限，自毁放在 `finally` 里。
 
@@ -277,9 +292,10 @@ store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 - **搜索**：`POST /api/v1/dev/machine/region/gpu_stock` 查各地区空闲卡数，按 `gpu.names` 和 `autodl.dc_list` 过滤。文档提醒多卡任务即使显示有库存也可能调度不上。
 - **创建**：`POST /api/v1/dev/deployment`，`deployment_type=Job`。`container_template` 填 `dc_list`、`gpu_name_set`、`gpu_num`、`cuda_v_from`、`price_from`/`price_to`（单位“元×1000”）、`image_uuid`、`cmd`（bootstrap）。部署名为 `dgpu-<job_id>-a<attempt>`，作为标签使用。
 - **价格口径**：`max_cny_per_hour` 是整个容器（全部卡）每小时的上限。文档没写清 `price_to` 是每卡还是每容器，目前假设每卡（`PRICE_IS_PER_GPU`），所以 `price_to` = 上限 ÷ 卡数，容器价格按“单价 × 卡数”换回整机价；探针确认后再改。库存接口不返回价格，offer 的价格填上限。
-- **状态**：`POST /api/v1/dev/deployment/list`（部署记录，含 `created_at`，gc 的年龄判断用）和 `POST /api/v1/dev/deployment/container/list`（容器状态），映射到统一的 `InstanceState`。`list` 只看部署记录，只返回名称以 `dgpu-` 开头的部署。
+- **状态**：`POST /api/v1/dev/deployment/list`（部署记录，含 `created_at`，gc 的年龄判断用）和 `POST /api/v1/dev/deployment/container/list`（容器状态），映射到统一的 `InstanceState`。`list` 只看部署记录，只返回名称以 `dgpu-` 开头的部署。`get` 返回平台上存的部署名，编排据此确认标签没有被改写。
+- **分页**：文档没写 `page_index` 从 0 还是 1 开始，不猜：第 1 页是空的而 `result_total` 不为 0 时改从 0 开始重新翻；翻完条数比 `result_total` 少时补读第 0 页（按 `uuid` 去重）。按 UUID 查单个部署同样处理。
 - **工作目录**：bootstrap 发现 `/root/autodl-tmp`（AutoDL 的数据盘）就把工作目录放在 `/root/autodl-tmp/dgpu`，数据和 checkpoint 不占系统盘。
-- **销毁**：`DELETE /api/v1/dev/deployment`（运行中会先停后删），幂等。
+- **销毁**：`DELETE /api/v1/dev/deployment`（运行中会先停后删），幂等。部署列表里查不到时也照样发 `DELETE`（刚创建的部署可能还没出现在列表里），平台回答错误就按已删除处理；查到记录时仍然只删名称以 `dgpu-` 开头的部署。
 - **余额**：`POST /api/v1/dev/wallet/balance`（数值除以 1000 为元），供 `doctor` 和提交前检查。
 
 与 Vast 的差异和限制：
@@ -302,7 +318,12 @@ store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 |---|---|---|
 | 没有符合条件的机器 | `submit` 失败，说明卡在哪个条件，不创建实例 | CLI 输出 |
 | 机器被别人抢走、创建失败（含 AutoDL 无库存） | 换下一台或下一个地区，最多 `max_offers` 次 | `create_failed` |
-| 创建请求超时，结果未知 | 按标签查询，接管或销毁，不重复创建 | `create_failed` |
+| 创建请求超时，结果未知 | 按标签查询，接管或销毁，不重复创建；只要不是平台明确的拒绝，下一次创建前 attempt + 1（新标签），晚到的实例被隔离、由 `gc` 当旧 attempt 销毁 | `create_failed`、`relaunch` |
+| 创建结果未知时放弃启动（Ctrl-C、信号、出错） | 按标签隔几秒查 4 次；查到就销毁，查不到就如实写“结果未知、标签为 X 的实例可能稍后出现”，作废这个 attempt，提示 10 分钟后跑 `gc`，不说“已销毁” | `relaunch`、`status.json` |
+| `submit` / `retry` / `wait --retries` 启动阶段收到 SIGTERM、SIGHUP（系统停止进程、终端关闭） | 和 Ctrl-C 一样销毁实例、写 `CANCELLED`、删启动文档，退出码 143 / 129；`cancel --force` 先把销毁做完。SIGKILL 由 `gc` 清理 | `status.json`、`instance_destroyed` |
+| 刚创建的实例在平台上暂时查不到 | 创建后 90 秒内按“等待调度”处理；销毁时照样发请求，并观察到 90 秒 | — |
+| 平台截断或改写了实例的标签 | 按实例 ID 销毁，`submit` 报错停止（`gc` 靠标签识别实例） | `create_failed` |
+| 创建后实际价格高于上限 | 销毁，换下一台 | `offer_rejected` |
 | 镜像拉取卡住、AutoDL 部署迟迟不调度 | 超 15 分钟销毁或删除部署，换机 | `startup_timeout` |
 | 镜像缺 python3、bootstrap 失败 | 等不到心跳，销毁；连续 2 次后停止并提示 | `runner_timeout` |
 | 无 GPU、驱动异常 | 销毁，换机 | `preflight_failed` |
@@ -314,16 +335,25 @@ store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 | 超过 `max_hours` | SIGTERM，宽限 60 秒后 SIGKILL，收尾，`TIMED_OUT`，销毁 | `deadline_hit` |
 | runner 崩溃 | watchdog 尽力同步一次，写 `FAILED(runner_crashed)`，销毁 | `status.json` |
 | runner 收到 SIGTERM/SIGINT（容器被停止） | 停止训练、最终同步，写 `FAILED(signalled)`，销毁 | `status.json` |
-| 运行中存储断连 | 继续训练，恢复后补传 | `sync_failed` |
+| 运行中存储断连 | 继续训练，恢复后补传；CLI 看到心跳过期、平台显示实例仍在运行时只报告“失联（实例仍在运行）”，不销毁、不重试 | `sync_failed` |
 | 最终上传失败 | 重试到时限；仍失败则写明未上传的文件，`FAILED(final_sync)`，销毁，本地数据随之丢失 | `final_sync_failed` |
-| 宿主机宕机 | 心跳过期显示 `LOST`；`retry` 或 `wait --retries` 换机续跑 | `relaunch`、`gc_destroyed` |
+| 宿主机宕机 | 心跳过期（按存储的时钟）显示 `LOST`；平台也显示实例已退出、消失或状态未知（或心跳停满 runner 最坏收尾时间）后，`wait --retries` 才换机续跑，`gc` 才销毁；`retry` 随时可以手动换机 | `relaunch`、`gc_destroyed` |
+| 电脑或实例的时钟不准 | 不影响：心跳过期用存储对象的 `LastModified` 和存储响应的 `Date` 计算 | — |
+| 取消之后 runner 已经不在（取消没人执行） | `wait --retries` 不自动重试，`retry` 拒绝，提示 `cancel --force`；任务已结束后显式 `retry` 会清除取消标志 | CLI 输出 |
 | 自毁 API 失败 | 每 30 秒重试，共 10 次；之后由 `gc` 清理 | `self_destroy_failed` |
 | CLI 或 `gc` 销毁失败、销毁后实例仍在 | 大声报告实例 ID；`submit`、`retry` 停下不再创建新实例；`gc` 记为失败，下次再试 | `destroy_failed` |
+| `wait` 在任务结束后清理实例失败（平台 API 出错、存储删不了启动文档） | 大声报告实例 ID 或标签并提示 `gc`；任务成功时退出码 6，失败时保持任务的退出码 | `destroy_failed` |
+| `wait` 暂时读不到存储 | 退避重试，最多 10 分钟；之后退出码 7，说明任务本身不受影响 | CLI 输出 |
 | 本地数据里有超过 5 GiB 的文件 | `submit` 在上传任何东西之前报错，提示先用 rclone 上传再写 `r2://` | CLI 输出 |
+| 本地数据里有符号链接 | 大小估算、确认、磁盘、AutoDL 检查和上传用同一次遍历（跟随链接）的清单；清单之后数据变了就拒绝上传 | CLI 输出 |
+| 代码目录里有坏掉或指向目录外的符号链接 | `submit` 列出跳过的条目并拒绝，`--yes` 放行 | CLI 输出 |
 | 启动途中电脑关机或断网 | 实例由 `gc` 清理 | `gc_destroyed` |
 | 旧 attempt 没死透，新 attempt 已启动 | 重试前先确认旧实例销毁；旧 runner 读到更大的 attempt 后自行退出 | `attempt_fenced` |
-| 两个 CLI 同时 `retry` | `attempt.json` 条件写，只有一个成功 | CLI 报错 |
+| 两个 CLI 同时 `retry` | `attempt.json` 条件写，只有一个成功；输的一方只销毁不新于它读到的 attempt 的实例，不碰赢家的 | CLI 报错 |
+| `wait` 收尾时另一个 CLI 刚 `retry` 成功 | `attempt.json` 已前进，`wait` 跳过收尾，不销毁新 attempt 的实例 | — |
+| 存储里查不到任务的 dgpu 实例（另一份配置的 bucket、同事的任务、手工起名） | `gc` 只报告“未知任务”（附年龄和标签），`--include-unknown` 确认后才销毁；任务 ID 不是 `new_job_id` 形状的标签不碰 | `gc` 输出 |
 | 账户余额耗尽 | 实例被平台停止，心跳过期显示 `LOST`；提交前已检查余额 | `status` 显示 |
+| Vast key 没有读取账户信息的权限（需要两步验证） | `doctor` 报警告并用列出实例验证 key；`submit` 提示“未检查余额”后继续；key 无效仍报错 | CLI 输出 |
 | 日志过大 | 继续读取防止阻塞，不再落盘 | `log_truncated` |
 | 重复 `submit` | 生成两个独立任务，属于预期行为 | 不同 job ID |
 
@@ -367,9 +397,13 @@ store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 ## 9. 后续风险
 
 - **凭据暴露给房东**：凭据和训练数据都会落到租用机器的磁盘上，社区机器的房东可以读到。v1 用只授权相关 bucket 的专用 token，敏感数据打开 `datacenter_only`。Cloudflare 可能提供带 TTL 的临时凭据，尚未核实，后续可替换。
-- **遗留实例的残余风险**：实例启动了但 runner 没起来，同时电脑关机且一直没跑 `gc`，会一直计费到余额耗尽。需确认 Vast 是否有服务端定时销毁，有的话加一层。
+- **遗留实例的残余风险**：实例启动了但 runner 没起来，同时电脑关机（或 `submit` 被 SIGKILL）且一直没跑 `gc`，会一直计费到余额耗尽。需确认 Vast 是否有服务端定时销毁，有的话加一层。
+- **失联判断偏保守**：心跳过期而平台显示实例仍在运行时，`wait --retries` 和 `gc` 最多多等 runner 最坏收尾时间（默认约 42 分钟）才动手，这段时间可能在为一台卡死的机器付费；换来的是不会销毁正在最终上传或暂时连不上存储的实例。平台状态字符串（Vast 的 `offline`、AutoDL 的部署状态）和真实宕机的对应关系要靠探针确认。
+- **存储时钟**：过期判断依赖存储响应的 `Date` 头（R2 和 S3 都有）；不给 `Date` 的存储每次读取多一次探针写入和删除。
+- **未知任务的实例**：换了 bucket 或配置文件之后，旧 bucket 里任务留下的实例在 `gc` 看来是“未知任务”，只报告不销毁，需要用户确认后 `gc --include-unknown`。
+- **创建结果未知**：平台在 dgpu 放弃查询之后才让实例出现，在用户跑 `gc` 之前会一直计费（它的 runner 被隔离，不会训练）。提示里给出了标签和 `gc` 的时间。
 - **AutoDL 跨境网络**：没有 AutoDL 到 R2 的实测，可能需要国内对象存储，届时数据要多维护一份。
-- **AutoDL 文档空白**：无库存行为、状态字符串、计费粒度都要靠探针确认，探针前不在 AutoDL 上跑真实任务。
+- **AutoDL 文档空白**：无库存行为、状态字符串、计费粒度、`cmd` 非 0 退出时是否重启容器、分页从 0 还是 1 开始都要靠探针确认，探针前不在 AutoDL 上跑真实任务。分页已按响应自检（见 4.12），但只覆盖“第 1 页空”和“条数不够”两种可观察的情况。
 - **房东质量差异**：可靠性分数是 Vast 自己的统计，没有公开定义。
 - **流量费**：R2 不收出口费，但 Vast 房东会收，已通过单价上限过滤。
 - **拉镜像耗时**：自定义镜像可能要 10–60 分钟，默认用 Vast 预缓存的基础镜像。
