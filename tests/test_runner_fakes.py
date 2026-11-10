@@ -18,6 +18,9 @@ Fake rclone
                      them are recorded in violations.jsonl
     calls.jsonl      one record per finished call (op, args, rc, times, payload of JSON rcats)
     gpu_util         utilization reported by the fake nvidia-smi (default 50)
+    gpu_lines        if present, printed verbatim instead (several GPUs, "[N/A]" values)
+    gpu_hang         if present, the fake nvidia-smi ignores SIGTERM and sleeps (only SIGKILL
+                     ends it), like a driver that stopped answering
     no_gpu           if present, the fake nvidia-smi fails
 """
 
@@ -345,6 +348,18 @@ def _dispatch(op, args, excludes, flags, record):
 def fake_nvidia_smi_main(argv):
     root = os.environ.get("FAKE_RCLONE_ROOT", "")
     control = os.path.join(root, ".control")
+    if os.path.exists(os.path.join(control, "gpu_hang")):
+        import signal
+
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(3600)
+        return 1
+    try:
+        with open(os.path.join(control, "gpu_lines"), encoding="utf-8") as handle:
+            sys.stdout.write(handle.read())
+        return 0
+    except OSError:
+        pass
     if os.path.exists(os.path.join(control, "no_gpu")):
         sys.stdout.write(
             "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver.\n"

@@ -358,7 +358,13 @@ class Harness:
     def freeze(self, prefixes: list[str]) -> None:
         (self.control / "frozen").write_text("\n".join(prefixes) + "\n")
 
-    def set_gpu(self, util: float | None = None, missing: bool = False) -> None:
+    def set_gpu(
+        self,
+        util: float | None = None,
+        missing: bool = False,
+        hang: bool | None = None,
+        lines: str | None = None,
+    ) -> None:
         if util is not None:
             (self.control / "gpu_util").write_text(str(util))
         flag = self.control / "no_gpu"
@@ -366,6 +372,14 @@ class Harness:
             flag.write_text("1")
         else:
             flag.unlink(missing_ok=True)
+        if hang is not None:
+            hang_flag = self.control / "gpu_hang"
+            if hang:
+                hang_flag.write_text("1")
+            else:
+                hang_flag.unlink(missing_ok=True)
+        if lines is not None:
+            (self.control / "gpu_lines").write_text(lines)
 
     # ------------------------------------------------------------ running
 
@@ -477,7 +491,45 @@ class Harness:
     def track_pid(self, pid: int) -> None:
         self._extra_pids.append(pid)
 
+    def registered_rclones(self, component: str = "runner") -> list[int]:
+        folder = self.work / "run" / f"rclone-{component}"
+        if not folder.is_dir():
+            return []
+        return sorted(int(p.name) for p in folder.iterdir() if p.name.isdigit())
+
+    def kill_all(self) -> None:
+        """Simulate a container restart: every process of this work root dies at once."""
+        for component in ("runner", "watchdog"):
+            for pid in self.registered_rclones(component):
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        child = self.child()
+        for pid in (self.pid("watchdog"), self.pid("runner")):
+            if pid:
+                procs.kill_pid(pid, signal.SIGKILL)
+        if child and child.get("pgid"):
+            try:
+                os.killpg(int(child["pgid"]), signal.SIGKILL)
+            except OSError:
+                pass
+        if self.boot_proc is not None and self.boot_proc.poll() is None:
+            self.boot_proc.kill()
+        if self.boot_proc is not None:
+            self.boot_proc.wait()
+        end = time.monotonic() + 10
+        for pid in (self.pid("watchdog"), self.pid("runner")):
+            while pid and procs.pid_alive(pid) and time.monotonic() < end:
+                time.sleep(0.05)
+
     def cleanup(self) -> None:
+        for component in ("runner", "watchdog"):
+            for pid in self.registered_rclones(component):
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    pass
         pids = [self.pid("runner"), self.pid("watchdog")] + self._extra_pids
         child = self.child()
         for pid in pids:
