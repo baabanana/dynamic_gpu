@@ -292,6 +292,8 @@ def test_symlinks_inside_are_kept_relative_and_outside_are_skipped(tmp_path):
     assert set(skipped) == {"leak.txt", "leakdir", "dangling"}
     assert "之外" in skipped["leak.txt"] and "之外" in skipped["leakdir"]
     assert "不存在" in skipped["dangling"]
+    # 坏链接和指向目录外的链接单独列出：submit 默认因为它们拒绝提交（--yes 放行）
+    assert sorted(result.skipped_links) == ["dangling", "leak.txt", "leakdir"]
 
     members = _members(result.path)
     assert members["configs/current.yaml"].issym()
@@ -549,6 +551,47 @@ def test_precomputed_manifest_is_reused(tmp_path, monkeypatch):
     other = _tree(tmp_path / "other", DATA)
     with pytest.raises(ValueError):
         upload_dataset(MemoryStore(), _local_ref(other), manifest=manifest)
+
+
+def test_scan_lists_the_same_files_as_the_upload_without_reading_them(tmp_path, monkeypatch):
+    """scan_dataset 和上传是同一次遍历、同样的规则（跟随符号链接），只是不读内容。"""
+    outside = _tree(tmp_path / "outside", {"big.bin": b"payload", "shared/x.txt": "x"})
+    root = _tree(tmp_path / "set", {"a.txt": "a", ".DS_Store": "finder"})
+    (root / "big.bin").symlink_to(outside / "big.bin")
+    (root / "shared").symlink_to(outside / "shared", target_is_directory=True)
+    monkeypatch.setattr(packaging, "_sha256_stream", lambda handle: pytest.fail("read content"))
+    listing = packaging.scan_dataset(root)
+    assert not listing.hashed and listing.content_hash == ""
+    assert {f.path: f.size for f in listing.files} == {"a.txt": 1, "big.bin": 7, "shared/x.txt": 1}
+    assert listing.total_bytes == 9 and listing.excluded == (".DS_Store",)
+
+
+def test_upload_from_a_scan_hashes_that_listing_without_walking_again(tmp_path, monkeypatch):
+    root = _tree(tmp_path / "set", DATA)
+    listing = packaging.scan_dataset(root)
+    monkeypatch.setattr(packaging, "_walk_dataset", lambda root: pytest.fail("walked twice"))
+    store = MemoryStore()
+    source = resolve_data(store, _local_ref(root), manifest=listing)
+    expected = hash_dataset(root, listing=listing)
+    assert source.prefix == layout.dataset_prefix(expected.content_hash)
+    assert store.exists(layout.dataset_complete_key(expected.content_hash))
+
+
+def test_data_changed_between_scan_and_upload_is_refused(tmp_path):
+    root = _tree(tmp_path / "set", DATA)
+    listing = packaging.scan_dataset(root)
+    (root / "labels.csv").write_text("changed after the size estimate")
+    store = MemoryStore()
+    with pytest.raises(SpecError, match="提交过程中被修改"):
+        upload_dataset(store, _local_ref(root), manifest=listing)
+    assert store.objects == {}
+
+
+def test_scan_does_not_refuse_big_files_so_submit_can_explain(tmp_path, monkeypatch):
+    monkeypatch.setattr(packaging, "SINGLE_UPLOAD_LIMIT", 5)
+    root = _tree(tmp_path / "set", {"a.txt": "x" * 10})
+    listing = packaging.scan_dataset(root)
+    assert listing.files[0].size == 10  # 上限检查交给调用方（submit 给出带 bucket 名的提示）
 
 
 def test_upload_rejects_remote_ref(tmp_path):

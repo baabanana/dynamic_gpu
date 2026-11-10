@@ -7,6 +7,7 @@ import 的外部名字（集成后这些模块由其他工作包提供）。
 from __future__ import annotations
 
 import json
+import signal
 import sys
 import types
 from pathlib import Path
@@ -24,9 +25,10 @@ from dgpu.contracts import (
     ConfigError,
     DataRef,
     DataSource,
+    StoreError,
     VastSettings,
 )
-from dgpu.orchestrator import Deps
+from dgpu.orchestrator import Deps, Terminated
 from dgpu.testing import TEST_PROFILE, MemoryStore
 from test_orchestrator_support import (
     MAIN_VAST_KEY,
@@ -356,3 +358,201 @@ def test_error_message_never_prints_main_key(env):
     result = run("submit", str(env.job_file))
     assert result.exit_code == 2
     assert MAIN_VAST_KEY not in result.output and "bad key ***" in result.stderr
+
+
+# ---------------------------------------------------------------- 评审 A1：SIGTERM / SIGHUP
+
+
+def test_termination_signals_become_terminated_once_and_handlers_are_restored():
+    before = {sig: signal.getsignal(sig) for sig in cli_mod.TERMINATION_SIGNALS}
+    with cli_mod.termination_signals():
+        with pytest.raises(Terminated) as info:
+            signal.raise_signal(signal.SIGTERM)
+        assert info.value.exit_code == 143 and info.value.signame == "SIGTERM"
+        signal.raise_signal(signal.SIGHUP)  # 清理期间再来的信号只记一笔，不打断
+    assert {sig: signal.getsignal(sig) for sig in cli_mod.TERMINATION_SIGNALS} == before
+    with cli_mod.termination_signals():
+        with pytest.raises(Terminated) as info:
+            signal.raise_signal(signal.SIGHUP)
+        assert info.value.exit_code == 129
+
+
+@pytest.mark.parametrize(("signum", "code"), [(signal.SIGTERM, 143), (signal.SIGHUP, 129)])
+def test_submit_destroys_the_instance_on_sigterm_or_sighup(env, signum, code):
+    env.world.plan_queue = [Plan(boot="stuck")]
+
+    def send_signal(world):
+        if world.sleeps == 3:
+            signal.raise_signal(signum)
+
+    env.world.on_sleep.append(send_signal)
+    with cli_mod.termination_signals():
+        result = run("submit", str(env.job_file))
+    assert result.exit_code == code, result.output
+    assert env.world.backend.creates() == ["o1"]
+    assert env.world.alive() == []  # 实例已销毁，不会一直计费
+    (job_id,) = env.world.store.list_dirs(layout.jobs_prefix())
+    status = env.world.doc(layout.status_key(job_id))
+    assert status["phase"] == states.CANCELLED
+    assert signal.Signals(signum).name in status["message"]
+    assert f"收到 {signal.Signals(signum).name}，已清理并退出" in result.stderr
+
+
+def test_cancel_force_on_sigterm_still_destroys(env):
+    submitted = run("submit", str(env.job_file))
+    job_id = submitted.stdout.strip()
+    real_destroy = env.world.backend.destroy
+    calls = []
+
+    def destroy_with_signal(ref):
+        calls.append(ref.id)
+        if len(calls) == 1:
+            signal.raise_signal(signal.SIGTERM)
+        real_destroy(ref)
+
+    env.world.backend.destroy = destroy_with_signal
+    with cli_mod.termination_signals():
+        result = run("cancel", job_id, "--force")
+    assert result.exit_code == 143
+    assert env.world.alive() == []
+    assert env.world.doc(layout.status_key(job_id))["phase"] == states.CANCELLED
+
+
+def test_progress_output_never_breaks_cleanup_when_the_terminal_is_gone(monkeypatch):
+    def broken_echo(*args, **kwargs):
+        raise OSError(5, "Input/output error")  # SIGHUP 之后写 stderr
+
+    monkeypatch.setattr(cli_mod.click, "echo", broken_echo)
+    cli_mod._progress("清理中……")  # 不抛异常
+
+
+# ---------------------------------------------------------------- 评审 A7、A12：退出码
+
+
+def test_wait_exit_code_6_when_the_job_succeeded_but_cleanup_failed(env):
+    env.world.plan_queue = [Plan(run_s=300, self_destroy=False)]
+    job_id = run("submit", str(env.job_file)).stdout.strip()
+    env.world.backend.destroy_errors["1"] = BackendError("api unavailable")
+    result = run("wait", job_id)
+    assert result.exit_code == states.EXIT_CLEANUP_FAILED == 6
+    assert result.stdout.strip() == states.SUCCEEDED
+    assert "dgpu gc" in result.stderr and "vast/1" in result.stderr
+
+
+def test_wait_keeps_the_job_exit_code_when_a_failed_job_also_failed_cleanup(env):
+    env.world.plan_queue = [
+        Plan(run_s=300, self_destroy=False, final_phase=states.FAILED, final_reason="exit_code")
+    ]
+    job_id = run("submit", str(env.job_file)).stdout.strip()
+    env.world.backend.destroy_errors["1"] = BackendError("api unavailable")
+    result = run("wait", job_id)
+    assert result.exit_code == states.EXIT_FAILED
+    assert "dgpu gc" in result.stderr
+
+
+def test_wait_exit_code_7_when_storage_stays_unreachable(env):
+    env.world.now = T0 + 60
+    seed_job(env.world.store, JOB, phase=states.RUNNING, hb_at=T0 + 60, updated_at=T0 + 60)
+
+    def unreachable(key):
+        raise StoreError("read timeout", transient=True)
+
+    env.world.store.get_json_meta = unreachable
+    result = run("wait", JOB)
+    assert result.exit_code == states.EXIT_STORE_UNREACHABLE == 7
+    assert "连不上存储" in result.stderr and "不受影响" in result.stderr
+
+
+def test_wait_permanent_storage_error_is_still_exit_2(env):
+    seed_job(env.world.store, JOB, phase=states.RUNNING)
+
+    def denied(key):
+        raise StoreError("AccessDenied (HTTP 403)")
+
+    env.world.store.get_json_meta = denied
+    result = run("wait", JOB)
+    assert result.exit_code == states.EXIT_USAGE
+
+
+def test_retry_exits_with_the_phase_when_the_new_attempt_ends_before_running(env):
+    seed_job(env.world.store, JOB, phase=states.FAILED, reason="exit_code", hb_at=None)
+    env.world.plan_queue = [
+        Plan(runner="ends", final_phase=states.FAILED, final_reason="data_sync")
+    ]
+    result = run("retry", JOB)
+    assert result.exit_code == states.EXIT_FAILED, result.output
+    assert result.stdout.strip() == JOB and "FAILED" in result.stderr
+
+
+# ---------------------------------------------------------------- 评审 A3、A4、A10：新参数和帮助
+
+
+def test_retry_with_a_pending_cancel_is_refused_and_help_explains_the_rule(env):
+    env.world.now = T0 + 3600
+    seed_job(env.world.store, JOB, phase=states.RUNNING, hb_at=T0, updated_at=T0)
+    assert run("cancel", JOB).exit_code == 0
+    result = run("retry", JOB)
+    assert result.exit_code == 2 and "未完成的取消请求" in result.stderr
+    assert env.world.backend.creates() == []
+    help_text = run("retry", "--help").stdout
+    assert "取消请求" in help_text and "cancel --force" in help_text
+
+
+def test_gc_reports_unknown_jobs_and_include_unknown_asks_first(env):
+    env.world.now = T0 + 7200
+    env.world.backend.add_instance("9", layout.label(JOB, 1), created_at=T0)
+    result = run("gc")
+    assert result.exit_code == 0 and env.world.backend.destroyed == []
+    assert "未知任务 vast/9" in result.stdout and "--include-unknown" in result.stderr
+
+    result = run("gc", "--include-unknown", input="n\n")
+    assert env.world.backend.destroyed == [] and "确定销毁" in result.stderr
+    data = json.loads(run("gc", "--dry-run", "--json").stdout)
+    assert [item["instance_id"] for item in data["unknown"]] == ["9"]
+
+    result = run("gc", "--include-unknown", input="y\n")
+    assert result.exit_code == 0 and env.world.backend.destroyed == ["9"]
+
+
+def test_gc_include_unknown_with_yes_does_not_ask(env):
+    env.world.now = T0 + 7200
+    env.world.backend.add_instance("9", layout.label(JOB, 1), created_at=T0)
+    result = run("gc", "--include-unknown", "--yes")
+    assert result.exit_code == 0 and env.world.backend.destroyed == ["9"]
+    assert "确定销毁" not in result.output
+
+
+def test_submit_with_a_broken_symlink_needs_yes(env):
+    from dgpu.packaging import PackResult
+
+    env.world.pack_result = PackResult(
+        path=env.tmp / "x.tar.gz",
+        file_count=1,
+        total_bytes=1,
+        archive_bytes=1,
+        sha256="0" * 64,
+        skipped=(("weights", "符号链接指向代码目录之外：/data/w"),),
+        skipped_links=("weights",),
+    )
+    result = run("submit", str(env.job_file))
+    assert result.exit_code == 2 and "weights" in result.stderr and "--yes" in result.stderr
+    assert env.world.backend.creates() == []
+    result = run("submit", str(env.job_file), "--yes")
+    assert result.exit_code == 0, result.output
+
+
+def test_doctor_prints_a_warning_for_a_key_without_account_permission(env):
+    env.world.backend.balance_value = None
+    env.world.backend.balance_note = "key 没有读取账户信息的权限"
+    result = run("doctor")
+    assert result.exit_code == 0
+    assert "[警告] 平台 vast" in result.stdout
+    assert "余额无法查询（key 没有读取账户信息的权限）" in result.stdout
+
+
+def test_submit_proceeds_without_balance_and_says_so(env):
+    env.world.backend.balance_value = None
+    env.world.backend.balance_note = "key 没有读取账户信息的权限"
+    result = run("submit", str(env.job_file))
+    assert result.exit_code == 0
+    assert "未检查余额（key 没有读取账户信息的权限）" in result.stderr

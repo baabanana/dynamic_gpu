@@ -12,6 +12,8 @@ import base64
 import hashlib
 import os
 import socket
+import time
+from datetime import UTC, datetime
 
 import boto3
 import botocore.endpoint
@@ -759,3 +761,74 @@ def test_download_prefix_refuses_keys_that_collide_locally(store, tmp_path):
     with pytest.raises(StoreError, match="同一个本地文件"):
         store.download_prefix("p/", tmp_path / "out")
     assert not (tmp_path / "out" / "a.txt").exists()
+
+
+# ======================================================= get_json_meta：用存储的时钟算多久没更新
+
+
+def test_get_json_meta_matches_get_json_and_reports_storage_times(store):
+    assert store.get_json_meta(KEY) is None
+    etag = store.put_json(KEY, {"a": 1})
+    meta = store.get_json_meta(KEY)
+    assert (meta.doc, meta.etag) == store.get_json(KEY) == ({"a": 1}, etag)
+    assert meta.age_s >= 0 and meta.last_modified <= meta.store_time + 1
+    assert abs(meta.store_time - time.time()) < 300  # 都是 epoch 秒
+
+
+def test_memory_store_clock_is_injectable():
+    now = [100.0]
+    store = MemoryStore(clock=lambda: now[0])
+    store.put_json(KEY, {"a": 1})
+    now[0] = 160.0
+    meta = store.get_json_meta(KEY)
+    assert (meta.last_modified, meta.store_time, meta.age_s) == (100.0, 160.0, 60.0)
+    store.put_bytes(KEY, b'{"a": 2}')  # 任何写入都更新 LastModified
+    assert store.get_json_meta(KEY).age_s == 0.0
+
+
+def test_get_json_meta_takes_the_store_time_from_the_response_date_header(s3):
+    s3.put_json(KEY, {"a": 1})
+
+    def add_date(parsed, **_):
+        parsed["ResponseMetadata"]["HTTPHeaders"]["date"] = "Tue, 10 Nov 2026 07:00:00 GMT"
+
+    puts: list[str] = []
+    s3._client.meta.events.register("after-call.s3.GetObject", add_date)
+    s3._client.meta.events.register("before-call.s3.PutObject", lambda **_: puts.append("put"))
+    meta = s3.get_json_meta(KEY)
+    assert meta.store_time == datetime(2026, 11, 10, 7, 0, tzinfo=UTC).timestamp()
+    assert puts == []  # 有 Date 头时不写探针，读取不改变存储
+
+
+def test_get_json_meta_without_a_date_header_probes_with_a_fresh_write(s3):
+    """moto 的响应没有 Date 头：写一个探针对象，用它的 LastModified 作为存储的当前时间。"""
+    s3.put_json(KEY, {"a": 1})
+    meta = s3.get_json_meta(KEY)
+    assert 0 <= meta.age_s < 60
+    assert s3.list("dgpu/clock-probe/") == []  # 探针用完就删
+
+
+def test_store_errors_say_whether_retrying_can_help():
+    store, stubber, _ = stubbed()
+    stubber.add_client_error("get_object", service_error_code="InternalError", http_status_code=500)
+    with pytest.raises(StoreError) as info:
+        store.get_json(KEY)
+    assert info.value.transient is True
+    stubber.add_client_error("get_object", service_error_code="SlowDown", http_status_code=503)
+    with pytest.raises(StoreError) as info:
+        store.get_json(KEY)
+    assert info.value.transient is True
+    stubber.add_client_error("get_object", service_error_code="AccessDenied", http_status_code=403)
+    with pytest.raises(StoreError) as info:
+        store.get_json(KEY)
+    assert info.value.transient is False
+
+    offline = S3Store(S3_PROFILE, max_attempts=2, sleep=lambda s: None)
+
+    def unreachable(request, **_):
+        raise EndpointConnectionError(endpoint_url=S3_PROFILE.endpoint)
+
+    offline._client.meta.events.register("before-send.s3", unreachable)
+    with pytest.raises(StoreError) as info:
+        offline.get_json_meta(KEY)
+    assert info.value.transient is True
