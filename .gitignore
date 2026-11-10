@@ -24,3 +24,6 @@ config.toml
 
 # macOS
 .DS_Store
+
+# Claude Code 的 agent 工作目录
+.claude/worktrees/
