@@ -37,7 +37,15 @@ class ConfigError(DgpuError):
 
 
 class StoreError(DgpuError):
-    """存储访问失败（重试耗尽后）。"""
+    """存储访问失败（重试耗尽后）。
+
+    transient：网络、超时、5xx、限流这类稍后重试可能成功的失败为 True；认证、bucket 不存在、
+    内容损坏等重试没有意义的为 False（默认）。`dgpu wait` 只对 transient 的失败退避重试。
+    """
+
+    def __init__(self, message: str = "", *, transient: bool = False):
+        super().__init__(message)
+        self.transient = transient
 
 
 class PreconditionFailed(StoreError):
@@ -120,6 +128,8 @@ class JobSpec:
     setup: str | None = None
     data: tuple[DataRef, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
+    # True：setup 和 run 以容器里的 root 运行（默认以无特权用户运行，见 docs/usage.md）
+    run_as_root: bool = False
 
     def image_for(self, backend: str) -> str:
         try:
@@ -349,7 +359,12 @@ class Backend(Protocol):
         """
 
     def balance(self) -> Balance | None:
-        """账户余额；平台不提供时返回 None。"""
+        """账户余额；平台不提供或查不到时返回 None。
+
+        key 本身有效、只是没有读取账户信息的权限时也返回 None（不抛异常），并在实现的
+        `balance_note` 属性（可选，字符串）里写明原因，供 doctor 和 submit 显示。
+        key 无效仍然抛 BackendError。
+        """
 
 
 # ---------------------------------------------------------------- 存储
@@ -357,6 +372,24 @@ class Backend(Protocol):
 # 单个对象的上传上限：S3 / R2 单段 PutObject 最多 5 GiB。R2 的分段上传 ETag 不可靠，
 # dgpu 只做单段上传，更大的文件要用户自己用 rclone 传到 bucket，再用 r2:// 引用。
 SINGLE_UPLOAD_LIMIT = 5 * 1024**3
+
+
+@dataclass(frozen=True)
+class StoredJson:
+    """get_json_meta 的结果：内容、ETag，以及两个都来自存储服务端时钟的时间。
+
+    age_s = store_time - last_modified 是“这个对象多久没更新了”，计算时不涉及本机或
+    实例的时钟（租来的机器的时钟可能差很多），心跳过期、gc 的判断都用它。
+    """
+
+    doc: dict[str, Any]
+    etag: str
+    last_modified: float  # 对象的最后修改时间（epoch 秒，S3 的 LastModified）
+    store_time: float  # 读取时存储服务端的当前时间（epoch 秒，响应的 Date 头等）
+
+    @property
+    def age_s(self) -> float:
+        return max(0.0, self.store_time - self.last_modified)
 
 
 @runtime_checkable
@@ -370,6 +403,13 @@ class Store(Protocol):
 
     def get_json(self, key: str) -> tuple[dict[str, Any], str] | None:
         """返回 (内容, ETag)；不存在返回 None。"""
+
+    def get_json_meta(self, key: str) -> StoredJson | None:
+        """和 get_json 一样，另外返回对象的最后修改时间和存储服务端的当前时间；不存在返回 None。
+
+        两个时间都必须来自存储自己的时钟（S3：LastModified 和响应的 Date 头；没有 Date 头时
+        写一个探针对象再读它的 LastModified），不能用本机时钟顶替。
+        """
 
     def put_json(
         self,
@@ -458,6 +498,7 @@ def build_remote_spec(
         "env": dict(spec.env),
         "data": [source.to_dict() for source in data],
         "max_hours": spec.limits.max_hours,
+        "run_as_root": bool(spec.run_as_root),
         "runner": runner.to_dict(),
     }
 

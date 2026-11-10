@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import time
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -26,6 +28,7 @@ from dgpu.contracts import (
     OfferUnavailable,
     PreconditionFailed,
     Store,
+    StoredJson,
     StoreError,
     StoreProfile,
 )
@@ -40,21 +43,41 @@ TEST_PROFILE = StoreProfile(
 
 
 class MemoryStore:
-    """内存里的 Store。ETag 是内容的 md5。"""
+    """内存里的 Store。ETag 是内容的 md5。
 
-    def __init__(self, profile: StoreProfile = TEST_PROFILE):
+    clock 是“存储服务端的时钟”：每次写入把它记成对象的 LastModified（modified），
+    get_json_meta 把它当作服务端的当前时间。测试可以注入假时钟，或直接改 modified。
+    """
+
+    def __init__(
+        self, profile: StoreProfile = TEST_PROFILE, *, clock: Callable[[], float] = time.time
+    ):
         self.profile = profile
+        self.clock = clock
         self.objects: dict[str, bytes] = {}
+        self.modified: dict[str, float] = {}
 
     @staticmethod
     def _etag(data: bytes) -> str:
         return hashlib.md5(data).hexdigest()
+
+    def _store(self, key: str, data: bytes) -> None:
+        self.objects[key] = data
+        self.modified[key] = self.clock()
 
     def get_json(self, key: str) -> tuple[dict[str, Any], str] | None:
         data = self.objects.get(key)
         if data is None:
             return None
         return json.loads(data), self._etag(data)
+
+    def get_json_meta(self, key: str) -> StoredJson | None:
+        got = self.get_json(key)
+        if got is None:
+            return None
+        doc, etag = got
+        modified = self.modified.get(key, self.clock())
+        return StoredJson(doc=doc, etag=etag, last_modified=modified, store_time=self.clock())
 
     def put_json(
         self,
@@ -70,7 +93,7 @@ class MemoryStore:
         if if_match is not None and (current is None or self._etag(current) != if_match):
             raise PreconditionFailed(f"{key} was modified")
         data = json.dumps(obj, ensure_ascii=False, sort_keys=True).encode()
-        self.objects[key] = data
+        self._store(key, data)
         return self._etag(data)
 
     def get_bytes(self, key: str, *, start: int = 0) -> bytes | None:
@@ -78,10 +101,10 @@ class MemoryStore:
         return None if data is None else data[start:]
 
     def put_bytes(self, key: str, data: bytes) -> None:
-        self.objects[key] = bytes(data)
+        self._store(key, bytes(data))
 
     def put_file(self, key: str, path: Path) -> None:
-        self.objects[key] = Path(path).read_bytes()
+        self._store(key, Path(path).read_bytes())
 
     def exists(self, key: str) -> bool:
         return key in self.objects
@@ -145,6 +168,7 @@ class MemoryStore:
 
     def delete(self, key: str) -> None:
         self.objects.pop(key, None)
+        self.modified.pop(key, None)
 
 
 class FakeBackend:
@@ -167,6 +191,7 @@ class FakeBackend:
         self.destroyed: list[str] = []
         self.calls: list[tuple[str, str]] = []
         self.balance_value: Balance | None = Balance(100.0, "USD" if name == "vast" else "CNY")
+        self.balance_note = ""  # balance() 返回 None 时的原因（如 key 没有读取账户信息的权限）
         self._ids = itertools.count(1)
 
     def search(self, req: GpuRequest) -> list[Offer]:

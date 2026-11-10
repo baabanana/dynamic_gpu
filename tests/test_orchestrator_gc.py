@@ -5,7 +5,15 @@ from __future__ import annotations
 import pytest
 
 from dgpu import layout, states
-from dgpu.contracts import BackendError, StoreError
+from dgpu.contracts import (
+    INST_EXITED,
+    INST_RUNNING,
+    INST_UNKNOWN,
+    BackendError,
+    RunnerSettings,
+    StoreError,
+)
+from dgpu.runner import util as runner_util
 from dgpu.testing import MemoryStore
 from test_orchestrator_support import T0, SimBackend, World, seed_job
 
@@ -55,16 +63,30 @@ def test_gc_destroys_after_deadline(world):
     assert "截止时间" in report.destroyed[0].reason
 
 
+def teardown_min() -> float:
+    """runner 最坏收尾时间（分钟），默认配置下约 42 分钟。"""
+    settings = runner_util.runner_settings({"runner": RunnerSettings().to_dict()})
+    return runner_util.teardown_worst_case_s(settings, runner_util.DEFAULT_TUNING) / 60
+
+
 @pytest.mark.parametrize(
-    ("hb_ago", "inst_age", "destroy"),
+    ("hb_ago", "inst_age", "platform", "destroy"),
     [
-        (31 * MIN, 120 * MIN, True),  # 心跳过期 30 分钟以上
-        (29 * MIN, 120 * MIN, False),  # 心跳还新
-        (None, 25 * MIN, True),  # 从没有心跳，且已超过启动 + runner 超时（20 分钟）
-        (None, 15 * MIN, False),  # 还在启动窗口内，可能正在启动
+        (29 * MIN, 120 * MIN, INST_RUNNING, False),  # 心跳还新
+        # 心跳过期 30 分钟以上，但平台显示仍在运行：可能在最终上传或和存储断连，保留
+        (31 * MIN, 120 * MIN, INST_RUNNING, False),
+        # 心跳过期，平台也显示实例退出或状态未知：销毁
+        (31 * MIN, 120 * MIN, INST_EXITED, True),
+        (31 * MIN, 120 * MIN, INST_UNKNOWN, True),
+        # 心跳停的时间超过 runner 最坏收尾时间：平台显示 running 也销毁
+        ("teardown+1", 200 * MIN, INST_RUNNING, True),
+        (None, 25 * MIN, INST_RUNNING, True),  # 从没有心跳，且已超过启动窗口（20 分钟）
+        (None, 15 * MIN, INST_RUNNING, False),  # 还在启动窗口内，可能正在启动
     ],
 )
-def test_gc_heartbeat_rule_respects_startup_window(world, hb_ago, inst_age, destroy):
+def test_gc_heartbeat_rule(world, hb_ago, inst_age, platform, destroy):
+    if hb_ago == "teardown+1":
+        hb_ago = (teardown_min() + 1) * MIN
     seed_job(
         world.store,
         JOB,
@@ -72,10 +94,31 @@ def test_gc_heartbeat_rule_respects_startup_window(world, hb_ago, inst_age, dest
         hb_at=None if hb_ago is None else NOW - hb_ago,
         attempt_created_at=NOW - inst_age,
     )
-    world.backend.add_instance("1", layout.label(JOB, 1), created_at=NOW - inst_age)
+    world.backend.add_instance("1", layout.label(JOB, 1), created_at=NOW - inst_age, phase=platform)
     report = world.orchestrator().gc()
     assert (world.backend.destroyed == ["1"]) is destroy
     assert len(report.destroyed if destroy else report.kept) == 1
+    if hb_ago == 31 * MIN and not destroy:
+        assert "失联（实例仍在运行）" in report.kept[0].reason
+
+
+def test_gc_staleness_uses_storage_time_not_the_instance_clock(world):
+    """实例的时钟慢了两小时：心跳内容里的 ts 很旧，但存储刚刚收到它。不能算过期。"""
+    seed_job(world.store, JOB, hb_at=NOW - 2 * 3600)
+    world.store.modified[layout.heartbeat_key(JOB)] = NOW - 30  # 存储 30 秒前收到这次心跳
+    world.backend.add_instance("1", layout.label(JOB, 1), created_at=NOW - 3 * 3600)
+    report = world.orchestrator().gc()
+    assert world.backend.destroyed == []
+    assert "运行中" in report.kept[0].reason
+
+
+def test_gc_staleness_ignores_a_fast_laptop_clock(world):
+    """本机时钟快了两小时，存储的时间正常：心跳是新的，gc 不能销毁。"""
+    seed_job(world.store, JOB, hb_at=NOW - 30)
+    world.backend.add_instance("1", layout.label(JOB, 1), created_at=NOW - 3600)
+    orch = world.orchestrator(clock=lambda: NOW + 2 * 3600)
+    orch.gc()
+    assert world.backend.destroyed == []
 
 
 def test_gc_uses_attempt_time_when_platform_has_no_creation_time(world):
@@ -85,16 +128,64 @@ def test_gc_uses_attempt_time_when_platform_has_no_creation_time(world):
     assert world.backend.destroyed == []
 
 
-@pytest.mark.parametrize(
-    ("created_ago", "destroy"), [(2 * 3600, True), (10 * MIN, False), (None, False)]
-)
-def test_gc_job_missing_from_storage(world, created_ago, destroy):
+@pytest.mark.parametrize("created_ago", [30 * 3600, 10 * MIN, None])
+def test_gc_never_auto_destroys_instances_of_unknown_jobs(world, created_ago):
+    """存储里查不到任务：可能是另一份配置（另一个 bucket）或同事的任务，只报告，不销毁。"""
     created_at = None if created_ago is None else NOW - created_ago
     world.backend.add_instance("1", layout.label(JOB, 1), created_at=created_at)
     report = world.orchestrator().gc()
-    assert (world.backend.destroyed == ["1"]) is destroy
-    assert "存储里没有这个任务" in (report.destroyed or report.kept)[0].reason
+    assert world.backend.destroyed == []
+    assert not any(name == "destroy" for name, _ in world.backend.calls)
+    (item,) = report.unknown
+    assert item.instance_id == "1" and item.label == layout.label(JOB, 1)
+    assert "查不到这个任务" in item.reason and "--include-unknown" in item.reason
+    if created_ago == 30 * 3600:
+        assert "1800 分钟" in item.reason  # 报告实例年龄
+    assert report.destroyed == [] and report.kept == []
     assert world.store.objects == {}  # 不为不存在的任务凭空建目录
+
+
+def test_gc_include_unknown_destroys_after_confirmation(world):
+    world.backend.add_instance("1", layout.label(JOB, 1), created_at=NOW - 3600)
+    asked: list[list[str]] = []
+
+    def decline(items):
+        asked.append([item.instance_id for item in items])
+        return False
+
+    report = world.orchestrator().gc(include_unknown=True, confirm_unknown=decline)
+    assert asked == [["1"]] and world.backend.destroyed == []
+    assert [item.instance_id for item in report.unknown] == ["1"]
+
+    dry = world.orchestrator().gc(dry_run=True, include_unknown=True, confirm_unknown=decline)
+    assert [item.instance_id for item in dry.destroyed] == ["1"] and len(asked) == 1
+
+    report = world.orchestrator().gc(include_unknown=True, confirm_unknown=lambda items: True)
+    assert world.backend.destroyed == ["1"]
+    assert [item.instance_id for item in report.destroyed] == ["1"]
+    assert world.store.objects == {}
+
+    world.backend.add_instance("2", layout.label(JOB, 2), created_at=NOW - 3600)
+    world.orchestrator().gc(include_unknown=True, confirm_unknown=None)  # --yes
+    assert world.backend.destroyed == ["1", "2"]
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "dgpu-x-a1",  # 手工起名
+        "dgpu-my-job-a1",
+        "dgpu-demo-260101000000-zzzz-a1",  # 随机部分不是十六进制
+        "dgpu-demo-261301000000-abcd-a1",  # 13 月
+        "dgpu-" + "n" * 30 + "-260101000000-abcd-a1",  # 名字超过 new_job_id 的截断长度
+    ],
+)
+def test_gc_only_handles_labels_with_generated_job_ids(world, label):
+    world.backend.add_instance("1", label, created_at=NOW - 30 * 3600, phase=INST_EXITED)
+    report = world.orchestrator().gc(include_unknown=True, confirm_unknown=None)
+    assert world.backend.destroyed == []
+    (item,) = report.kept
+    assert "不处理" in item.reason
 
 
 def test_gc_keeps_new_attempt_whose_status_still_shows_old_failure(world):
@@ -134,7 +225,8 @@ def test_gc_dry_run_destroys_nothing(world):
     world.backend.add_instance("2", layout.label("orphan-260101000000-ffff", 1), created_at=T0)
     report = world.orchestrator().gc(dry_run=True)
     assert report.dry_run
-    assert {item.instance_id for item in report.destroyed} == {"1", "2"}
+    assert {item.instance_id for item in report.destroyed} == {"1"}
+    assert {item.instance_id for item in report.unknown} == {"2"}  # 查不到任务：只报告
     assert world.backend.destroyed == []
     assert not any(name == "destroy" for name, _ in world.backend.calls)
     assert gc_events(world) == []
@@ -212,11 +304,28 @@ def test_doctor_detects_store_without_conditional_writes(world):
     assert store.objects == {}
 
 
-def test_doctor_uses_search_when_platform_has_no_balance(world):
+def test_doctor_verifies_the_key_when_platform_has_no_balance(world):
     world.backend.balance_value = None
     checks = world.orchestrator().doctor()
-    assert checks[2].ok and "搜索返回" in checks[2].detail
-    assert ("search", "") in world.backend.calls
+    assert checks[2].ok and not checks[2].warning and "key 有效" in checks[2].detail
+    assert ("list", layout.LABEL_PREFIX) in world.backend.calls
+
+
+def test_doctor_warns_when_the_key_cannot_read_the_balance(world):
+    """Vast 的 key 没有读取账户信息的权限：余额查不到是警告，不是失败；key 仍要验证。"""
+    world.backend.balance_value = None
+    world.backend.balance_note = "key 没有读取账户信息的权限"
+    check = world.orchestrator().doctor()[2]
+    assert check.ok and check.warning
+    assert "余额无法查询（key 没有读取账户信息的权限）" in check.detail
+    assert ("list", layout.LABEL_PREFIX) in world.backend.calls
+
+    def bad_key(label_prefix=layout.LABEL_PREFIX):
+        raise BackendError("Vast 列出实例被拒绝（HTTP 401）：API key 无效")
+
+    world.backend.list = bad_key
+    check = world.orchestrator().doctor()[2]
+    assert not check.ok and "API key 无效" in check.detail
 
 
 def test_doctor_without_backends(world):

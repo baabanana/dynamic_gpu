@@ -20,6 +20,8 @@
     保留为相对链接；指向目录外或不存在的链接跳过，并在 PackResult.skipped 里列出。
 
 数据集
+    scan_dataset 只遍历一次目录，得到文件清单和大小（submit 用它估算、确认、算磁盘）；
+    这份清单原样交给 upload_dataset，按它算哈希和上传，不再遍历，估算的和上传的一致。
     本地数据目录按内容寻址：哈希由排序后的相对路径、大小和每个文件的 sha256 算出。
     上传到 layout.dataset_prefix(哈希)，所有文件传完后最后写 layout.dataset_complete_key(哈希)。
     已有完成标记就整体跳过；中断的上传没有标记，下次全部重传。数据目录里的符号链接
@@ -81,23 +83,30 @@ class PackResult:
     archive_bytes: int  # tar.gz 的大小
     sha256: str  # tar.gz 的 sha256
     skipped: tuple[tuple[str, str], ...] = ()  # (相对路径, 原因)：没有打进包的条目
+    # skipped 里坏掉（指向不存在的文件）或指向代码目录之外的符号链接的相对路径：
+    # 训练代码用到它们会在实例上失败，submit 默认拒绝（--yes 放行）
+    skipped_links: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class DatasetFile:
     path: str  # 相对数据目录的路径，/ 分隔
     size: int
-    sha256: str
+    sha256: str  # scan_dataset 的清单里为空串（还没读内容）
     mtime_ns: int  # 只用来检测上传过程中的修改，不参与内容哈希
 
 
 @dataclass(frozen=True)
 class DatasetManifest:
     root: Path  # 数据目录（绝对路径）
-    content_hash: str
+    content_hash: str  # scan_dataset 的清单里为空串（还没算哈希）
     total_bytes: int
     files: tuple[DatasetFile, ...]  # 按 path 排序
     excluded: tuple[str, ...] = ()  # 被 DATASET_EXCLUDED 排除的相对路径（目录以 / 结尾）
+
+    @property
+    def hashed(self) -> bool:
+        return bool(self.content_hash)
 
 
 # ---------------------------------------------------------------- 代码文件列表
@@ -295,6 +304,7 @@ def pack_code(
     regular: list[tuple[str, Path]] = []
     links: dict[str, str] = {}
     skipped: list[tuple[str, str]] = []
+    bad_links: list[str] = []
     sizes: dict[str, int] = {}
     for rel_path in rel_files:
         rel = rel_path.as_posix()
@@ -308,8 +318,10 @@ def pack_code(
             target = os.path.realpath(full)
             if not _within(target, real_root):
                 skipped.append((rel, f"符号链接指向代码目录之外：{os.readlink(full)}"))
+                bad_links.append(rel)
             elif not os.path.exists(target):
                 skipped.append((rel, f"符号链接指向不存在的文件：{os.readlink(full)}"))
+                bad_links.append(rel)
             else:
                 target_rel = os.path.relpath(target, real_root)
                 link_dir = posixpath.dirname(rel) or "."
@@ -365,6 +377,7 @@ def pack_code(
         archive_bytes=dest.stat().st_size,
         sha256=_sha256_file(dest),
         skipped=tuple(skipped),
+        skipped_links=tuple(bad_links),
     )
 
 
@@ -430,11 +443,12 @@ def _sha256_file(path: Path) -> str:
 # ---------------------------------------------------------------- 数据集
 
 
-def hash_dataset(path: Path, *, max_file_bytes: int = SINGLE_UPLOAD_LIMIT) -> DatasetManifest:
-    """计算本地数据目录的内容哈希和文件清单。
+def scan_dataset(path: Path) -> DatasetManifest:
+    """遍历本地数据目录，得到文件清单和大小，不读文件内容（content_hash 为空）。
 
-    目录为空、含坏链接，或有文件超过 max_file_bytes（存储单次上传的上限）时抛 SpecError；
-    大小在读文件算哈希之前检查。
+    和上传用的是同一次遍历、同样的规则（跟随符号链接，排除 DATASET_EXCLUDED）：submit 用
+    它估算大小、确认、算磁盘，再把它交给 upload_dataset，上传时按这份清单算哈希，不再遍历。
+    目录为空或含坏链接时抛 SpecError；超过单次上传上限的文件不在这里报错（调用方检查）。
     """
     root = _check_dir(path, "数据目录")
     found, excluded = _walk_dataset(root)
@@ -442,14 +456,50 @@ def hash_dataset(path: Path, *, max_file_bytes: int = SINGLE_UPLOAD_LIMIT) -> Da
         raise SpecError(
             f"数据目录 {root} 里没有文件（或者都被默认规则排除了）。检查 job.yaml 的 data 路径。"
         )
-    _check_file_sizes(root, [(rel, os.stat(root / rel).st_size) for rel in found], max_file_bytes)
     files: list[DatasetFile] = []
     for rel in sorted(found):
-        with _open_for_read(root / rel, "数据文件") as handle:
+        info = os.stat(root / rel)
+        files.append(DatasetFile(path=rel, size=info.st_size, sha256="", mtime_ns=info.st_mtime_ns))
+    return DatasetManifest(
+        root=root,
+        content_hash="",
+        total_bytes=sum(item.size for item in files),
+        files=tuple(files),
+        excluded=tuple(sorted(excluded)),
+    )
+
+
+def hash_dataset(
+    path: Path,
+    *,
+    max_file_bytes: int = SINGLE_UPLOAD_LIMIT,
+    listing: DatasetManifest | None = None,
+) -> DatasetManifest:
+    """计算本地数据目录的内容哈希和文件清单。
+
+    listing 是事先 scan_dataset 得到的清单：给了就按它读文件，不再遍历目录；文件在两次之间
+    变了（大小或修改时间不同）时抛 SpecError，保证估算的和上传的是同一份数据。
+    目录为空、含坏链接，或有文件超过 max_file_bytes（存储单次上传的上限）时抛 SpecError；
+    大小在读文件算哈希之前检查。
+    """
+    root = _check_dir(path, "数据目录")
+    if listing is None:
+        listing = scan_dataset(root)
+    elif Path(listing.root) != root:
+        raise ValueError(f"清单属于 {listing.root}，不是 {root}")
+    _check_file_sizes(root, [(item.path, item.size) for item in listing.files], max_file_bytes)
+    files: list[DatasetFile] = []
+    for item in listing.files:
+        with _open_for_read(root / item.path, "数据文件") as handle:
             info = os.fstat(handle.fileno())
+            if info.st_size != item.size or info.st_mtime_ns != item.mtime_ns:
+                raise SpecError(
+                    f"数据文件 {root / item.path} 在提交过程中被修改（估算大小之后又变了）。"
+                    "等数据不再变化后重新提交。没有上传这份数据。"
+                )
             sha256 = _sha256_stream(handle)
         files.append(
-            DatasetFile(path=rel, size=info.st_size, sha256=sha256, mtime_ns=info.st_mtime_ns)
+            DatasetFile(path=item.path, size=item.size, sha256=sha256, mtime_ns=item.mtime_ns)
         )
     content = hashlib.sha256(DATASET_HASH_SALT)
     for item in files:
@@ -459,7 +509,7 @@ def hash_dataset(path: Path, *, max_file_bytes: int = SINGLE_UPLOAD_LIMIT) -> Da
         content_hash=content.hexdigest(),
         total_bytes=sum(item.size for item in files),
         files=tuple(files),
-        excluded=tuple(sorted(excluded)),
+        excluded=listing.excluded,
     )
 
 
@@ -513,16 +563,19 @@ def upload_dataset(
     """把本地数据目录上传到存储，返回实例可以拉取的 DataSource。幂等。
 
     已有完成标记时直接返回，不重传；否则上传全部文件，最后写完成标记。
-    manifest 可以传入事先算好的 hash_dataset 结果，避免重复计算哈希。
+    manifest 可以传入事先算好的 hash_dataset 结果（避免重复计算哈希），或 scan_dataset 的
+    清单（按清单算哈希，不再遍历目录）。
     存储失败时 StoreError 原样抛出，此时没有完成标记，下次会重传。
     """
     if not ref.is_local or ref.local_path is None:
         raise ValueError(f"data {ref.name!r} 不是本地目录，用 resolve_remote")
     root = Path(os.path.abspath(ref.local_path))
+    if manifest is not None and manifest.root != root:
+        raise ValueError(f"manifest 属于 {manifest.root}，不是 {root}")
     if manifest is None:
         manifest = hash_dataset(root)
-    elif manifest.root != root:
-        raise ValueError(f"manifest 属于 {manifest.root}，不是 {root}")
+    elif not manifest.hashed:
+        manifest = hash_dataset(root, listing=manifest)
     _check_file_sizes(
         root, [(item.path, item.size) for item in manifest.files], SINGLE_UPLOAD_LIMIT
     )
@@ -597,6 +650,13 @@ def resolve_remote(ref: DataRef) -> DataSource:
     return DataSource(name=ref.name, bucket=ref.bucket, prefix=prefix)
 
 
-def resolve_data(store: Store, ref: DataRef) -> DataSource:
-    """data 的一项 → 实例可以拉取的 DataSource：本地目录先上传到存储，存储里的直接转换。"""
-    return upload_dataset(store, ref) if ref.is_local else resolve_remote(ref)
+def resolve_data(
+    store: Store, ref: DataRef, *, manifest: DatasetManifest | None = None
+) -> DataSource:
+    """data 的一项 → 实例可以拉取的 DataSource：本地目录先上传到存储，存储里的直接转换。
+
+    manifest：本地目录事先 scan_dataset / hash_dataset 得到的清单，上传时复用，不再遍历。
+    """
+    if ref.is_local:
+        return upload_dataset(store, ref, manifest=manifest)
+    return resolve_remote(ref)

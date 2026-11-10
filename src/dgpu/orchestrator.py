@@ -19,12 +19,12 @@ from __future__ import annotations
 import codecs
 import json
 import math
-import os
 import re
 import secrets
+import signal
 import tempfile
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +35,7 @@ from dgpu.contracts import (
     CURRENCY_BY_BACKEND,
     INST_EXITED,
     INST_GONE,
+    INST_PENDING,
     INST_RUNNING,
     INST_UNKNOWN,
     SINGLE_UPLOAD_LIMIT,
@@ -43,7 +44,6 @@ from dgpu.contracts import (
     Bundler,
     BundleRef,
     Config,
-    DataRef,
     DataSource,
     DgpuError,
     GpuRequest,
@@ -55,6 +55,8 @@ from dgpu.contracts import (
     OfferUnavailable,
     PreconditionFailed,
     Store,
+    StoredJson,
+    StoreError,
     build_launch_doc,
     build_remote_spec,
 )
@@ -72,13 +74,25 @@ CAS_TRIES = 5  # attempt.json / status.json 读改写的最多次数
 CAS_BACKOFF_S = 1.0
 MIN_DISK_GB = 40
 AUTODL_DATA_DISK_GB = 50  # AutoDL 数据盘固定大小（设计 4.12）
-ORPHAN_MIN_AGE_S = 3600.0  # 存储里没有对应任务的实例，至少存在这么久才由 gc 销毁
 DEADLINE_MARGIN_S = 1800.0  # 实例最晚自毁的时间之后 gc 再多等 30 分钟，避免和 watchdog 抢
 MAX_CONSECUTIVE_RUNNER_TIMEOUTS = 2
 PREFLIGHT_STEP = "preflight"  # runner 心跳里 preflight 期间的 step
 LAUNCH_URL_EXTRA_S = 3600  # 预签名 URL 有效期 = 启动超时 + runner 超时 + 1 小时
 DOCTOR_PREFIX = layout.ROOT + "/doctor/"
 GB = 1024**3
+# 创建请求的结果未知、又要放弃这次启动时（Ctrl-C、SIGTERM、出错），按标签重复查几次再下结论。
+# 和后端自己确认 create 结果的间隔同一量级（Vast 2、10 秒，AutoDL 2、5、10 秒）。
+CREATE_UNKNOWN_LOOKUP_DELAYS_S = (0.0, 2.0, 5.0, 10.0)
+LATE_INSTANCE_GC_MIN = 10  # 结果未知时，提示用户多少分钟后跑 dgpu gc
+# 刚创建的实例在平台上短时间内可能查不到（列表、详情接口有延迟）：这段时间里 GONE 当作还在调度，
+# 销毁它时也多观察这么久，确认它没有“晚到”
+CREATE_GONE_GRACE_S = 90.0
+PRICE_TOLERANCE = 1e-6  # 实例实际价格和上限比较时的相对容差（浮点误差）
+# dgpu wait 读存储失败时的退避：5 秒起翻倍，最长 60 秒一次，总共最多 10 分钟
+STORE_RETRY_BASE_S = 5.0
+STORE_RETRY_MAX_S = 60.0
+STORE_OUTAGE_MAX_S = 600.0
+MAX_SKIPPED_SHOWN = 20
 
 RETRYABLE_PHASES = (states.LOST, states.FAILED, states.TIMED_OUT, states.CANCELLED)
 _CLI_PHASES = (states.PROVISIONING, states.STARTING)  # runner 第一次心跳前由 CLI 写的阶段
@@ -97,10 +111,15 @@ class Deps:
     store: Store
     backends: dict[str, Backend]
     bundler: Bundler
-    # 把代码目录打成 tar.gz 写到给定路径；exclude 是不打进包的绝对路径（代码目录里的本地数据）
+    # 把代码目录打成 tar.gz 写到给定路径；exclude 是不打进包的绝对路径（代码目录里的本地数据）。
+    # 返回值有 skipped（(相对路径, 原因)）和 skipped_links（坏掉或指向目录外的符号链接）时会被报告
     pack_code: Callable[..., Any]
-    resolve_data: Callable[[Store, DataRef], DataSource]  # 本地数据先上传到存储
-    clock: Callable[[], float]  # UTC epoch 秒；要和 runner 写的时间可比，所以是墙上时钟
+    # resolve_data(store, ref, manifest=...)：本地数据先上传到存储（manifest 是 scan_data 的结果）
+    resolve_data: Callable[..., DataSource]
+    # 本地数据目录 → 文件清单（.total_bytes，.files[i].path / .size），跟随符号链接，和上传用
+    # 同一次遍历：大小估算、确认、磁盘估算、AutoDL 50 GB 检查都用它，再原样交给 resolve_data
+    scan_data: Callable[[Path], Any]
+    clock: Callable[[], float]  # UTC epoch 秒，只用来计时和写时间戳；“多久没更新”用存储的时钟
     sleep: Callable[[float], None]
     echo: Callable[[str], None]  # 给人看的进度输出
     # 以下两项只有 CLI 用到
@@ -133,6 +152,36 @@ class AttemptConflict(DgpuError):
 
 class _CancelRequested(DgpuError):
     pass
+
+
+class Terminated(KeyboardInterrupt):
+    """进程收到 SIGTERM 或 SIGHUP。
+
+    是 KeyboardInterrupt 的子类，所以走和 Ctrl-C 完全相同的中止路径：销毁本进程创建（或可能
+    创建）的实例、写终态、删启动文档。cli.main() 安装信号处理把信号变成这个异常；
+    CLI 清理完后以 128 + 信号值退出（SIGTERM 143，SIGHUP 129）。SIGKILL 无法处理，交给 gc。
+    """
+
+    def __init__(self, signum: int):
+        self.signum = int(signum)
+        try:
+            self.signame = signal.Signals(self.signum).name
+        except ValueError:
+            self.signame = f"信号 {self.signum}"
+        super().__init__(f"收到 {self.signame}")
+
+    @property
+    def exit_code(self) -> int:
+        return 128 + self.signum
+
+
+class StoreUnreachable(DgpuError):
+    """dgpu wait 连续 STORE_OUTAGE_MAX_S 读不到存储。任务本身不受影响，结果未知。"""
+
+
+def interrupt_name(exc: BaseException) -> str:
+    """中断的来源，写进状态和输出：Ctrl-C、SIGTERM、SIGHUP。"""
+    return exc.signame if isinstance(exc, Terminated) else "Ctrl-C"
 
 
 # ---------------------------------------------------------------- 结果类型
@@ -169,16 +218,27 @@ class JobView:
     cancel_requested: bool
     deadline_at: float | None
     status_updated_at: float | None
-    heartbeat_at: float | None
-    heartbeat_age_s: float | None
+    heartbeat_at: float | None  # runner 写进心跳的时间（实例的时钟，只用来显示）
+    heartbeat_age_s: float | None  # 心跳多久没更新（存储的时钟：Date - LastModified）
     step: str | None
     gpu_util: float | None
     synced_bytes: int | None
     last_sync_at: float | None
     lost: bool
+    # 本 attempt 最后一次有动静（心跳；没有心跳时是 status.json / attempt.json 的写入）到现在
+    # 多久，用存储的时钟算。终态时为 None。
+    silence_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class WaitOutcome:
+    """dgpu wait 的结果：最终阶段，以及任务结束后清理遗留实例时的问题（实例可能仍在计费）。"""
+
+    phase: str
+    cleanup_problems: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -230,6 +290,9 @@ class GcReport:
     destroyed: list[GcItem] = field(default_factory=list)  # dry_run 时表示“将会销毁”
     kept: list[GcItem] = field(default_factory=list)
     failed: list[GcItem] = field(default_factory=list)
+    # 存储里查不到对应任务的实例：可能属于另一份配置（另一个 bucket）或共用平台账户的同事，
+    # 默认只报告；gc --include-unknown 才销毁（这时它们出现在 destroyed 里）
+    unknown: list[GcItem] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -237,6 +300,7 @@ class GcReport:
             "destroyed": [asdict(item) for item in self.destroyed],
             "kept": [asdict(item) for item in self.kept],
             "failed": [asdict(item) for item in self.failed],
+            "unknown": [asdict(item) for item in self.unknown],
         }
 
 
@@ -245,6 +309,7 @@ class CheckResult:
     name: str
     ok: bool
     detail: str
+    warning: bool = False  # 通过，但有需要用户知道的问题（如余额查不到）
 
 
 @dataclass(frozen=True)
@@ -272,11 +337,14 @@ class _Launch:
     label: str | None = None  # 当前 create 用的标签
     create_unknown: bool = False  # create 已调用但结果未知
     offer: Offer | None = None
+    created_at: float | None = None  # ref 创建成功的时间（本机时钟，只用来算刚创建的宽限期）
+    seen_alive: bool = False  # 平台的 get 至少有一次查到过 ref（不是 GONE）
 
 
 @dataclass(frozen=True)
 class _Outcome:
-    kind: str  # started | ended | create_failed | startup_failed | runner_timeout | preflight
+    # started | ended | create_failed | startup_failed | runner_timeout | preflight | price
+    kind: str
     reason: str | None = None
     instance_may_exist: bool = False
     detail: str = ""
@@ -286,9 +354,9 @@ class _Outcome:
 @dataclass
 class _JobDocs:
     exists: bool
-    attempt: dict[str, Any] | None
-    status: dict[str, Any] | None
-    heartbeat: dict[str, Any] | None
+    attempt: StoredJson | None
+    status: StoredJson | None
+    heartbeat: StoredJson | None
 
 
 # ---------------------------------------------------------------- 编排
@@ -304,7 +372,15 @@ class Orchestrator:
         self.clock = deps.clock
         self.sleep = deps.sleep
         self._secrets = secret_values(deps.config, deps.store)
-        self.echo = lambda message: deps.echo(redact(message, self._secrets))
+        self.echo = self._echo
+
+    def _echo(self, message: str) -> None:
+        """给人看的输出。输出失败（终端已关闭、SIGHUP 之后的 EIO）不能打断清理：
+        需要留档的信息都另外写进了存储的 events/。"""
+        try:
+            self.deps.echo(redact(message, self._secrets))
+        except Exception:  # noqa: BLE001 - 见上
+            pass
 
     # ============================================================ submit
 
@@ -313,42 +389,51 @@ class Orchestrator:
         spec: JobSpec,
         *,
         confirm_upload: Callable[[float], bool] | None = None,
+        accept_skipped_links: bool = False,
     ) -> SubmitResult:
         """提交任务：找机器、上传、创建实例，等到 runner 通过 preflight 后返回。
 
         confirm_upload：本地数据超过 config.local_data_confirm_gb 时调用，参数是 GB 数，
         返回 False 则放弃。None 表示不需要确认（--yes）。
+        accept_skipped_links：代码目录里有坏掉或指向目录外的符号链接时照样提交（--yes）；
+        否则报错，什么都不上传。
         """
         backend_name = spec.backend
         backend = self._backend(backend_name)
         self._check_store_profile(backend_name)
-        self._check_local_file_sizes(spec)
         self._warn_foreign_buckets(spec)
+        # 本地数据只遍历一次：单文件上限、大小确认、磁盘估算、AutoDL 检查和上传都用这份清单
+        listings = self._scan_local_data(spec)
+        self._check_local_file_sizes(listings)
 
-        # 1. 搜机器。没有就报错，此时没有创建任何东西，也没有写存储。
-        request, local_bytes, has_remote = self._build_request(spec, backend_name)
-        offers = backend.search(request)
-        if not offers:
-            raise DgpuError(self._no_offer_message(backend_name, request, has_remote))
-        currency = CURRENCY_BY_BACKEND[backend_name]
-        best = offers[0]
-        self.echo(
-            f"找到 {len(offers)} 台符合条件的机器（{backend_name}），最便宜的是 "
-            f"{best.gpu_name} × {best.gpu_count}，{best.price_per_hour:.3f} {currency}/h"
-        )
+        with tempfile.TemporaryDirectory(prefix="dgpu-") as tmp:
+            # 0. 先在本地打包代码：有问题（坏链接、超过 200 MB）在花钱和写存储之前就报错
+            archive = self._pack_code(spec, Path(tmp), accept_skipped_links)
 
-        # 2. 费用上限和余额。
-        ceiling = self._print_ceiling(request, currency)
-        self._check_balance(backend, ceiling, currency)
-        local_gb = local_bytes / GB
-        if confirm_upload is not None and local_gb > self.config.local_data_confirm_gb:
-            if not confirm_upload(local_gb):
-                raise DgpuError("已取消：没有上传数据，也没有创建实例。")
+            # 1. 搜机器。没有就报错，此时没有创建任何东西，也没有写存储。
+            request, local_bytes, has_remote = self._build_request(spec, backend_name, listings)
+            offers = backend.search(request)
+            if not offers:
+                raise DgpuError(self._no_offer_message(backend_name, request, has_remote))
+            currency = CURRENCY_BY_BACKEND[backend_name]
+            best = offers[0]
+            self.echo(
+                f"找到 {len(offers)} 台符合条件的机器（{backend_name}），最便宜的是 "
+                f"{best.gpu_name} × {best.gpu_count}，{best.price_per_hour:.3f} {currency}/h"
+            )
 
-        # 3. 上传代码、数据、spec，写初始状态。
-        job_id = layout.new_job_id(spec.name, now=self.clock())
-        self.echo(f"任务 ID：{job_id}")
-        self._upload_job_files(spec, job_id, backend_name, request)
+            # 2. 费用上限和余额。
+            ceiling = self._print_ceiling(request, currency)
+            self._check_balance(backend, ceiling, currency)
+            local_gb = local_bytes / GB
+            if confirm_upload is not None and local_gb > self.config.local_data_confirm_gb:
+                if not confirm_upload(local_gb):
+                    raise DgpuError("已取消：没有上传数据，也没有创建实例。")
+
+            # 3. 上传代码、数据、spec，写初始状态。
+            job_id = layout.new_job_id(spec.name, now=self.clock())
+            self.echo(f"任务 ID：{job_id}")
+            self._upload_job_files(spec, job_id, backend_name, request, archive, listings)
         bundle = self.bundler.ensure_uploaded(self.store)
         now = self.clock()
         attempt_doc = states.new_attempt_doc(
@@ -384,8 +469,8 @@ class Orchestrator:
     def status(self, job_id: str) -> JobView:
         """读 status.json、attempt.json、heartbeat.json 合成视图。只读，从不写存储。"""
         self._check_job_id(job_id)
-        att = self._read_doc(layout.attempt_key(job_id), "attempt.json")
-        st = self._read_doc(layout.status_key(job_id), "status.json")
+        att = self._read_meta(layout.attempt_key(job_id), "attempt.json")
+        st = self._read_meta(layout.status_key(job_id), "status.json")
         if att is None and st is None:
             if self.store.exists(layout.spec_key(job_id)):
                 raise DgpuError(
@@ -396,13 +481,8 @@ class Orchestrator:
                 f"找不到任务 {job_id}（存储 {self.store.profile.name}，"
                 f"bucket {self.store.profile.bucket}，路径 {layout.job_prefix(job_id)}）。"
             )
-        hb = self._read_doc(layout.heartbeat_key(job_id), "heartbeat.json")
-        return self._view(
-            job_id,
-            att[0] if att else None,
-            st[0] if st else None,
-            hb[0] if hb else None,
-        )
+        hb = self._read_meta(layout.heartbeat_key(job_id), "heartbeat.json")
+        return self._view(job_id, att, st, hb)
 
     def list_jobs(self, limit: int | None = None) -> list[JobSummary]:
         """列出存储里的任务，最新的在前。"""
@@ -447,7 +527,8 @@ class Orchestrator:
         backend_name = spec.backend
         backend = self._backend(backend_name)
         self._warn_foreign_buckets(spec)
-        request, _, has_remote = self._build_request(spec, backend_name)
+        listings = self._scan_local_data(spec)
+        request, _, has_remote = self._build_request(spec, backend_name, listings)
         found = backend.search(request)
         currency = CURRENCY_BY_BACKEND[backend_name]
         return OffersResult(
@@ -455,7 +536,7 @@ class Orchestrator:
             request=request,
             offers=list(found),
             currency=currency,
-            cost_ceiling=request.max_price_per_hour * request.max_hours,
+            cost_ceiling=request.max_price_per_hour * self._billed_hours(request.max_hours),
             constraints=self._describe_constraints(backend_name, request, has_remote),
         )
 
@@ -519,47 +600,170 @@ class Orchestrator:
     # ============================================================ wait / retry / cancel
 
     def wait(self, job_id: str, retries: int = 0) -> str:
-        """等到终态或 LOST。LOST 且还有重试次数时自动 retry。返回最终阶段。"""
+        """等到终态或确认失联（LOST），返回最终阶段。细节见 wait_for。"""
+        return self.wait_for(job_id, retries=retries).phase
+
+    def wait_for(self, job_id: str, retries: int = 0) -> WaitOutcome:
+        """等到终态或确认失联。
+
+        心跳过期（按存储的时钟）只是“失联”的迹象：平台上实例仍在运行时，runner 可能在最终
+        上传或暂时连不上存储，这时只报告“失联（实例仍在运行）”，什么都不销毁，继续等。
+        确认失联（平台显示实例已退出、消失或状态未知，或心跳停的时间超过 runner 最坏收尾时间）
+        后：有重试次数、且没有未完成的取消请求时自动 retry，否则返回 LOST。
+        读存储暂时失败时退避重试，最多 STORE_OUTAGE_MAX_S，之后抛 StoreUnreachable。
+        """
         last_shown: tuple | None = None
         while True:
-            view = self.status(job_id)
-            shown = (view.phase, view.attempt, view.step)
+            view = self._status_patiently(job_id)
+            verdict: tuple[bool, str] | None = None
+            if view.phase == states.LOST:
+                verdict = self._lost_verdict(view)
+            if verdict is not None and not verdict[0]:
+                shown: tuple = ("alive", view.attempt)
+                text = (
+                    f"任务 {job_id}：失联（实例仍在运行）。{verdict[1]}。"
+                    "不销毁任何东西，继续等。"
+                )
+            else:
+                shown = (view.phase, view.attempt, view.step)
+                text = _describe_progress(view)
             if shown != last_shown:
-                self.echo(_describe_progress(view))
+                self.echo(text)
                 last_shown = shown
             if view.phase in states.TERMINAL_PHASES:
-                self._cleanup_after_end(job_id)
-                return view.phase
-            if view.phase == states.LOST:
+                return WaitOutcome(view.phase, self._cleanup_after_end(job_id, view.attempt))
+            if verdict is not None and verdict[0]:
+                if self._cancel_pending(view):
+                    self.echo(
+                        f"任务 {job_id} 已确认失联（{verdict[1]}），但它有未完成的取消请求"
+                        "（dgpu cancel），不会自动重试。runner 多半已经不在了：用 "
+                        f"`dgpu cancel --force {job_id}` 销毁实例并把任务标记为 CANCELLED。"
+                    )
+                    return WaitOutcome(states.LOST)
                 if retries <= 0:
                     self.echo(
-                        f"任务 {job_id} 心跳已过期（LOST）。可以用 `dgpu retry {job_id}` 换机续跑；"
-                        "遗留实例会由 `dgpu gc` 清理。"
+                        f"任务 {job_id} 已确认失联（LOST：{verdict[1]}）。可以用 "
+                        f"`dgpu retry {job_id}` 换机续跑；遗留实例会由 `dgpu gc` 清理。"
                     )
-                    return states.LOST
+                    return WaitOutcome(states.LOST)
                 retries -= 1
-                self.echo(f"任务心跳已过期（LOST），自动重试（还剩 {retries} 次）")
+                self.echo(f"任务已确认失联（{verdict[1]}），自动重试（还剩 {retries} 次）")
                 try:
                     self.retry(job_id)
                 except DgpuError as exc:
                     self.echo(f"自动重试失败：{exc}")
-                    view = self.status(job_id)
+                    view = self._status_patiently(job_id)
                     if view.phase in states.TERMINAL_PHASES:
-                        self._cleanup_after_end(job_id)
-                        return view.phase
-                    return states.LOST
+                        problems = self._cleanup_after_end(job_id, view.attempt)
+                        return WaitOutcome(view.phase, problems)
+                    return WaitOutcome(states.LOST)
                 last_shown = None
                 continue
             self.sleep(POLL_WAIT_S)
 
+    def _status_patiently(self, job_id: str) -> JobView:
+        """status()，但存储暂时不可用（网络、5xx、限流）时退避重试，总共最多 STORE_OUTAGE_MAX_S。"""
+        started: float | None = None
+        delay = STORE_RETRY_BASE_S
+        while True:
+            try:
+                return self.status(job_id)
+            except StoreError as exc:
+                if isinstance(exc, PreconditionFailed) or not exc.transient:
+                    raise
+                now = self.clock()
+                if started is None:
+                    started = now
+                waited = now - started
+                if waited >= STORE_OUTAGE_MAX_S:
+                    raise StoreUnreachable(
+                        f"连续 {waited / 60:.0f} 分钟读不到存储 {self.store.profile.name}"
+                        f"（bucket {self.store.profile.bucket}）：{exc}。"
+                        f"任务 {job_id} 本身不受影响（机器上的 runner 独立运行、自己销毁实例），"
+                        f"但现在不知道它的结果。网络恢复后再运行 `dgpu wait {job_id}`。"
+                    ) from exc
+                self.echo(
+                    f"读取任务状态失败（{exc}）。{delay:.0f} 秒后重试；"
+                    f"最多再等 {(STORE_OUTAGE_MAX_S - waited) / 60:.0f} 分钟。"
+                )
+                self.sleep(delay)
+                delay = min(delay * 2, STORE_RETRY_MAX_S)
+
+    def _lost_verdict(self, view: JobView) -> tuple[bool, str]:
+        """LOST 的任务是否确认失联：(True, 原因) 可以重试；(False, 说明) 实例可能还在干活。
+
+        - 本 attempt 从没有心跳（启动阶段的 LOST）：runner 没起来，确认失联。
+        - 心跳停的时间超过 runner 最坏收尾时间：runner 早该自己结束了，确认失联。
+        - 否则看平台：实例已退出、消失或状态未知才算确认失联。
+        """
+        silence = view.silence_s or 0.0
+        quiet = f"心跳已停 {silence / 60:.0f} 分钟"
+        runner_never_started = view.heartbeat_age_s is None and (
+            view.stored_phase in (None, *_CLI_PHASES)
+            or (view.status_attempt or 0) < (view.attempt or 0)
+        )
+        if runner_never_started:
+            return True, f"启动阶段 {silence / 60:.0f} 分钟没有进展，runner 没有发出心跳"
+        teardown = self._teardown_worst_case_s()
+        if silence > teardown:
+            return True, f"{quiet}，超过 runner 最坏收尾时间 {teardown / 60:.0f} 分钟"
+        phase, detail = self._probe_instance(view)
+        if phase in _DEAD_INSTANCE_PHASES:
+            return True, f"{quiet}，平台显示{detail}"
+        if phase is None:
+            return False, f"{quiet}，查不到平台上的实例状态（{detail}）"
+        return False, (
+            f"{quiet}，但平台显示{detail}：runner 可能在最终上传，或暂时连不上存储；"
+            f"心跳停满 {teardown / 60:.0f} 分钟或实例退出后才算失联"
+        )
+
+    def _probe_instance(self, view: JobView) -> tuple[str | None, str]:
+        """平台上当前 attempt 的实例状态：(INST_*, 说明)；查不了时 (None, 原因)。"""
+        backend = self.backends.get(view.backend or "")
+        if backend is None:
+            return None, f"没有 {view.backend} 平台的凭据"
+        label = view.label or (
+            layout.label(view.job_id, view.attempt) if view.attempt else None
+        )
+        try:
+            if view.instance_id:
+                ref = InstanceRef(backend=backend.name, id=str(view.instance_id), label=label or "")
+                state = backend.get(ref)
+            elif label:
+                found = [s for s in backend.list(label) if s.ref.label == label]
+                if not found:
+                    return INST_GONE, f"没有标签为 {label} 的实例"
+                state = found[0]
+            else:
+                return None, "attempt.json 里没有实例 ID 和标签"
+        except Exception as exc:  # noqa: BLE001 - 平台查询失败时保守地当作“不知道”
+            return None, f"查询失败：{exc}"
+        return state.phase, f"实例 {state.ref.id} 是 {state.phase}（{state.raw_status or '-'}）"
+
+    def _cancel_pending(self, view: JobView) -> bool:
+        """有取消请求，而当前 attempt 还没有终态：取消还没完成，不能自动或手动重试。"""
+        return view.cancel_requested and not _terminal_for_current(view)
+
     def retry(self, job_id: str) -> SubmitResult:
-        """换机重跑：先确认旧实例已销毁，再用条件写把 attempt + 1，然后走换机循环。"""
+        """换机重跑：先确认旧实例已销毁，再用条件写把 attempt + 1，然后走换机循环。
+
+        有未完成的取消请求（取消标志已设置、当前 attempt 还没有终态）时拒绝：取消优先。
+        任务已经结束（包括 CANCELLED）时，显式的 retry 会清除取消标志。
+        """
         view = self.status(job_id)
         if view.phase not in RETRYABLE_PHASES:
             raise DgpuError(
                 f"任务 {job_id} 当前是 {view.phase}，只有 LOST、FAILED、TIMED_OUT、CANCELLED "
                 "的任务可以重试。"
             )
+        if self._cancel_pending(view):
+            raise DgpuError(
+                f"任务 {job_id} 有未完成的取消请求（dgpu cancel 设置了取消标志，任务还没结束），"
+                "不重试。确实要放弃这次运行重新开始：先 "
+                f"`dgpu cancel --force {job_id}`（销毁实例并标记 CANCELLED），"
+                f"再 `dgpu retry {job_id}`。"
+            )
+        cancel_seen = view.cancel_requested
         request, backend_name = self._read_request(job_id)
         backend = self._backend(backend_name)
         self._check_store_profile(backend_name)
@@ -575,13 +779,21 @@ class Orchestrator:
             raise DgpuError(f"任务 {job_id} 没有 attempt.json，无法重试。")
         old_doc = got[0]
         old_attempt = int(old_doc["attempt"])
-        # 旧实例必须确认销毁；失败就停在这里，不启动第二台。
+        # 旧实例必须确认销毁；失败就停在这里，不启动第二台。只销毁不新于 old_attempt 的实例：
+        # 并发的另一个 retry 可能已经推进到下一个 attempt 并创建了实例，那不是这里该销毁的。
         self._destroy_job_instances(
-            job_id, backend, old_doc, why=f"重试前确认 attempt {old_attempt} 的实例已销毁"
+            job_id,
+            backend,
+            old_doc,
+            why=f"重试前确认 attempt {old_attempt} 的实例已销毁",
+            max_attempt=old_attempt,
         )
         bundle = self.bundler.ensure_uploaded(self.store)
 
         def bump(doc: dict[str, Any]) -> dict[str, Any]:
+            if doc.get("cancel") and not cancel_seen:
+                # 检查之后才有人 dgpu cancel：取消优先，这次不重试
+                raise _CancelRequested(f"任务 {job_id} 刚被取消（dgpu cancel），这次没有重试。")
             new_attempt = int(doc["attempt"]) + 1
             doc.update(
                 attempt=new_attempt,
@@ -663,8 +875,26 @@ class Orchestrator:
             raise DgpuError(f"任务 {job_id} 没有 attempt.json，找不到要销毁的实例。")
         att = got[0]
         backend = self._backend(att["backend"])
-        self._destroy_job_instances(job_id, backend, att, why="dgpu cancel --force")
         attempt = int(att["attempt"])
+
+        def destroy() -> None:
+            self._destroy_job_instances(
+                job_id, backend, att, why="dgpu cancel --force", max_attempt=attempt
+            )
+
+        try:
+            destroy()
+        except KeyboardInterrupt as exc:
+            # 用户要的就是销毁：Ctrl-C / SIGTERM / SIGHUP 时先把销毁做完再退出
+            # （同类信号不会再打断；再按一次 Ctrl-C 可以放弃）
+            self.echo(f"收到中断（{interrupt_name(exc)}）：先把实例销毁做完再退出……")
+            destroy()
+            self._finish_force_cancel(job_id, attempt)
+            raise
+        self._finish_force_cancel(job_id, attempt)
+        return self.status(job_id)
+
+    def _finish_force_cancel(self, job_id: str, attempt: int) -> None:
         self._write_terminal_if_absent(
             job_id,
             attempt,
@@ -673,15 +903,27 @@ class Orchestrator:
             "dgpu cancel --force：实例已直接销毁，没有做最终同步",
         )
         self.store.delete(layout.secrets_key(job_id, attempt))
-        return self.status(job_id)
 
     # ============================================================ gc / doctor
 
-    def gc(self, dry_run: bool = False) -> GcReport:
-        """清理遗留实例。只处理标签能被 layout.parse_label 解析的实例。"""
+    def gc(
+        self,
+        dry_run: bool = False,
+        *,
+        include_unknown: bool = False,
+        confirm_unknown: Callable[[list[GcItem]], bool] | None = None,
+    ) -> GcReport:
+        """清理遗留实例。
+
+        只处理标签能被 layout.parse_label 解析、且任务 ID 是 layout.new_job_id 生成的形状的实例。
+        存储里查不到任务的实例（可能属于另一份配置或共用平台账户的同事）默认只报告，放在
+        report.unknown；include_unknown 时才销毁，销毁前调用 confirm_unknown（None 表示
+        不再确认，即 --yes）。
+        """
         report = GcReport(dry_run=dry_run)
         now = self.clock()
         cache: dict[str, _JobDocs] = {}
+        unknown: list[tuple[Backend, InstanceState, GcItem]] = []
         for name, backend in self.backends.items():
             try:
                 instances = backend.list(layout.LABEL_PREFIX)
@@ -691,9 +933,16 @@ class Orchestrator:
             for inst in instances:
                 label = inst.ref.label
                 parsed = layout.parse_label(label)
-                if parsed is None:
+                if parsed is None or not layout.is_generated_job_id(parsed[0]):
                     report.kept.append(
-                        GcItem(name, inst.ref.id, label, None, None, "标签不是 dgpu 格式，不处理")
+                        GcItem(
+                            name,
+                            inst.ref.id,
+                            label,
+                            None,
+                            None,
+                            "标签不是 dgpu 生成的格式（dgpu-<名字>-<时间>-<随机>-a<次数>），不处理",
+                        )
                     )
                     continue
                 if inst.phase == INST_GONE:
@@ -717,43 +966,67 @@ class Orchestrator:
                     )
                     continue
                 item = GcItem(name, inst.ref.id, label, job_id, attempt, reason)
+                if not docs.exists:
+                    unknown.append((backend, inst, item))
+                    continue
                 if not destroy:
                     report.kept.append(item)
                     continue
-                if dry_run:
-                    report.destroyed.append(item)
-                    continue
-                try:
-                    backend.destroy(inst.ref)
-                    self._confirm_gone(backend, inst.ref)  # 平台受理了不等于已经停止计费
-                except Exception as exc:
-                    message = (
-                        f"!! gc 销毁实例 {name}/{inst.ref.id}（标签 {label}）失败：{exc}。"
-                        "它可能仍在计费，请稍后再跑 `dgpu gc` 或到平台控制台手动销毁。"
-                    )
-                    self.echo(message)
-                    report.failed.append(GcItem(name, inst.ref.id, label, job_id, attempt, message))
-                    if docs.exists:
-                        self._event(
-                            job_id,
-                            states.EV_DESTROY_FAILED,
-                            attempt,
-                            message,
-                            {"backend": name, "instance_id": inst.ref.id, "label": label},
-                            source=states.SRC_GC,
-                        )
-                    continue
-                report.destroyed.append(item)
-                if docs.exists:
-                    self._event(
-                        job_id,
-                        states.EV_GC_DESTROYED,
-                        attempt,
-                        f"gc 销毁实例 {inst.ref.id}：{reason}",
-                        {"backend": name, "instance_id": inst.ref.id, "label": label},
-                        source=states.SRC_GC,
-                    )
+                self._gc_destroy(report, backend, inst, item, job_known=True)
+        if unknown:
+            items = [item for _, _, item in unknown]
+            if not include_unknown:
+                report.unknown.extend(items)
+            elif dry_run or confirm_unknown is None or confirm_unknown(items):
+                for backend, inst, item in unknown:
+                    self._gc_destroy(report, backend, inst, item, job_known=False)
+            else:
+                report.unknown.extend(items)
         return report
+
+    def _gc_destroy(
+        self,
+        report: GcReport,
+        backend: Backend,
+        inst: InstanceState,
+        item: GcItem,
+        *,
+        job_known: bool,
+    ) -> None:
+        if report.dry_run:
+            report.destroyed.append(item)
+            return
+        name, label, job_id, attempt = item.backend, item.label, item.job_id, item.attempt
+        try:
+            backend.destroy(inst.ref)
+            self._confirm_gone(backend, inst.ref)  # 平台受理了不等于已经停止计费
+        except Exception as exc:
+            message = (
+                f"!! gc 销毁实例 {name}/{inst.ref.id}（标签 {label}）失败：{exc}。"
+                "它可能仍在计费，请稍后再跑 `dgpu gc` 或到平台控制台手动销毁。"
+            )
+            self.echo(message)
+            report.failed.append(replace(item, reason=message))
+            if job_known and job_id:
+                self._event(
+                    job_id,
+                    states.EV_DESTROY_FAILED,
+                    attempt,
+                    message,
+                    {"backend": name, "instance_id": inst.ref.id, "label": label},
+                    source=states.SRC_GC,
+                )
+            return
+        report.destroyed.append(item)
+        if job_known and job_id:  # 存储里没有这个任务时不凭空建目录
+            self._event(
+                job_id,
+                states.EV_GC_DESTROYED,
+                attempt,
+                f"gc 销毁实例 {inst.ref.id}：{item.reason}",
+                {"backend": name, "instance_id": inst.ref.id, "label": label},
+                source=states.SRC_GC,
+            )
 
     def doctor(self) -> list[CheckResult]:
         """检查配置、存储读写和各平台 API。每项独立，不因为一项失败而中断。"""
@@ -893,8 +1166,12 @@ class Orchestrator:
                 detail,
                 {**_offer_data(offer), "found_by_label": [ref.id for ref in found]},
             )
-            return _Outcome("create_failed", states.REASON_NO_OFFER, bool(found), detail)
+            # 不是平台明确的拒绝：请求可能已经执行，实例可能稍后才出现在列表里。下一次创建
+            # 换新的 attempt 和标签，晚到的实例就是旧 attempt：它的 runner 被隔离，gc 会销毁它。
+            return _Outcome("create_failed", states.REASON_NO_OFFER, True, detail)
         ctx.ref = ref
+        ctx.created_at = self.clock()
+        ctx.seen_alive = False
         ctx.create_unknown = False
         self.echo(f"已创建实例 {ref.id}（标签 {launch.label}），等待启动……")
         self._record_instance(ctx, ref)
@@ -911,10 +1188,12 @@ class Orchestrator:
         """
         cfg = self.config
         job_id, attempt = ctx.job_id, ctx.attempt
-        startup_deadline = self.clock() + cfg.startup_timeout_min * 60
+        created = self.clock()
+        startup_deadline = created + cfg.startup_timeout_min * 60
         running_at: float | None = None
         preflight_since: float | None = None  # 第一次看到本 attempt 心跳的时间
         last_phase = None
+        price_checked = False
         while True:
             ended = self._startup_status_outcome(ctx, ref)
             if ended is not None:
@@ -951,6 +1230,23 @@ class Orchestrator:
 
             state = ctx.backend.get(ref)
             now = self.clock()
+            if state.phase != INST_GONE:
+                ctx.seen_alive = True
+            elif now - created < CREATE_GONE_GRACE_S:
+                # 刚创建的实例，平台的详情 / 列表接口可能还查不到：按“等待调度”处理
+                state = replace(
+                    state,
+                    phase=INST_PENDING,
+                    raw_status=f"刚创建，平台暂时查不到（{state.raw_status or '-'}）",
+                )
+            if state.phase != INST_GONE:
+                self._check_platform_label(ctx, ref, state)
+                if not price_checked and state.price_per_hour is not None:
+                    price_checked = True
+                    if state.price_per_hour > ctx.request.max_price_per_hour * (
+                        1 + PRICE_TOLERANCE
+                    ):
+                        return self._price_rejected(ctx, ref, state.price_per_hour)
             if state.phase != last_phase:
                 self.echo(f"实例 {ref.id} 状态：{state.phase}（{state.raw_status or '-'}）")
                 last_phase = state.phase
@@ -1006,6 +1302,52 @@ class Orchestrator:
                 return st[0]["phase"]
         return states.RUNNING
 
+    def _check_platform_label(self, ctx: _Launch, ref: InstanceRef, state: InstanceState) -> None:
+        """平台回报的标签必须和创建时的一字不差：gc 和按标签查找都靠它识别 dgpu 的实例。"""
+        actual = state.ref.label
+        if not actual or actual == ref.label:
+            return
+        message = (
+            f"!! 平台把实例 {ref.backend}/{ref.id} 的标签改成了 {actual!r}"
+            f"（创建时是 {ref.label!r}，"
+            "可能是长度或字符被截断、改写）。dgpu gc 和按标签查找都靠这个标签识别 dgpu 的实例，"
+            "标签不对就可能漏掉遗留实例，所以停止提交，并按实例 ID 销毁它。请把这个问题报告给 "
+            "dgpu 的维护者（附上任务名），并用 `dgpu gc --dry-run` 和平台控制台确认没有遗留。"
+        )
+        self.echo(message)
+        self._event(
+            ctx.job_id,
+            states.EV_CREATE_FAILED,
+            ctx.attempt,
+            message,
+            {"instance_id": ref.id, "expected_label": ref.label, "actual_label": actual},
+        )
+        raise DgpuError(message)  # _abort_launch 按 ctx.ref（实例 ID）销毁
+
+    def _price_rejected(self, ctx: _Launch, ref: InstanceRef, price: float) -> _Outcome:
+        """实例的实际价格高于上限（搜索到创建之间涨价，或平台的价格口径和假设不同）。"""
+        ceiling = ctx.request.max_price_per_hour
+        detail = (
+            f"实例 {ref.id} 的实际价格 {price:.4f} {ctx.currency}/h 高于上限 "
+            f"{ceiling:g} {ctx.currency}/h（搜索时 offer {ctx.offer.id if ctx.offer else '?'} "
+            f"报价 {ctx.offer.price_per_hour if ctx.offer else '?'}）"
+        )
+        self.echo(detail + "，销毁并换下一台")
+        self._event(
+            ctx.job_id,
+            states.EV_OFFER_REJECTED,
+            ctx.attempt,
+            detail,
+            {
+                "instance_id": ref.id,
+                "price_per_hour": price,
+                "max_price_per_hour": ceiling,
+                **(_offer_data(ctx.offer) if ctx.offer else {}),
+            },
+        )
+        self._destroy_ctx(ctx, ref, why="实际价格高于上限")
+        return _Outcome("price", states.REASON_NO_OFFER, True, detail)
+
     def _preflight_failed(self, ctx: _Launch, ref: InstanceRef, detail: str) -> _Outcome:
         self.echo(detail + "，换下一台")
         self._event(
@@ -1031,11 +1373,19 @@ class Orchestrator:
         return _Outcome("runner_timeout", states.REASON_RUNNER_TIMEOUT, True, detail)
 
     def _abort_launch(self, ctx: _Launch, exc: BaseException) -> list[str]:
-        """异常路径：销毁（可能）创建的实例，写终态，删启动文档。返回需要大声报告的问题。"""
+        """异常路径：销毁（可能）创建的实例，写终态，删启动文档。返回需要大声报告的问题。
+
+        Ctrl-C、SIGTERM、SIGHUP（Terminated）都是 KeyboardInterrupt，走同一条路径。
+        create 的结果未知时，按标签重复查几次；仍然查不到就如实说“结果未知”，绝不说
+        “已销毁”，并把这个 attempt 作废：晚到的实例的 runner 会被隔离，gc 把它当作旧 attempt
+        销毁。
+        """
         problems: list[str] = []
         interrupted = isinstance(exc, KeyboardInterrupt)
+        how = interrupt_name(exc) if interrupted else ""
         if interrupted:
-            self.echo("收到中断，正在清理：销毁已创建的实例……")
+            self.echo(f"收到中断（{how}），正在清理：销毁已创建的实例……")
+        launch_attempt = ctx.attempt  # 启动文档属于这个 attempt
 
         def report(step: str, cleanup_exc: BaseException) -> None:
             # 清理本身失败（含再次 Ctrl-C）：大声说，继续做剩下的步骤，不吞原异常
@@ -1048,31 +1398,58 @@ class Orchestrator:
             problems.append(message)
 
         # 1. 销毁已创建或可能已创建的实例
+        destroyed: list[str] = []
+        unknown_label: str | None = None
+        why = f"启动被中断（{how}）" if interrupted else "启动异常退出"
         try:
             refs: list[InstanceRef] = []
             if ctx.ref is not None:
                 refs.append(ctx.ref)
             elif ctx.create_unknown and ctx.label:
-                refs.extend(self._lookup_label(ctx.backend, ctx.label))
+                unknown_label = ctx.label  # 查到之前都算结果未知
+                refs.extend(self._lookup_label_patiently(ctx.backend, ctx.label))
+                if refs:
+                    unknown_label = None
             for ref in refs:
                 try:
-                    self._destroy_ctx(
-                        ctx, ref, why="submit 异常退出" if not interrupted else "Ctrl-C"
-                    )
+                    self._destroy_ctx(ctx, ref, why=why)
+                    destroyed.append(ref.id)
                 except DestroyFailed as destroy_exc:
                     problems.append(str(destroy_exc))
         except BaseException as cleanup_exc:
             report("销毁实例", cleanup_exc)
+        fenced_by_other = isinstance(exc, AttemptConflict | _CancelRequested)
+        if unknown_label is not None:
+            message = (
+                f"!! 创建实例的请求结果未知：按标签 {unknown_label} 查了 "
+                f"{len(CREATE_UNKNOWN_LOOKUP_DELAYS_S)} 次都没找到实例，"
+                "但它可能稍后才出现并开始计费。"
+                f"请在 {LATE_INSTANCE_GC_MIN} 分钟后运行 `dgpu gc`（它会销毁这个任务留下的实例），"
+                "并到平台控制台确认。"
+            )
+            self.echo(message)
+            problems.append(message)
+            if not fenced_by_other:
+                try:
+                    self._fence_unknown_attempt(ctx, unknown_label)
+                except BaseException as cleanup_exc:
+                    report("作废 attempt", cleanup_exc)
         # 2. 写终态（runner 已写或已被别的进程接管时不写）
-        if not isinstance(exc, AttemptConflict | _CancelRequested):
+        if not fenced_by_other:
             if interrupted:
                 phase, reason = states.CANCELLED, None
-                message = "submit 被中断（Ctrl-C），启动中的实例已销毁"
+                message = f"启动被中断（{how}）"
             else:
                 phase, reason = states.FAILED, states.REASON_STARTUP
                 message = f"启动过程中出错：{exc}"
-            if problems:
-                message = message.replace("，启动中的实例已销毁", "")
+            if destroyed:
+                message += f"；已销毁实例 {'、'.join(destroyed)}"
+            if unknown_label is not None:
+                message += (
+                    f"；创建实例的结果未知，标签为 {unknown_label} 的实例可能稍后出现并计费，"
+                    f"请在 {LATE_INSTANCE_GC_MIN} 分钟后运行 `dgpu gc`（它会销毁这个实例）"
+                )
+            elif problems:
                 message += "；有实例可能没有销毁，见 `dgpu gc`"
             try:
                 self._write_terminal_if_absent(ctx.job_id, ctx.attempt, phase, reason, message)
@@ -1080,10 +1457,64 @@ class Orchestrator:
                 report("写终态", cleanup_exc)
         # 3. 删掉含存储凭据的启动文档
         try:
-            self.store.delete(layout.secrets_key(ctx.job_id, ctx.attempt))
+            self.store.delete(layout.secrets_key(ctx.job_id, launch_attempt))
         except BaseException as cleanup_exc:
             report("删除启动文档", cleanup_exc)
         return problems
+
+    def _lookup_label_patiently(self, backend: Backend, label: str) -> list[InstanceRef]:
+        """按标签查几次（刚创建的实例可能稍后才出现在列表里）。查询本身出错也继续查。"""
+        errors: list[str] = []
+        for delay in CREATE_UNKNOWN_LOOKUP_DELAYS_S:
+            if delay:
+                self.sleep(delay)
+            try:
+                found = self._lookup_label(backend, label)
+            except Exception as exc:  # noqa: BLE001 - 平台暂时不可用：记下来，下一次再查
+                errors.append(f"{type(exc).__name__}: {exc}")
+                continue
+            if found:
+                return found
+        if errors:
+            self.echo(f"按标签 {label} 查询实例时出错 {len(errors)} 次，最后一次：{errors[-1]}")
+        return []
+
+    def _fence_unknown_attempt(self, ctx: _Launch, label: str) -> None:
+        """create 结果未知、要放弃这次启动：把 attempt + 1，作废可能晚到的实例。
+
+        晚到实例的 runner 启动时读到更大的 attempt 就自行退出（不写状态），gc 把它当作旧
+        attempt 销毁。终态随后写给新的 attempt。
+        """
+        old = ctx.attempt
+
+        def bump(doc: dict[str, Any]) -> dict[str, Any]:
+            new_attempt = int(doc["attempt"]) + 1
+            doc.update(
+                attempt=new_attempt,
+                label=layout.label(ctx.job_id, new_attempt),
+                instance_id=None,
+                created_at=self.clock(),
+            )
+            return doc
+
+        try:
+            doc = self._update_attempt(ctx.job_id, bump, expect_attempt=old)
+        except AttemptConflict:
+            return  # 别的进程已经推进了 attempt：旧 attempt 同样被作废
+        ctx.attempt = int(doc["attempt"])
+        self._event(
+            ctx.job_id,
+            states.EV_RELAUNCH,
+            ctx.attempt,
+            f"attempt {old} 的创建结果未知（标签 {label}），作废它，改记为 attempt {ctx.attempt}；"
+            "晚到的实例会被隔离，由 gc 销毁",
+            {
+                "old_attempt": old,
+                "new_attempt": ctx.attempt,
+                "why": "create_unknown",
+                "label": label,
+            },
+        )
 
     def _prepare_launch(self, ctx: _Launch) -> LaunchSpec:
         """写本次尝试的启动文档（含存储凭据），生成只含预签名 URL 的启动命令。"""
@@ -1168,12 +1599,20 @@ class Orchestrator:
         job_id: str,
         attempt: int | None,
         why: str,
+        already_gone: bool = False,
+        settle_until: float | None = None,
     ) -> None:
-        """销毁并确认实例消失。失败时大声输出并抛 DestroyFailed。"""
-        self.echo(f"正在销毁实例 {ref.backend}/{ref.id}（{why}）……")
+        """销毁并确认实例消失。失败时大声输出并抛 DestroyFailed。
+
+        already_gone：平台已经查不到它。照样发一次销毁（刚创建的实例可能只是还没出现在
+        查询结果里），但不算作“销毁了一台实例”，不写 instance_destroyed。
+        settle_until：刚创建的实例，查不到也要观察到这个时间，确认它没有晚到。
+        """
+        if not already_gone:
+            self.echo(f"正在销毁实例 {ref.backend}/{ref.id}（{why}）……")
         try:
             backend.destroy(ref)
-            self._confirm_gone(backend, ref)
+            self._confirm_gone(backend, ref, settle_until=settle_until)
         except Exception as exc:
             message = (
                 f"!! 销毁实例 {ref.backend}/{ref.id}（标签 {ref.label}）失败：{exc}。"
@@ -1188,6 +1627,8 @@ class Orchestrator:
                 {"backend": ref.backend, "instance_id": ref.id, "label": ref.label, "why": why},
             )
             raise DestroyFailed(ref, message) from exc
+        if already_gone:
+            return
         self._event(
             job_id,
             states.EV_INSTANCE_DESTROYED,
@@ -1197,17 +1638,37 @@ class Orchestrator:
         )
 
     def _destroy_ctx(self, ctx: _Launch, ref: InstanceRef, *, why: str) -> None:
-        self._destroy(ctx.backend, ref, job_id=ctx.job_id, attempt=ctx.attempt, why=why)
+        settle = None
+        mine = ctx.ref is not None and ctx.ref.id == ref.id
+        if mine and not ctx.seen_alive and ctx.created_at is not None:
+            # 平台还从没查到过这台刚创建的实例：查不到不等于没有，观察到宽限期结束
+            settle = ctx.created_at + CREATE_GONE_GRACE_S
+        self._destroy(
+            ctx.backend, ref, job_id=ctx.job_id, attempt=ctx.attempt, why=why, settle_until=settle
+        )
         if ctx.ref is not None and ctx.ref.id == ref.id:
             ctx.ref = None
 
-    def _confirm_gone(self, backend: Backend, ref: InstanceRef) -> None:
+    def _confirm_gone(
+        self, backend: Backend, ref: InstanceRef, *, settle_until: float | None = None
+    ) -> None:
+        """销毁后确认实例消失：详情（get）和列表（list）都查不到才算。
+
+        刚创建的实例（settle_until 之前）查不到也继续观察，期间照常重发销毁。
+        """
         start = self.clock()
         last_issue = start
         while True:
             state = backend.get(ref)
             if state.phase == INST_GONE:
-                return
+                listed = self._listed_alive(backend, ref)
+                if listed is None:
+                    now = self.clock()
+                    if settle_until is None or now >= settle_until:
+                        return
+                    state = replace(state, raw_status="刚创建，观察它是否晚到")
+                else:
+                    state = listed
             now = self.clock()
             if now - start >= DESTROY_CONFIRM_TIMEOUT_S:
                 raise DgpuError(
@@ -1219,6 +1680,15 @@ class Orchestrator:
                 last_issue = now
             self.sleep(DESTROY_CONFIRM_POLL_S)
 
+    def _listed_alive(self, backend: Backend, ref: InstanceRef) -> InstanceState | None:
+        """按标签列出实例时，这个 ID 还在（且不是 GONE）就返回它的状态。"""
+        if not ref.label.startswith(layout.LABEL_PREFIX):
+            return None  # list 只接受 dgpu- 前缀；非 dgpu 标签的实例 dgpu 本来就不碰
+        for state in backend.list(ref.label):
+            if state.ref.id == ref.id and state.phase != INST_GONE:
+                return state
+        return None
+
     def _lookup_label(self, backend: Backend, label: str) -> list[InstanceRef]:
         """按精确标签查实例（list 按前缀匹配，a1 也是 a10 的前缀，所以再精确比较）。"""
         return [
@@ -1228,46 +1698,123 @@ class Orchestrator:
         ]
 
     def _destroy_job_instances(
-        self, job_id: str, backend: Backend, att_doc: dict[str, Any], *, why: str
+        self,
+        job_id: str,
+        backend: Backend,
+        att_doc: dict[str, Any],
+        *,
+        why: str,
+        max_attempt: int,
     ) -> None:
-        """销毁这个任务在该平台上的所有实例（attempt.json 记录的和按标签查到的）。失败即抛。"""
+        """销毁这个任务在该平台上 attempt ≤ max_attempt 的实例。
+
+        包括 attempt.json 记录的和按标签查到的。
+
+        max_attempt 是这次销毁所依据的判断（“attempt N 已结束”“attempt N 要被替换”）里的 N。
+        更新的 attempt 的实例属于并发的另一个 dgpu 进程（比如刚完成的 retry），不归这里销毁。
+        失败即抛。
+        """
         refs: dict[str, InstanceRef] = {}
-        attempt = att_doc.get("attempt")
-        if att_doc.get("instance_id"):
-            label = att_doc.get("label") or layout.label(job_id, int(attempt or 1))
+        attempt = int(att_doc.get("attempt") or 1)
+        if att_doc.get("instance_id") and attempt <= max_attempt:
+            label = att_doc.get("label") or layout.label(job_id, attempt)
             ref = InstanceRef(backend=backend.name, id=str(att_doc["instance_id"]), label=label)
             refs[ref.id] = ref
         for state in backend.list(f"{layout.LABEL_PREFIX}{job_id}-a"):
             parsed = layout.parse_label(state.ref.label)
             if parsed is None or parsed[0] != job_id or state.phase == INST_GONE:
                 continue
+            if parsed[1] > max_attempt:
+                self.echo(
+                    f"跳过实例 {state.ref.id}（标签 {state.ref.label}）：它属于更新的 attempt "
+                    f"{parsed[1]}，这次只处理 attempt ≤ {max_attempt} 的实例。"
+                )
+                continue
             refs.setdefault(state.ref.id, state.ref)
         for ref in refs.values():
-            if backend.get(ref).phase == INST_GONE:
-                continue
+            # 平台说已经没有了也照样发一次销毁（刚创建的实例可能只是还没出现在查询结果里）
+            gone = backend.get(ref).phase == INST_GONE
             parsed = layout.parse_label(ref.label)
             self._destroy(
-                backend, ref, job_id=job_id, attempt=parsed[1] if parsed else attempt, why=why
+                backend,
+                ref,
+                job_id=job_id,
+                attempt=parsed[1] if parsed else attempt,
+                why=why,
+                already_gone=gone,
             )
 
-    def _cleanup_after_end(self, job_id: str) -> None:
-        """任务到终态后确认实例已销毁（AutoDL 需要 CLI 删除部署记录），删掉残留的启动文档。"""
-        got = self._read_doc(layout.attempt_key(job_id), "attempt.json")
+    def _cleanup_after_end(self, job_id: str, seen_attempt: int | None) -> tuple[str, ...]:
+        """任务到终态后确认实例已销毁（AutoDL 需要 CLI 删除部署记录），删掉残留的启动文档。
+
+        seen_attempt 是看到终态的那个 attempt：attempt.json 已经前进（并发的 retry 启动了新
+        attempt）时什么都不做，新 attempt 的实例不归这里管。返回需要大声报告的问题（实例
+        可能仍在计费）；问题已经输出，并写了 destroy_failed 事件。
+        """
+        problems: list[str] = []
+
+        def problem(message: str, data: dict[str, Any]) -> None:
+            self.echo(message)
+            problems.append(message)
+            self._event(job_id, states.EV_DESTROY_FAILED, seen_attempt, message, data)
+
+        try:
+            got = self._read_doc(layout.attempt_key(job_id), "attempt.json")
+        except DgpuError as exc:
+            problem(
+                f"!! 任务 {job_id} 已结束，但读不到 attempt.json，无法确认实例已销毁：{exc}。"
+                "实例可能仍在计费：请稍后运行 `dgpu gc`。",
+                {"why": "cleanup_read_attempt"},
+            )
+            return tuple(problems)
         if got is None:
-            return
+            return ()
         att = got[0]
-        self.store.delete(layout.secrets_key(job_id, int(att["attempt"])))
+        current = int(att.get("attempt") or 0)
+        if seen_attempt is not None and current > seen_attempt:
+            self.echo(
+                f"任务 {job_id} 已经被重试到 attempt {current}，attempt {seen_attempt} 的实例"
+                "交给那次重试（它先确认旧实例已销毁）和 `dgpu gc` 处理。"
+            )
+            return ()
+        upto = seen_attempt if seen_attempt is not None else current
+        label = att.get("label") or layout.label(job_id, upto or 1)
+        try:
+            self.store.delete(layout.secrets_key(job_id, upto))
+        except Exception as exc:  # noqa: BLE001 - 大声报告，继续清理实例
+            message = (
+                f"!! 删除任务 {job_id} attempt {upto} 的启动文档（含存储凭据）失败：{exc}。"
+                "请稍后再运行 `dgpu wait` 或手动删除。"
+            )
+            self.echo(message)
+            problems.append(message)
         backend = self.backends.get(att.get("backend"))
         if backend is None:
-            self.echo(
-                f"注意：没有 {att.get('backend')} 平台的凭据，无法确认实例已销毁；"
-                "请在有凭据的电脑上跑 `dgpu gc`。"
+            problem(
+                f"!! 没有 {att.get('backend')} 平台的凭据，无法确认任务 {job_id} 的实例"
+                f"（标签 {label}）已销毁，它可能仍在计费：请在有凭据的电脑上运行 `dgpu gc`。",
+                {"backend": att.get("backend"), "label": label, "why": "no_credentials"},
             )
-            return
+            return tuple(problems)
         try:
-            self._destroy_job_instances(job_id, backend, att, why="任务已结束，清理实例")
-        except DgpuError:
-            pass  # _destroy 已经大声输出了实例 ID；任务结果照常返回，gc 会再试
+            self._destroy_job_instances(
+                job_id, backend, att, why="任务已结束，清理实例", max_attempt=upto
+            )
+        except DestroyFailed as exc:
+            problems.append(str(exc))  # _destroy 已经大声输出并写了 destroy_failed
+        except Exception as exc:  # noqa: BLE001 - 平台或存储出错：大声报告，任务结果照常返回
+            problem(
+                f"!! 任务 {job_id} 已结束，但清理实例时出错：{exc}。标签为 {label} 的实例"
+                "（实例 ID " + str(att.get("instance_id") or "未知") + "）可能仍在计费："
+                "请稍后运行 `dgpu gc`，或到平台控制台检查。",
+                {
+                    "backend": backend.name,
+                    "instance_id": att.get("instance_id"),
+                    "label": label,
+                    "why": "cleanup_error",
+                },
+            )
+        return tuple(problems)
 
     # ============================================================ attempt.json / status.json
 
@@ -1413,9 +1960,27 @@ class Orchestrator:
                 "读权限，否则下载数据会失败（FAILED(data_sync)）。"
             )
 
-    def _check_local_file_sizes(self, spec: JobSpec) -> None:
+    def _scan_local_data(self, spec: JobSpec) -> dict[str, Any]:
+        """data 里每个本地目录的文件清单（数据名 → scan_data 的结果）。只遍历这一次。"""
+        listings: dict[str, Any] = {}
+        for ref in spec.data:
+            if ref.local_path is None:
+                continue
+            listings[ref.name] = self.deps.scan_data(Path(ref.local_path))
+        return listings
+
+    def _check_local_file_sizes(self, listings: dict[str, Any]) -> None:
         """本地数据里有超过单次上传上限的文件：上传任何东西之前就报错。"""
-        too_big = _oversized_local_files(spec, SINGLE_UPLOAD_LIMIT)
+        too_big = sorted(
+            (
+                (name, str(Path(listing.root) / item.path), item.size)
+                for name, listing in listings.items()
+                for item in listing.files
+                if item.size > SINGLE_UPLOAD_LIMIT
+            ),
+            key=lambda entry: entry[2],
+            reverse=True,
+        )
         if not too_big:
             return
         name, path, size = too_big[0]
@@ -1447,11 +2012,23 @@ class Orchestrator:
         if got is None:
             return None
         doc, etag = got
+        self._check_version(key, doc, what)
+        return doc, etag
+
+    def _read_meta(self, key: str, what: str) -> StoredJson | None:
+        """读 JSON 文档和它的存储时间（LastModified、存储的当前时间），用来算多久没更新。"""
+        got = self.store.get_json_meta(key)
+        if got is None:
+            return None
+        self._check_version(key, got.doc, what)
+        return got
+
+    @staticmethod
+    def _check_version(key: str, doc: dict[str, Any], what: str) -> None:
         try:
             states.check_version(doc, what)
         except ValueError as exc:
             raise DgpuError(f"{key}：{exc}。可能是更新版本的 dgpu 写的，请升级 dgpu。") from None
-        return doc, etag
 
     def _read_request(self, job_id: str) -> tuple[GpuRequest, str]:
         got = self._read_doc(layout.request_key(job_id), "request.json")
@@ -1468,10 +2045,13 @@ class Orchestrator:
         )
         return request, str(doc["backend"])
 
-    def _build_request(self, spec: JobSpec, backend_name: str) -> tuple[GpuRequest, int, bool]:
+    def _build_request(
+        self, spec: JobSpec, backend_name: str, listings: dict[str, Any]
+    ) -> tuple[GpuRequest, int, bool]:
         max_price = spec.limits.max_price(backend_name)
         image = spec.image_for(backend_name)
-        local_bytes = _local_data_bytes(spec)
+        # 和上传同一份清单（跟随符号链接），估算的就是实际要传、要拷到实例上的量
+        local_bytes = sum(int(listing.total_bytes) for listing in listings.values())
         has_remote = any(not ref.is_local for ref in spec.data)
         if self.config.disk_gb is not None:
             disk_gb = int(self.config.disk_gb)
@@ -1525,18 +2105,50 @@ class Orchestrator:
             "或用 --backend 换平台。没有创建实例，也没有写入存储。"
         )
 
+    def _runner_settings(self) -> dict[str, float]:
+        return runner_util.runner_settings({"runner": self.config.runner.to_dict()})
+
+    def _teardown_worst_case_s(self) -> float:
+        """runner 从决定停止到自毁结束最多用多久（和 runner、watchdog 同一个公式）。"""
+        settings = self._runner_settings()
+        return runner_util.teardown_worst_case_s(settings, runner_util.DEFAULT_TUNING)
+
+    def _startup_window_s(self) -> float:
+        return (self.config.startup_timeout_min + self.config.runner_timeout_min) * 60.0
+
+    def _billed_hours(self, max_hours: float) -> float:
+        """一台机器最坏计费多久：启动窗口 + 实例存活时限（max_hours + 收尾 + watchdog 余量）。"""
+        lifetime = runner_util.instance_lifetime_s(
+            max_hours, self._runner_settings(), runner_util.DEFAULT_TUNING
+        )
+        return (self._startup_window_s() + lifetime) / 3600.0
+
     def _print_ceiling(self, req: GpuRequest, currency: str) -> float:
-        ceiling = req.max_price_per_hour * req.max_hours
+        price = req.max_price_per_hour
+        hours = self._billed_hours(req.max_hours)
+        startup_h = self._startup_window_s() / 3600.0
+        teardown_h = hours - startup_h - req.max_hours
+        ceiling = price * hours
         self.echo(
-            f"费用上限：{req.max_price_per_hour:g} {currency}/h × {req.max_hours:g} h = "
-            f"{ceiling:.2f} {currency}（不含流量费）"
+            f"费用上限：{price:g} {currency}/h × {hours:.2f} h = {ceiling:.2f} {currency}"
+            f"（不含流量费；{hours:.2f} h = 启动最多 {startup_h:.2f} h + max_hours "
+            f"{req.max_hours:g} h + 收尾最多 {teardown_h:.2f} h，到时间实例一定被销毁）"
+        )
+        self.echo(
+            f"另外：每台启动失败而被换掉的机器最多再花 {price * startup_h:.2f} {currency}"
+            f"（最多换 {self.config.max_offers} 台）；每次 retry（包括 wait --retries）"
+            "都按上面的上限再算一次。"
         )
         return ceiling
 
     def _check_balance(self, backend: Backend, ceiling: float, currency: str) -> None:
         balance = backend.balance()
         if balance is None:
-            self.echo("平台没有提供余额，跳过余额检查。")
+            note = getattr(backend, "balance_note", "") or "平台没有提供余额"
+            self.echo(
+                f"注意：未检查余额（{note}）。请自己确认账户余额够覆盖费用上限 "
+                f"{ceiling:.2f} {currency}。"
+            )
             return
         if balance.currency != currency:
             self.echo(
@@ -1552,21 +2164,48 @@ class Orchestrator:
             )
         self.echo(f"账户余额 {balance.amount:.2f} {currency}，够用。")
 
-    def _upload_job_files(
-        self, spec: JobSpec, job_id: str, backend_name: str, request: GpuRequest
-    ) -> None:
+    def _pack_code(self, spec: JobSpec, tmp: Path, accept_skipped_links: bool) -> Path:
+        """把代码目录打包到 tmp/code.tar.gz。跳过的条目逐个列出；坏链接默认拒绝。"""
         self.echo(f"打包代码 {spec.code} ……")
         # data 里的本地目录单独上传；它们在代码目录里时不能再打进代码包
         local_data = [Path(ref.local_path) for ref in spec.data if ref.local_path is not None]
-        with tempfile.TemporaryDirectory(prefix="dgpu-") as tmp:
-            archive = Path(tmp) / "code.tar.gz"
-            self.deps.pack_code(Path(spec.code), archive, exclude=local_data)
-            self.store.put_file(layout.code_key(job_id), archive)
+        archive = tmp / "code.tar.gz"
+        result = self.deps.pack_code(Path(spec.code), archive, exclude=local_data)
+        skipped = tuple(getattr(result, "skipped", ()) or ())
+        bad_links = tuple(getattr(result, "skipped_links", ()) or ())
+        if skipped:
+            self.echo(f"注意：代码包跳过了 {len(skipped)} 个条目，它们不会出现在实例上：")
+            for rel, reason in skipped[:MAX_SKIPPED_SHOWN]:
+                self.echo(f"  {rel}：{reason}")
+            if len(skipped) > MAX_SKIPPED_SHOWN:
+                self.echo(f"  ……另有 {len(skipped) - MAX_SKIPPED_SHOWN} 个")
+        if bad_links and not accept_skipped_links:
+            shown = "、".join(bad_links[:5]) + ("等" if len(bad_links) > 5 else "")
+            raise DgpuError(
+                f"代码目录里有 {len(bad_links)} 个坏掉或指向代码目录之外的符号链接（{shown}），"
+                "它们没有打进代码包，训练代码用到它们时会在实例上失败。修好或删掉这些链接；"
+                "确认不需要它们时加 --yes 提交。没有上传任何东西，也没有创建实例。"
+            )
+        return archive
+
+    def _upload_job_files(
+        self,
+        spec: JobSpec,
+        job_id: str,
+        backend_name: str,
+        request: GpuRequest,
+        archive: Path,
+        listings: dict[str, Any],
+    ) -> None:
+        self.store.put_file(layout.code_key(job_id), archive)
         sources: list[DataSource] = []
         for ref in spec.data:
             if ref.is_local:
                 self.echo(f"准备数据 {ref.name}（本地 {ref.local_path}）……")
-            sources.append(self.deps.resolve_data(self.store, ref))
+                source = self.deps.resolve_data(self.store, ref, manifest=listings.get(ref.name))
+            else:
+                source = self.deps.resolve_data(self.store, ref)
+            sources.append(source)
         remote_spec = build_remote_spec(
             spec, job_id=job_id, backend=backend_name, data=sources, runner=self.config.runner
         )
@@ -1623,31 +2262,37 @@ class Orchestrator:
     def _view(
         self,
         job_id: str,
-        att: dict[str, Any] | None,
-        st: dict[str, Any] | None,
-        hb: dict[str, Any] | None,
+        att_meta: StoredJson | None,
+        st_meta: StoredJson | None,
+        hb_meta: StoredJson | None,
     ) -> JobView:
+        """合成任务视图。“多久没动静”一律用存储的时钟算（对象的 LastModified 和读取时
+        存储的当前时间），不比较本机和租来的实例的时钟。"""
         cfg = self.config
-        now = self.clock()
+        att = att_meta.doc if att_meta else None
+        st = st_meta.doc if st_meta else None
+        hb = hb_meta.doc if hb_meta else None
         current = (att or {}).get("attempt") or (st or {}).get("attempt")
         status_attempt = (st or {}).get("attempt")
         if st is None or (status_attempt or 0) < (current or 0):
             base_phase = states.PROVISIONING  # 已换到新的 attempt，状态还没写
-            base_time = (att or {}).get("created_at")
+            base_meta = att_meta  # 换 attempt 的时间就是 attempt.json 的写入时间
         else:
             base_phase = st.get("phase") or states.PROVISIONING
-            base_time = st.get("updated_at")
+            base_meta = st_meta
         hb_current = hb if hb is not None and hb.get("attempt") == current else None
         if hb_current is not None and base_phase in _CLI_PHASES:
             base_phase = states.RUNNING  # runner 已发心跳，状态写入稍晚
         lost = False
-        hb_age = now - hb_current["ts"] if hb_current and hb_current.get("ts") else None
+        hb_age = hb_meta.age_s if hb_current is not None and hb_meta is not None else None
+        silence: float | None = None
         if base_phase in (states.RUNNING, states.UPLOADING):
-            ref_time = hb_current.get("ts") if hb_current else base_time
-            lost = ref_time is not None and now - ref_time > cfg.lost_after_min * 60
+            silence = hb_age if hb_age is not None else (base_meta.age_s if base_meta else None)
+            lost = silence is not None and silence > cfg.lost_after_min * 60
         elif base_phase in _CLI_PHASES:
-            window = (cfg.startup_timeout_min + cfg.runner_timeout_min + cfg.lost_after_min) * 60
-            lost = base_time is not None and now - base_time > window
+            silence = base_meta.age_s if base_meta else None
+            window = self._startup_window_s() + cfg.lost_after_min * 60
+            lost = silence is not None and silence > window
         return JobView(
             job_id=job_id,
             phase=states.LOST if lost else base_phase,
@@ -1671,32 +2316,38 @@ class Orchestrator:
             synced_bytes=hb_current.get("synced_bytes") if hb_current else None,
             last_sync_at=hb_current.get("last_sync_at") if hb_current else None,
             lost=lost,
+            silence_s=silence,
         )
 
     def _load_job_docs(self, job_id: str) -> _JobDocs:
-        att = self._read_doc(layout.attempt_key(job_id), "attempt.json")
-        st = self._read_doc(layout.status_key(job_id), "status.json")
-        hb = self._read_doc(layout.heartbeat_key(job_id), "heartbeat.json")
+        att = self._read_meta(layout.attempt_key(job_id), "attempt.json")
+        st = self._read_meta(layout.status_key(job_id), "status.json")
+        hb = self._read_meta(layout.heartbeat_key(job_id), "heartbeat.json")
         exists = att is not None or st is not None or self.store.exists(layout.spec_key(job_id))
-        return _JobDocs(
-            exists=exists,
-            attempt=att[0] if att else None,
-            status=st[0] if st else None,
-            heartbeat=hb[0] if hb else None,
-        )
+        return _JobDocs(exists=exists, attempt=att, status=st, heartbeat=hb)
 
     def _gc_decide(
         self, docs: _JobDocs, attempt: int, inst: InstanceState, now: float
     ) -> tuple[bool, str]:
+        """gc 是否销毁这台实例：(是否销毁, 原因)。
+
+        心跳过期用存储的时钟算。心跳过期只说明可能失联：平台显示实例已退出或状态未知，或者
+        心跳停的时间超过 runner 最坏收尾时间，才销毁；平台显示仍在运行时报告“失联（实例仍在
+        运行）”并保留（runner 可能在最终上传或暂时连不上存储）。
+        本 attempt 从没有过心跳的实例按启动窗口判断（实例创建时间来自平台）。
+        """
         cfg = self.config
         inst_age = now - inst.created_at if inst.created_at is not None else None
         if not docs.exists:
-            if inst_age is None:
-                return False, "存储里没有这个任务，实例创建时间未知，保留"
-            if inst_age > ORPHAN_MIN_AGE_S:
-                return True, f"存储里没有这个任务，实例已存在 {inst_age / 60:.0f} 分钟"
-            return False, "存储里没有这个任务，但实例创建不到 1 小时（可能正在别处提交），保留"
-        att, st, hb = docs.attempt, docs.status, docs.heartbeat
+            age = f"实例已存在 {inst_age / 60:.0f} 分钟" if inst_age is not None else "实例年龄未知"
+            return False, (
+                f"存储 {self.store.profile.name}（bucket {self.store.profile.bucket}）里查不到这个"
+                f"任务，可能属于另一份配置或共用平台账户的人；{age}。不自动销毁，确认是自己的遗留"
+                "实例后用 `dgpu gc --include-unknown` 销毁"
+            )
+        att = docs.attempt.doc if docs.attempt else None
+        st = docs.status.doc if docs.status else None
+        hb = docs.heartbeat.doc if docs.heartbeat else None
         current = (att or {}).get("attempt") or (st or {}).get("attempt")
         if current is not None and attempt < current:
             return True, f"旧 attempt（当前是 attempt {current}）"
@@ -1709,21 +2360,29 @@ class Orchestrator:
         deadline = (att or {}).get("deadline_at")
         if deadline is not None and attempt == current and now > deadline:
             return True, f"超过截止时间 {(now - deadline) / 60:.0f} 分钟"
-        hb_mine = hb if hb is not None and hb.get("attempt") == attempt else None
-        hb_age = now - hb_mine["ts"] if hb_mine is not None and hb_mine.get("ts") else None
-        if hb_age is not None and hb_age <= cfg.gc_stale_min * 60:
-            return False, f"运行中（{hb_age:.0f} 秒前有心跳）"
+        hb_mine = hb is not None and hb.get("attempt") == attempt
+        if hb_mine and docs.heartbeat is not None:
+            silence = docs.heartbeat.age_s
+            if silence <= cfg.gc_stale_min * 60:
+                return False, f"运行中（{silence:.0f} 秒前有心跳）"
+            quiet = f"心跳已停 {silence / 60:.0f} 分钟"
+            if inst.phase in (INST_EXITED, INST_UNKNOWN):
+                return True, f"{quiet}，平台显示实例 {inst.phase}（{inst.raw_status or '-'}）"
+            teardown = self._teardown_worst_case_s()
+            if silence > teardown:
+                return True, f"{quiet}，超过 runner 最坏收尾时间 {teardown / 60:.0f} 分钟"
+            return False, (
+                f"失联（实例仍在运行）：{quiet}，平台显示 {inst.phase}；runner 可能在最终上传或"
+                f"暂时连不上存储。心跳停满 {teardown / 60:.0f} 分钟或实例退出后才清理"
+            )
         age = inst_age
-        if age is None and att is not None and attempt == current and att.get("created_at"):
-            age = now - att["created_at"]
-        startup_window = (cfg.startup_timeout_min + cfg.runner_timeout_min) * 60
+        if age is None and docs.attempt is not None and attempt == current:
+            age = docs.attempt.age_s  # 平台没给创建时间：用换到这个 attempt 的时间（存储时钟）
         if age is None:
-            return False, "没有新心跳，但实例年龄未知，保留"
-        if age <= startup_window:
+            return False, "没有心跳，但实例年龄未知，保留"
+        if age <= self._startup_window_s():
             return False, "实例还在启动窗口内，保留"
-        if hb_age is None:
-            return True, f"实例已存在 {age / 60:.0f} 分钟仍没有心跳"
-        return True, f"心跳已过期 {hb_age / 60:.0f} 分钟"
+        return True, f"实例已存在 {age / 60:.0f} 分钟仍没有心跳"
 
     def _check_store(self) -> CheckResult:
         name = f"存储 {self.store.profile.name}（bucket {self.store.profile.bucket}）"
@@ -1757,26 +2416,27 @@ class Orchestrator:
             return CheckResult(name, False, f"{type(exc).__name__}: {exc}")
 
     def _check_backend(self, name: str, backend: Backend) -> CheckResult:
+        title = f"平台 {name}"
         try:
             balance = backend.balance()
             if balance is not None:
                 return CheckResult(
-                    f"平台 {name}", True, f"可以访问，余额 {balance.amount:.2f} {balance.currency}"
+                    title, True, f"可以访问，余额 {balance.amount:.2f} {balance.currency}"
                 )
-            probe = GpuRequest(
-                names=("RTX 4090", "RTX 3090"),
-                count=1,
-                max_price_per_hour=1000.0,
-                max_hours=1,
-                disk_gb=MIN_DISK_GB,
-                image="",
-            )
-            found = backend.search(probe)
-            return CheckResult(
-                f"平台 {name}", True, f"可以访问（平台不提供余额；搜索返回 {len(found)} 个 offer）"
-            )
+            # 余额查不到：用一个只读、需要认证的调用确认 key 本身有效
+            listed = backend.list(layout.LABEL_PREFIX)
         except Exception as exc:
-            return CheckResult(f"平台 {name}", False, f"{type(exc).__name__}: {exc}")
+            return CheckResult(title, False, f"{type(exc).__name__}: {exc}")
+        verified = f"key 有效（列出实例成功，当前有 {len(listed)} 台 dgpu 实例）"
+        note = getattr(backend, "balance_note", "")
+        if note:
+            return CheckResult(
+                title,
+                True,
+                f"{verified}；余额无法查询（{note}），提交前不会检查余额，请自己留意",
+                warning=True,
+            )
+        return CheckResult(title, True, f"{verified}；平台不提供余额")
 
 
 # ---------------------------------------------------------------- 模块级工具
@@ -1841,42 +2501,11 @@ def _offer_data(offer: Offer) -> dict[str, Any]:
     }
 
 
-def _local_data_bytes(spec: JobSpec) -> int:
-    total = 0
-    for ref in spec.data:
-        if ref.local_path is None:
-            continue
-        path = Path(ref.local_path)
-        if path.is_file():
-            total += path.stat().st_size
-        elif path.is_dir():
-            for root, _dirs, files in os.walk(path):
-                for name in files:
-                    full = os.path.join(root, name)
-                    if not os.path.islink(full):
-                        total += os.path.getsize(full)
-    return total
-
-
-def _oversized_local_files(spec: JobSpec, limit: int) -> list[tuple[str, str, int]]:
-    """本地数据里大于 limit 的文件：(数据名, 路径, 大小)，从大到小。
-
-    指向文件的符号链接按目标大小算；不进入指向目录的链接（上传前 packaging 还会再查一遍）。
-    """
-    found: list[tuple[str, str, int]] = []
-    for ref in spec.data:
-        if ref.local_path is None:
-            continue
-        for root, _dirs, files in os.walk(ref.local_path):
-            for name in files:
-                full = os.path.join(root, name)
-                try:
-                    size = os.stat(full).st_size
-                except OSError:
-                    continue  # 坏链接等：上传时 packaging 会报清楚的错
-                if size > limit:
-                    found.append((ref.name, full, size))
-    return sorted(found, key=lambda item: item[2], reverse=True)
+def _terminal_for_current(view: JobView) -> bool:
+    """当前 attempt 已经有终态（status.json 是这个 attempt 写的终态）。"""
+    return view.stored_phase in states.TERMINAL_PHASES and (view.status_attempt or 0) >= (
+        view.attempt or 0
+    )
 
 
 def _job_sort_key(job_id: str) -> tuple[str, str]:

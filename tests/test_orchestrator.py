@@ -18,6 +18,7 @@ from dgpu.contracts import (
     DgpuError,
 )
 from dgpu.orchestrator import AttemptConflict
+from dgpu.runner import util as runner_util
 from dgpu.testing import TEST_PROFILE, MemoryStore, make_offer
 from test_orchestrator_support import (
     MAIN_AUTODL_TOKEN,
@@ -33,6 +34,14 @@ from test_orchestrator_support import (
 def only_job_id(world: World) -> str:
     (job_id,) = world.store.list_dirs(layout.jobs_prefix())
     return job_id
+
+
+def billed_hours(world: World, max_hours: float) -> float:
+    """一台机器最坏计费的小时数：启动窗口 + 实例存活时限（和 watchdog 同一个公式）。"""
+    cfg = world.config
+    settings = runner_util.runner_settings({"runner": cfg.runner.to_dict()})
+    lifetime = runner_util.instance_lifetime_s(max_hours, settings, runner_util.DEFAULT_TUNING)
+    return ((cfg.startup_timeout_min + cfg.runner_timeout_min) * 60 + lifetime) / 3600
 
 
 def secrets_left(world: World) -> list[str]:
@@ -71,7 +80,8 @@ def test_submit_happy_path(tmp_path):
     command = world.bundler.commands[0]
     assert layout.secrets_key(job_id, 1) in command["launch_url"]
     assert command["launch_url"].endswith(f"ttl={(15 + 5) * 60 + 3600}")
-    assert "费用上限：0.5 USD/h × 2 h = 1.00 USD" in world.text()
+    hours = billed_hours(world, 2.0)
+    assert f"费用上限：0.5 USD/h × {hours:.2f} h = {0.5 * hours:.2f} USD" in world.text()
     assert not world.events(job_id, states.EV_CREATE_FAILED)
 
 
@@ -87,7 +97,7 @@ def test_offers_creates_nothing(tmp_path):
     world = World(tmp_path)
     result = world.orchestrator().offers(make_spec(tmp_path))
     assert [offer.id for offer in result.offers] == ["o1", "o2", "o3"]
-    assert result.cost_ceiling == pytest.approx(1.0)
+    assert result.cost_ceiling == pytest.approx(0.5 * billed_hours(world, 2.0))
     assert "RTX 3090" in result.constraints
     assert world.store.objects == {}
     assert world.backend.creates() == []
@@ -110,8 +120,8 @@ def test_no_offers_explains_constraints_and_writes_nothing(tmp_path):
 
 def test_insufficient_balance_stops_before_anything_is_created(tmp_path):
     world = World(tmp_path)
-    world.backend.balance_value = Balance(0.5, "USD")  # 上限是 0.5 × 2 = 1.0
-    with pytest.raises(DgpuError, match="余额 0.50 USD 不够"):
+    world.backend.balance_value = Balance(1.5, "USD")  # 上限是 0.5 × 约 3.4 h ≈ 1.72
+    with pytest.raises(DgpuError, match="余额 1.50 USD 不够"):
         world.orchestrator().submit(make_spec(tmp_path))
     assert world.store.objects == {}
     assert world.backend.creates() == []
@@ -472,6 +482,8 @@ def test_cleanup_continues_when_platform_is_down(tmp_path):
         world.orchestrator().submit(make_spec(tmp_path))
     job_id = only_job_id(world)
     status = world.doc(layout.status_key(job_id))
-    assert status["phase"] == states.FAILED and "可能没有销毁" in status["message"]
+    # 查不了标签就不知道有没有创建：如实说“结果未知”，不说“已销毁”，提示 gc
+    assert status["phase"] == states.FAILED and "结果未知" in status["message"]
+    assert "已销毁" not in status["message"] and "dgpu gc" in status["message"]
     assert secrets_left(world) == []  # 平台不可用也要删掉凭据
     assert any(line.startswith("!!") for line in world.messages)

@@ -120,6 +120,10 @@ EXIT_TIMED_OUT = 3
 EXIT_CANCELLED = 4
 EXIT_LOST = 5
 
+# 不对应某个阶段的退出码（只有 CLI 用）
+EXIT_CLEANUP_FAILED = 6  # 任务 SUCCEEDED，但结束后清理遗留实例失败（实例可能仍在计费）
+EXIT_STORE_UNREACHABLE = 7  # wait 连续多分钟读不到存储，任务结果未知（任务本身不受影响）
+
 EXIT_CODE_BY_PHASE = {
     SUCCEEDED: EXIT_SUCCEEDED,
     FAILED: EXIT_FAILED,

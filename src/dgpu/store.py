@@ -16,12 +16,14 @@
 from __future__ import annotations
 
 import base64
+import email.utils
 import hashlib
 import json
 import os
 import secrets
 import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, TypeVar
 
@@ -44,6 +46,7 @@ from dgpu.contracts import (
     SINGLE_UPLOAD_LIMIT,
     ConfigError,
     PreconditionFailed,
+    StoredJson,
     StoreError,
     StoreProfile,
 )
@@ -65,6 +68,8 @@ DEFAULT_READ_TIMEOUT_S = 60.0
 
 _CHUNK = 1024 * 1024
 _MAX_BACKOFF_S = 20.0
+# 存储不返回 Date 头时，get_json_meta 写这里的探针对象来读存储的当前时间
+_CLOCK_PROBE_PREFIX = "dgpu/clock-probe/"
 
 # 响应体读到一半断开：botocore 不会重试，这里重新发起 GET
 _STREAM_ERRORS = (HTTPClientError, IncompleteReadError)
@@ -175,6 +180,55 @@ class S3Store:
         if got is None:
             return None
         meta, data = got
+        return self._decode_json(key, meta, data)
+
+    def get_json_meta(self, key: str) -> StoredJson | None:
+        """get_json，另外返回对象的 LastModified 和存储服务端的当前时间。
+
+        服务端时间取这次响应的 Date 头（R2 和 S3 都会给）；没有 Date 头的存储写一个探针
+        对象，读它的 LastModified，再删掉。两种办法都只用存储的时钟。
+        """
+        got = self._get_object("get_json", key)
+        if got is None:
+            return None
+        meta, data = got
+        doc, etag = self._decode_json(key, meta, data)
+        modified = meta.get("LastModified")
+        if not isinstance(modified, datetime):
+            raise StoreError(
+                f"读取 {self._where(key)} 的响应里没有 LastModified，无法判断它多久没更新。"
+                "这个存储可能不完全兼容 S3；换一个存储 profile"
+            )
+        store_time = _response_date(meta)
+        if store_time is None:
+            store_time = self._probe_store_time()
+        return StoredJson(
+            doc=doc, etag=etag, last_modified=modified.timestamp(), store_time=store_time
+        )
+
+    def _probe_store_time(self) -> float:
+        """没有 Date 头时：写一个小对象，用它的 LastModified 作为存储的当前时间。"""
+        key = f"{_CLOCK_PROBE_PREFIX}{secrets.token_hex(6)}"
+        self.put_bytes(key, b"")
+        try:
+            try:
+                head = self._call(lambda: self._client.head_object(Bucket=self._bucket, Key=key))
+            except (ClientError, BotoCoreError) as exc:
+                raise self._failure("probe_time", key, exc) from exc
+        finally:
+            try:
+                self.delete(key)
+            except StoreError:
+                pass  # 探针只是一个空对象，主结果更重要；下次 gc 不会碰它
+        modified = head.get("LastModified")
+        if not isinstance(modified, datetime):
+            raise StoreError(
+                f"存储 {self.profile.name} 的响应既没有 Date 头，也没有 LastModified，"
+                "无法得到存储的当前时间。换一个存储 profile"
+            )
+        return modified.timestamp()
+
+    def _decode_json(self, key: str, meta: dict[str, Any], data: bytes) -> tuple[dict, str]:
         try:
             obj = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
@@ -516,14 +570,17 @@ class S3Store:
             if retries:
                 detail += f"，已重试 {retries} 次"
             hint = self._hint(code, status)
+            # 限流和服务端错误稍后可能恢复；认证、bucket 不存在等 4xx 重试没有意义
+            transient = code in _THROTTLE_CODES or status in (429,) or (status or 0) >= 500
         else:
             detail = f"{type(exc).__name__}: {exc}"
             hint = self._hint_for_exception(exc)
+            transient = not isinstance(exc, NoCredentialsError | PartialCredentialsError)
         message = (
             f"存储操作 {op} 失败：{self._where(key)}"
             f"（profile {self.profile.name}，endpoint {self.profile.endpoint}）：{detail}。{hint}"
         )
-        return StoreError(_redact(message, self.profile))
+        return StoreError(_redact(message, self.profile), transient=transient)
 
     def _hint(self, code: str, status: int | None) -> str:
         name = self.profile.name
@@ -581,6 +638,21 @@ def _is_precondition_failure(exc: ClientError, has_if_match: bool) -> bool:
         return True
     # If-Match 指向不存在的对象时，S3 返回 404 NoSuchKey；与 MemoryStore 一致，算条件不满足
     return has_if_match and _is_missing(exc)
+
+
+def _response_date(meta: dict[str, Any]) -> float | None:
+    """响应的 Date 头（服务端生成响应的时间），epoch 秒；没有或无法解析时返回 None。"""
+    headers = meta.get("ResponseMetadata", {}).get("HTTPHeaders") or {}
+    value = headers.get("date") or headers.get("Date")
+    if not value:
+        return None
+    try:
+        moment = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if moment is None or moment.tzinfo is None:  # RFC 7231 的 Date 一律是 GMT
+        return None
+    return moment.timestamp()
 
 
 def _quote_etag(etag: str) -> str:

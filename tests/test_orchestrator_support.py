@@ -34,6 +34,7 @@ from dgpu.contracts import (
     VastSettings,
 )
 from dgpu.orchestrator import Deps, Orchestrator
+from dgpu.packaging import scan_dataset
 from dgpu.testing import TEST_PROFILE, FakeBackend, FakeBundler, MemoryStore, make_offer
 
 MAIN_VAST_KEY = "VAST-MAIN-KEY-must-never-leak-7f3a"
@@ -93,6 +94,9 @@ class Plan:
     final_phase: str = states.SUCCEEDED
     final_reason: str | None = None
     die_after_s: float | None = None  # 第一次心跳后多久宿主机失联（不再心跳，实例仍在）
+    # 失联时平台显示的状态：None 表示平台仍显示 running（比如只是和存储断连）；
+    # "unknown" / "exited" 表示平台也知道它挂了（宿主机宕机）
+    die_platform_phase: str | None = None
     self_destroy: bool = True  # 结束时自毁（Vast）；False 则停在 exited（AutoDL 的部署记录）
     log: bool = False  # 运行时每个 tick 追加一行日志
 
@@ -166,6 +170,7 @@ class World:
         self.tmp_path = tmp_path
         self.now = T0
         self.store = store or MemoryStore()
+        self.store.clock = self.clock  # 存储的时钟就是模拟世界的时钟（LastModified、Date）
         if offers is None:
             offers = [
                 make_offer("o1", backend=backend_name, price=0.2),
@@ -182,7 +187,9 @@ class World:
         self.sleeps = 0
         self.on_sleep: list[Callable[[World], None]] = []
         self.data_uploads: list[str] = []
+        self.data_manifests: dict[str, Any] = {}  # resolve_data 收到的清单（数据名 → 清单）
         self.pack_excludes: list[list[Path]] = []
+        self.pack_result: Any = None  # pack_code 的返回值（测试可以换成带 skipped 的结果）
 
     # ---- 注入点
 
@@ -201,17 +208,19 @@ class World:
     def echo(self, message: str) -> None:
         self.messages.append(message)
 
-    def pack_code(self, code_dir: Path, dest: Path, *, exclude: Any = ()) -> None:
+    def pack_code(self, code_dir: Path, dest: Path, *, exclude: Any = ()) -> Any:
         self.pack_excludes.append([Path(path) for path in exclude])
         with tarfile.open(dest, "w:gz") as tar:
             tar.add(code_dir, arcname=".")
+        return self.pack_result
 
-    def resolve_data(self, store: Store, ref: DataRef) -> DataSource:
+    def resolve_data(self, store: Store, ref: DataRef, *, manifest: Any = None) -> DataSource:
         if ref.is_local:
             prefix = layout.dataset_prefix("hash" + ref.name)
             store.put_bytes(prefix + "data.bin", b"dataset")
             store.put_bytes(layout.dataset_complete_key("hash" + ref.name), b"")
             self.data_uploads.append(ref.name)
+            self.data_manifests[ref.name] = manifest
             return DataSource(ref.name, store.profile.bucket, prefix)
         return DataSource(ref.name, ref.bucket or "", ref.prefix or "")
 
@@ -223,6 +232,7 @@ class World:
             "bundler": self.bundler,
             "pack_code": self.pack_code,
             "resolve_data": self.resolve_data,
+            "scan_data": scan_dataset,  # 真实的遍历：符号链接、大小都和上传一致
             "clock": self.clock,
             "sleep": self.sleep,
             "echo": self.echo,
@@ -342,7 +352,12 @@ class World:
             return
         since_hb = self.now - sim.first_hb
         if plan.die_after_s is not None and since_hb >= plan.die_after_s:
-            return  # 宿主机失联：实例还在计费，但不再心跳
+            # 失联：实例还在计费，但不再心跳
+            if plan.die_platform_phase and backend.instances[sim.iid].phase != (
+                plan.die_platform_phase
+            ):
+                backend.set_phase(sim.iid, plan.die_platform_phase)
+            return
         self._heartbeat(sim)
         if plan.log:
             sim.log_lines += 1
@@ -390,21 +405,28 @@ def seed_job(
     reason: str | None = None,
     with_request: bool = True,
 ) -> None:
-    """直接往存储里写一个任务的状态文档（gc、status、wait 的测试用）。"""
+    """直接往存储里写一个任务的状态文档（gc、status、wait 的测试用）。
+
+    每个文档在存储里的修改时间（LastModified）就是它自己的时间字段：attempt.json 是
+    attempt_created_at，status.json 是 updated_at，heartbeat.json 是 hb_at。
+    """
     att = states.new_attempt_doc(
         job_id, attempt, backend, layout.label(job_id, attempt), instance_id, deadline_at
     )
     att["created_at"] = attempt_created_at
     store.put_json(layout.attempt_key(job_id), att)
+    store.modified[layout.attempt_key(job_id)] = attempt_created_at
     st = states.new_status_doc(
         job_id, status_attempt or attempt, phase, states.SRC_RUNNER, reason=reason
     )
     st["updated_at"] = updated_at
     store.put_json(layout.status_key(job_id), st)
+    store.modified[layout.status_key(job_id)] = updated_at
     if hb_at is not None:
         hb = states.new_heartbeat_doc(job_id, hb_attempt or attempt, states.RUNNING, "run")
         hb["ts"] = hb_at
         store.put_json(layout.heartbeat_key(job_id), hb)
+        store.modified[layout.heartbeat_key(job_id)] = hb_at
     store.put_json(layout.spec_key(job_id), {"version": 1, "job_id": job_id})
     if with_request:
         store.put_json(

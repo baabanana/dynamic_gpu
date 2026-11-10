@@ -80,7 +80,8 @@ def test_submit_error_exits_2_without_traceback(env):
     env.world.backend.offers = []
     result = run("submit", str(env.job_file))
     assert result.exit_code == states.EXIT_USAGE
-    assert result.stderr.startswith("错误：") and "没有符合条件的机器" in result.stderr
+    last = result.stderr.strip().splitlines()[-1]
+    assert last.startswith("错误：") and "没有符合条件的机器" in last
     assert "Traceback" not in result.output
     assert result.stdout == ""
 
@@ -185,7 +186,8 @@ def test_offers_json_and_text(env):
     assert result.exit_code == 0
     data = json.loads(result.stdout)
     assert [offer["id"] for offer in data["offers"]] == ["o1", "o2"]
-    assert data["currency"] == "USD" and data["cost_ceiling"] == pytest.approx(1.0)
+    # 价格上限 × (启动窗口 + max_hours + 收尾)，比 0.5 × 2 h 大
+    assert data["currency"] == "USD" and 1.0 < data["cost_ceiling"] < 2.0
     result = run("offers", str(env.job_file))
     assert "o3" in result.stdout and "费用上限" in result.stdout
     assert env.world.store.objects == {} and env.world.backend.creates() == []
@@ -323,6 +325,7 @@ def test_build_deps_wires_expected_external_names(tmp_path, monkeypatch):
         "dgpu.packaging",
         pack_code=lambda code_dir, dest, exclude=(): None,
         resolve_data=resolve_data,
+        scan_dataset=lambda path: ("listing", path),
     )
     module("dgpu.store", open_store=open_store)
     module("dgpu.backends.vast", VastBackend=FakeVast)
@@ -342,6 +345,7 @@ def test_build_deps_wires_expected_external_names(tmp_path, monkeypatch):
     remote = DataRef(name="b", bucket="bk", prefix="p/")
     assert deps.resolve_data(deps.store, local).bucket == "uploaded"
     assert deps.resolve_data(deps.store, remote).bucket == "remote"
+    assert deps.scan_data(tmp_path) == ("listing", tmp_path)
 
 
 def test_error_message_never_prints_main_key(env):

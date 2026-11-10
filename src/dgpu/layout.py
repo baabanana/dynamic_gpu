@@ -17,6 +17,10 @@ ROOT = "dgpu"
 _JOB_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _LABEL_RE = re.compile(r"^dgpu-(?P<job_id>[a-z0-9]+(?:-[a-z0-9]+)*)-a(?P<attempt>\d+)$")
 _NAME_CLEAN_RE = re.compile(r"[^a-z0-9]+")
+# new_job_id 生成的形状：<名字>-<yymmddHHMMSS>-<4 位小写十六进制>
+_GENERATED_JOB_ID_RE = re.compile(
+    r"^(?P<slug>[a-z0-9]+(?:-[a-z0-9]+)*)-(?P<stamp>\d{12})-(?P<rand>[0-9a-f]{4})$"
+)
 
 LABEL_PREFIX = "dgpu-"
 MAX_NAME_LEN = 24
@@ -37,6 +41,24 @@ def new_job_id(name: str, now: Optional[float] = None) -> str:
 
 def is_valid_job_id(job_id: str) -> bool:
     return bool(_JOB_ID_RE.match(job_id))
+
+
+def is_generated_job_id(job_id: Optional[str]) -> bool:
+    """job_id 是否正是 new_job_id 生成的形状（比 is_valid_job_id 严格）。
+
+    <名字>-<UTC 时间 yymmddHHMMSS>-<4 位十六进制>，名字不超过 MAX_NAME_LEN 个字符，
+    时间的月、日、时、分、秒在合法范围内。gc 只处理这种任务 ID 的标签：手工起名的
+    dgpu-xxx-a1 之类的实例不碰。
+    """
+    if not job_id:
+        return False
+    match = _GENERATED_JOB_ID_RE.match(job_id)
+    if not match or len(match.group("slug")) > MAX_NAME_LEN:
+        return False
+    stamp = match.group("stamp")
+    month, day = int(stamp[2:4]), int(stamp[4:6])
+    hour, minute, second = int(stamp[6:8]), int(stamp[8:10]), int(stamp[10:12])
+    return 1 <= month <= 12 and 1 <= day <= 31 and hour < 24 and minute < 60 and second < 61
 
 
 def label(job_id: str, attempt: int) -> str:

@@ -47,6 +47,7 @@ from dgpu.contracts import (
     Offer,
     PreconditionFailed,
     RunnerSettings,
+    StoredJson,
     StoreError,
     StoreProfile,
 )
@@ -129,6 +130,9 @@ class DirStore:
         self._lock_path = self.root / ".control" / "store.lock"
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
         self.puts: list[str] = []
+        # “存储服务端”的时钟：LastModified 是文件的 mtime，当前时间来自这里。
+        # Cloud 把它换成可快进的 SkewClock，用来模拟心跳过期。
+        self.clock = time.time
 
     # ---- 内部
 
@@ -169,6 +173,14 @@ class DirStore:
         if data is None:
             return None
         return json.loads(data), self._etag(data)
+
+    def get_json_meta(self, key: str) -> StoredJson | None:
+        with self._locked():  # 内容和 mtime 来自同一次写入
+            data = self._read(key)
+            if data is None:
+                return None
+            modified = self._path(key).stat().st_mtime
+        return StoredJson(json.loads(data), self._etag(data), modified, self.clock())
 
     def put_json(self, key, obj, *, if_match=None, if_none_match=False) -> str:
         data = json.dumps(obj, ensure_ascii=False, sort_keys=True).encode()
@@ -463,6 +475,7 @@ class Cloud:
         self.stub = DestroyStub(self.backend.self_destroy)
         self.bundler = self._bundler()
         self.clock = SkewClock()
+        self.store.clock = self.clock  # 快进时钟 = 存储“看到”的时间前进，心跳随之过期
         self.messages: list[str] = []
         self.orch = Orchestrator(
             Deps(
@@ -472,6 +485,7 @@ class Cloud:
                 bundler=self.bundler,
                 pack_code=packaging.pack_code,
                 resolve_data=packaging.resolve_data,
+                scan_data=packaging.scan_dataset,
                 clock=self.clock,
                 sleep=self.sleep,
                 echo=self.messages.append,
