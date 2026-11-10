@@ -29,6 +29,7 @@ import os
 import re
 import stat
 import tomllib
+import urllib.parse
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -179,6 +180,15 @@ def _parse_stores(table: _Table | None, env: Mapping[str, str]) -> dict[str, Sto
         if not endpoint.startswith(("https://", "http://")):
             raise ConfigError(
                 f"{section.field('endpoint')} 应该以 https:// 开头。"
+                "R2 写成 https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
+            )
+        endpoint_path = urllib.parse.urlsplit(endpoint).path.strip("/")
+        if endpoint_path:
+            # R2 控制台给的“S3 API”地址末尾带 bucket 名，照抄会让读写落到
+            # <bucket>/<bucket>/... 下、列举和实例上的 rclone 都找不到对象（真实探针里遇到）
+            raise ConfigError(
+                f"{section.field('endpoint')} 只写到域名为止，去掉末尾的 /{endpoint_path}。"
+                "bucket 名单独写在 bucket 字段。"
                 "R2 写成 https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
             )
         bucket = section.string("bucket")

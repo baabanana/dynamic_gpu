@@ -498,3 +498,15 @@ def test_template_refuses_to_follow_a_symlink(tmp_path):
     with pytest.raises(ConfigError, match="已经存在"):
         write_config_template(link)
     assert not target.exists()
+
+
+def test_endpoint_with_a_bucket_path_is_rejected(tmp_path):
+    """R2 控制台的 S3 API 地址末尾带 bucket 名；照抄会让实例上的 rclone 找不到任何对象。"""
+    import re
+
+    text, count = re.subn(
+        r'endpoint = "(https://[^"/]+)"', r'endpoint = "\1/my-bucket"', MINIMAL, count=1
+    )
+    assert count == 1
+    message = _error(_write(tmp_path, text), "stores.r2.endpoint", "只写到域名", "/my-bucket")
+    assert "bucket 字段" in message

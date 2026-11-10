@@ -2714,6 +2714,13 @@ class Orchestrator:
             got = self.store.get_json(key)
             if got is None or got[0].get("probe") != key:
                 return CheckResult(name, False, "写入后读不回同样的内容")
+            if key not in self.store.list(DOCTOR_PREFIX):
+                self.store.delete(key)
+                return CheckResult(
+                    name,
+                    False,
+                    "写入的对象列举不出来：检查 endpoint 是否只写到域名（末尾不带 bucket 名）",
+                )
             try:
                 self.store.put_json(key, probe, if_none_match=True)
                 conditional_ok = False
@@ -2728,7 +2735,7 @@ class Orchestrator:
                     False,
                     "条件写（If-None-Match）不生效，无法保证单写者；换一个支持条件写的存储",
                 )
-            return CheckResult(name, True, "读、写、条件写、删除都正常")
+            return CheckResult(name, True, "读、写、列举、条件写、删除都正常")
         except Exception as exc:
             try:
                 self.store.delete(key)

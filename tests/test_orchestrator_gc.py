@@ -331,3 +331,16 @@ def test_doctor_warns_when_the_key_cannot_read_the_balance(world):
 def test_doctor_without_backends(world):
     checks = world.orchestrator(backends={}).doctor()
     assert checks[-1].ok is False and "没有任何平台" in checks[-1].detail
+
+
+def test_doctor_detects_objects_that_cannot_be_listed(world):
+    """endpoint 末尾多写了 bucket 名时，读写正常但列举不到（真实探针里遇到）。"""
+
+    class NoListStore(MemoryStore):
+        def list(self, prefix):
+            return []
+
+    store = NoListStore()
+    checks = world.orchestrator(store=store).doctor()
+    assert checks[1].ok is False and "列举" in checks[1].detail and "endpoint" in checks[1].detail
+    assert store.objects == {}
