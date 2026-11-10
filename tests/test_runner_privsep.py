@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -67,6 +68,14 @@ class FakeSystem(privsep.System):
         self._device_mode = device_mode
         self.stat = self._stat
         self.switch = switch or (lambda uid, gid: None)
+        self.spawns = []
+        self.spawn = self._spawn
+
+    def _spawn(self, argv, env, cwd, preexec_fn):
+        # the capability probe: run it for real (as this user), with this interpreter
+        self.spawns.append(argv)
+        argv = [PY if argv[0] == "python3" else argv[0]] + list(argv[1:])
+        return privsep._spawn(argv, env, cwd, preexec_fn)
 
     def _getpwnam(self, name):
         if name not in self.users:
@@ -364,7 +373,8 @@ def test_runner_runs_setup_and_run_through_the_identity(tmp_path):
             privsep_system=system,
         )
         assert runner.run() == states.EXIT_SUCCEEDED
-        assert marker.read_text().split() == ["1500:1500", "1500:1500"]
+        # capability probe, setup, run
+        assert marker.read_text().split() == ["1500:1500", "1500:1500", "1500:1500"]
         env_txt = h.get(layout.output_prefix(h.job_id) + "env.txt").decode()
         assert f"HOME={h.work / 'home'}" in env_txt and "USER=dgpu" in env_txt
         assert "PIP_USER=1" in env_txt
@@ -404,3 +414,163 @@ def test_remote_spec_carries_run_as_root():
         spec(run_as_root=True), job_id="j", backend="vast", data=[], runner=RunnerSettings()
     )
     assert remote["run_as_root"] is True
+
+
+# ---------------------------------------------------------------- F8: hardening
+
+
+class _Stop(Exception):
+    pass
+
+
+def _big_dataset(paths, files=600):
+    folder = os.path.join(paths.data, "big")
+    os.makedirs(folder, exist_ok=True)
+    for index in range(files):
+        open(os.path.join(folder, f"{index}.jpg"), "w").close()
+    return folder
+
+
+def test_f8_chown_of_a_large_tree_stops_when_asked(layout_root):
+    sandbox, paths = layout_root
+    _big_dataset(paths)
+    system = FakeSystem(sandbox, users={"dgpu": (1500, 1500)}, probe=_probe(writable=True))
+    checks = []
+
+    def check():  # the runner passes its cancel / deadline check
+        checks.append(1)
+        if len(checks) >= 2:
+            raise _Stop()
+
+    with pytest.raises(_Stop):  # not swallowed into a run_as_root fallback
+        privsep.prepare(paths, False, {}, system=system, check=check)
+    assert len(system.chowns) < 600
+    assert len(checks) == 2
+
+
+class _OwnedStat(FakeSystem):
+    """Pretends the lchown calls took effect: the five top folders report the new owner."""
+
+    def _stat(self, path):
+        result = super()._stat(path)
+        owned = {path for path, uid, gid in self.chowns}
+        if path in owned:
+            return SimpleNamespace(st_mode=result.st_mode, st_uid=1500, st_gid=1500)
+        return result
+
+
+def test_f8_restart_does_not_walk_trees_that_are_already_owned(layout_root):
+    sandbox, paths = layout_root
+    big = _big_dataset(paths)
+    system = _OwnedStat(sandbox, users={"dgpu": (1500, 1500)}, probe=_probe(writable=True))
+    assert privsep.prepare(paths, False, {}, system=system).active
+    first = len(system.chowns)
+    assert first > 600
+    # the container restarts: same user, markers and top-level owners match -> no walk
+    assert privsep.prepare(paths, False, {}, system=system).active
+    assert len(system.chowns) == first
+    # the runner downloads data again as root (forget_ownership) -> only data/ is walked
+    privsep.forget_ownership(paths, "data")
+    assert privsep.prepare(paths, False, {}, system=system).active
+    walked = [path for path, _uid, _gid in system.chowns[first:]]
+    assert os.path.join(big, "0.jpg") in walked
+    assert not any(path.startswith(paths.code) for path in walked)
+
+
+def test_f8_falling_back_forgets_the_ownership_markers(layout_root):
+    sandbox, paths = layout_root
+    system = _OwnedStat(sandbox, users={"dgpu": (1500, 1500)}, probe=_probe(writable=True))
+    assert privsep.prepare(paths, False, {}, system=system).active
+    assert os.path.exists(os.path.join(paths.run, "owner-data.json"))
+    assert not privsep.prepare(paths, True, {}, system=system).active  # run_as_root
+    assert not any(name.startswith("owner-") for name in os.listdir(paths.run))
+
+
+def test_f8_capability_probe_really_signals_a_child_of_the_training_user(layout_root):
+    sandbox, paths = layout_root
+    system = FakeSystem(sandbox, users={"dgpu": (1500, 1500)}, probe=_probe(writable=True))
+    killed = []
+    real_kill = system.kill
+
+    def kill(pid, signum):
+        killed.append(signum)
+        real_kill(pid, signum)
+
+    system.kill = kill
+    identity = privsep.prepare(paths, False, {}, system=system)
+    assert identity.active, identity.detail
+    assert killed == [0, signal.SIGKILL]
+    (argv,) = system.spawns
+    assert argv[0] == "python3"
+    assert not os.path.exists(os.path.join(paths.home, ".dgpu-capprobe"))
+
+
+@pytest.mark.parametrize("missing", ["kill", "read"])
+def test_f8_missing_capabilities_fall_back_with_a_reason(layout_root, missing):
+    sandbox, paths = layout_root
+    system = FakeSystem(sandbox, users={"dgpu": (1500, 1500)}, probe=_probe(writable=True))
+    started = []
+    real_spawn = system.spawn
+
+    def spawn(*args):
+        proc = real_spawn(*args)
+        started.append(proc)
+        return proc
+
+    system.spawn = spawn
+
+    def refuse(*_args):
+        raise PermissionError(1, "Operation not permitted")
+
+    if missing == "kill":
+        system.kill = refuse
+    else:
+        system.read_file = refuse
+    identity = privsep.prepare(paths, False, {}, system=system)
+    assert not identity.active and identity.reason == privsep.REASON_CAPS
+    assert ("CAP_KILL" if missing == "kill" else "CAP_DAC_OVERRIDE") in identity.detail
+    assert privsep.REASON_TEXT[privsep.REASON_CAPS] in identity.describe()
+    (proc,) = started
+    assert proc.poll() is not None, "the probe process does not outlive the probe"
+
+
+def test_f8_cancel_during_a_long_chown_stops_the_runner_before_setup(tmp_path):
+    """The runner passes its cancel / deadline check into the chown: a cancel that arrives while
+    a big dataset is being chowned ends the job (CANCELLED) without walking the rest."""
+    from dgpu.runner.main import Runner
+
+    h = Harness(tmp_path)
+    try:
+        h.prepare(setup="echo setup > $DGPU_OUTPUT/setup.txt", run="true")
+        paths = Paths(str(h.work))
+        paths.ensure()
+        _big_dataset(paths, files=2000)
+        system = FakeSystem(tmp_path, users={"dgpu": (1500, 1500)}, probe=_probe(writable=True))
+        runner = Runner(
+            paths,
+            tuning=load_tuning({"DGPU_RUNNER_TUNING": json.dumps(h.tuning)}),
+            environ=h.env(),
+            destroyer=CountingDestroyer(),
+            gpu_query=lambda timeout: ([{"index": "0", "name": "fake", "util": 50.0}], ""),
+            privsep_system=system,
+        )
+        record = system.lchown
+
+        def lchown(path, uid, gid):
+            record(path, uid, gid)
+            if len(system.chowns) == 300:
+                runner.cancel.set()  # dgpu cancel seen by the heartbeat thread
+
+        system.lchown = lchown
+        runner.run()
+        assert h.status()["phase"] == states.CANCELLED, h.diagnostics()
+        assert len(system.chowns) < 1000
+        assert h.get(layout.output_prefix(h.job_id) + "setup.txt") is None
+    finally:
+        h.cleanup()
+
+
+def test_f8_every_fallback_reason_has_a_text():
+    reasons = [value for name, value in vars(privsep).items() if name.startswith("REASON_")]
+    reasons = [value for value in reasons if isinstance(value, str)]
+    assert reasons and all(privsep.REASON_TEXT.get(reason) for reason in reasons)

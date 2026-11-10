@@ -194,8 +194,9 @@ def sync_dir(
 ) -> Tuple[bool, Optional[str]]:
     """同步一个目录，成功后把同步前的快照记为已上传。返回 (成功, 错误)。
 
-    本地目录不存在时什么都不用传，算成功。被 guard 拦下（已被更新的 attempt 取代、正在停止）
-    时返回 (False, None)。
+    没有要传的东西（本地目录不存在、是空的，或者每个文件都和同步记录一致）时不调用 rclone，
+    直接算成功：存储连不上时也不会对着空目录重试到最终同步的时限（评审 F2）。被 guard 拦下
+    （已被更新的 attempt 取代、正在停止）时返回 (False, None)。
     """
     if not os.path.isdir(root):
         return True, None
@@ -203,6 +204,9 @@ def sync_dir(
         before = syncstate.snapshot(root, skip_tmp)
     except syncstate.ListError as exc:
         return False, "cannot list %s: %s" % (root, exc)
+    uploaded = syncstate.load(paths.run, name)
+    if uploaded is not None and all(uploaded.get(rel) == meta for rel, meta in before.items()):
+        return True, None
     try:
         rclone.copy_up(
             root,
@@ -355,6 +359,7 @@ class Runner:
         self.max_hours = 0.0
         self.sink = None  # type: Optional[LogSink]
         self.identity = privsep.inactive(privsep.REASON_NOT_ROOT, "尚未决定")
+        self.identity_summary = None  # type: Optional[Dict[str, Any]]
 
         self.outcome = None  # type: Optional[Outcome]
         self.previous_final = None  # type: Optional[Dict[str, Any]]
@@ -795,6 +800,9 @@ class Runner:
             synced_bytes=self.synced_bytes,
             last_sync_at=self.last_sync_at,
         )
+        if self.identity_summary is not None:
+            # 训练进程的身份（是否降权、没降权的原因）：dgpu status 显示（评审 F7）
+            doc["identity"] = self.identity_summary
         data = json.dumps(doc, sort_keys=True).encode("utf-8")
         self.rclone.rcat(
             layout.heartbeat_key(self.job_id), data, tag="heartbeat", guard=self._may_write
@@ -985,6 +993,8 @@ class Runner:
                 os.rename(tmp, self.paths.code)
                 self._note("代码已解压（%d 个条目）" % count)
 
+            # root 要往 code/ 里写：之前的属主标记作废，降权时重新 chown（privsep.py）
+            privsep.forget_ownership(self.paths, "code")
             self._data_retry("code", fetch_code)
             _touch(self.paths.ready_marker("code"))
         os.makedirs(self.paths.data, exist_ok=True)
@@ -1013,6 +1023,7 @@ class Runner:
                     )
                 )
             self._note("下载数据 %s" % name)
+            privsep.forget_ownership(self.paths, "data")
 
             def fetch_data(prefix: str = prefix, dest: str = dest, bucket: str = bucket) -> None:
                 self.rclone.copy_down(
@@ -1031,6 +1042,7 @@ class Runner:
         )
         remote = [item for item in listing if not str(item.get("Path", "")).endswith(".tmp")]
         if remote:
+            privsep.forget_ownership(self.paths, "ckpt")
             before = self._snapshot_or_empty(self.paths.ckpt, True)
             self._data_retry(
                 "ckpt",
@@ -1117,7 +1129,10 @@ class Runner:
             system=self._privsep_system,
             probe_timeout=self.tuning["privsep_probe_timeout_s"],
             note=self._note,
+            check=self._checkpoint,  # 大目录的 chown 也能被取消、截止打断（评审 F8）
+            kill_wait=self.tuning["kill_wait_s"],
         )
+        self.identity_summary = self.identity.summary()  # 之后的心跳带上它（dgpu status 显示）
         try:
             write_json_atomic(self.paths.privsep, self.identity.to_dict())
         except OSError as exc:
@@ -1126,8 +1141,12 @@ class Runner:
         if not self.identity.active:
             self.events.emit(
                 states.EV_RUN_AS_ROOT,
-                "训练进程没有降权：%s" % self.identity.detail,
-                {"reason": self.identity.reason, "detail": self.identity.detail[:500]},
+                "训练进程没有降权（%s）：%s" % (self.identity.reason_text, self.identity.detail),
+                {
+                    "reason": self.identity.reason,
+                    "reason_text": self.identity.reason_text,
+                    "detail": self.identity.detail[:500],
+                },
             )
 
     def _run_command(self, step: str, command: str) -> int:
@@ -1408,11 +1427,12 @@ class Runner:
         return False
 
     def _needs_final_sync(self) -> bool:
-        """训练开始过、上次运行的结论还没同步完，或者本地有结果文件（容器重启后已经超时或
-        被取消时，内存里的标志都没了，看磁盘）。"""
-        return (
-            self.training_started or self.previous_final is not None or self._local_results_exist()
-        )
+        """本地 output/、ckpt/ 里有结果文件（列不出来时也算有）。
+
+        只看磁盘，不看“训练开始过”这类内存里的标志：容器重启后已经超时或被取消时标志都没了
+        （评审 B5）；代码或数据下载失败时训练开始过但没有结果，不该做最终同步（评审 F2）。
+        """
+        return self._local_results_exist()
 
     # ================================================================ 收尾
 

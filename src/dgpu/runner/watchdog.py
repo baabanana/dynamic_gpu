@@ -94,6 +94,8 @@ class Watchdog:
         self.spec = None  # type: Optional[Dict[str, Any]]
         self.settings = runner_settings({})
         self.hard_deadline = None  # type: Optional[float]
+        # 启动时 runner 自己的截止已经过了（容器重启后）：接手时给满最终同步时限（见 _load_spec）
+        self.restart_late = False
         self._alive_fd = None  # type: Optional[int]
         self._flock_broken = False
         self._budget_end = 0.0
@@ -193,15 +195,30 @@ class Watchdog:
         self.settings = runner_settings(spec)
         budget = watchdog_hard_deadline_s(max_hours, self.settings, self.tuning)
         started = read_json(self.paths.started)
+        elapsed = self.clock.monotonic() - self.t_start
         if started and started.get("attempt") == self.attempt:
             try:
-                budget -= max(0.0, self.clock.time() - float(started["wall"]))
+                elapsed = max(0.0, self.clock.time() - float(started["wall"]))
             except (KeyError, TypeError, ValueError):
                 pass
-        else:
-            budget -= self.clock.monotonic() - self.t_start
+        budget -= elapsed
+        # 这个 watchdog 启动时 runner 自己的截止（max_hours）已经过了：容器重启、停机时间长，
+        # runner 来不及在 watchdog 截止之前做完收尾。到截止接手时给满 runner 的最终同步时限
+        # （评审 F6）；这个上限已经算进 util.watchdog_teardown_worst_case_s。
+        self.restart_late = elapsed >= max_hours * 3600.0
         self.hard_deadline = self.clock.monotonic() + budget
-        diag(COMPONENT, "hard deadline in %.0f s" % budget)
+        diag(
+            COMPONENT,
+            "hard deadline in %.0f s%s"
+            % (
+                budget,
+                "; started after the runner's own deadline, so a takeover gets the full "
+                "final sync budget (%.0f s)"
+                % watchdog_sync_s(self.settings, self.tuning, restart=True)
+                if self.restart_late
+                else "",
+            ),
+        )
 
     def _fenced(self) -> bool:
         doc = read_json(self.paths.fenced)
@@ -374,15 +391,31 @@ class Watchdog:
         return newer
 
     def _best_effort_sync(self) -> Tuple[List[str], int]:
-        """一次有总时限的同步；返回按同步记录算出的没传上去的文件和总数。"""
-        end = self.clock.monotonic() + watchdog_sync_s(self.settings, self.tuning)
-        for name, root, prefix, skip_tmp in target_dirs(self.paths, self.job_id):
-            limit = max(1.0, end - self.clock.monotonic())
-            ok, error = sync_dir(
-                self.rclone, self.paths, name, root, prefix, skip_tmp, limit, COMPONENT
-            )
-            if not ok:
-                diag(COMPONENT, "sync of %s failed: %s" % (name, error))
+        """有总时限的同步；返回按同步记录算出的没传上去的文件和总数。
+
+        平时只试一次（runner 已经用过自己的最终同步时限）。容器重启时 runner 的截止已经过了
+        （restart_late），watchdog 替 runner 做最终同步：给满 final_sync_timeout_min，失败就
+        重试到时限，和 runner 一样（评审 F6）。
+        """
+        restart = self.restart_late
+        limit_s = watchdog_sync_s(self.settings, self.tuning, restart=restart)
+        if restart:
+            diag(COMPONENT, "final sync on behalf of the runner, up to %.0f s" % limit_s)
+        end = self.clock.monotonic() + limit_s
+        while True:
+            failed = False
+            for name, root, prefix, skip_tmp in target_dirs(self.paths, self.job_id):
+                limit = max(1.0, end - self.clock.monotonic())
+                ok, error = sync_dir(
+                    self.rclone, self.paths, name, root, prefix, skip_tmp, limit, COMPONENT
+                )
+                if not ok:
+                    failed = True
+                    diag(COMPONENT, "sync of %s failed: %s" % (name, error))
+            remaining = end - self.clock.monotonic()
+            if not failed or not restart or remaining <= 0:
+                break
+            self.clock.sleep(min(remaining, self.tuning["final_sync_backoff_s"]))
         return not_uploaded(self.paths, self.job_id, int(self.tuning["max_not_uploaded"]))
 
     def _budget_timeout(self) -> float:

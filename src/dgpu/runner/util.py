@@ -200,24 +200,35 @@ def watchdog_kill_grace_s(settings: Dict[str, float]) -> float:
     return min(settings["term_grace_s"], 10.0)
 
 
-def watchdog_sync_s(settings: Dict[str, float], tuning: Dict[str, Any]) -> float:
-    """watchdog 尽力同步一次 output/、ckpt/ 的总时限（两个目录共用）。"""
-    return max(
-        1.0, min(tuning["watchdog_sync_timeout_s"], settings["final_sync_timeout_min"] * 60.0)
-    )
+def watchdog_sync_s(
+    settings: Dict[str, float], tuning: Dict[str, Any], restart: bool = False
+) -> float:
+    """watchdog 尽力同步 output/、ckpt/ 的总时限（两个目录共用）。
+
+    平时 runner 已经用过自己的最终同步时限，watchdog 只再试一次，取 watchdog_sync_timeout_s
+    和 final_sync_timeout_min 的小者。restart：容器重启时 runner 自己的截止（max_hours）已经
+    过了，runner 来不及在 watchdog 截止之前做完收尾，这时 watchdog 接手给和 runner 一样的
+    最终同步时限 final_sync_timeout_min，失败就重试到时限（评审 F6）。这是 watchdog 同步的
+    上限，计入 watchdog_teardown_worst_case_s 和实例存活时限。
+    """
+    final = settings["final_sync_timeout_min"] * 60.0
+    if restart:
+        return max(1.0, final)
+    return max(1.0, min(tuning["watchdog_sync_timeout_s"], final))
 
 
 def watchdog_teardown_worst_case_s(settings: Dict[str, float], tuning: Dict[str, Any]) -> float:
     """watchdog 接手后（runner 消失或到达硬截止）最多用多久。
 
-    结束 runner、训练进程和 rclone（宽限 + SIGKILL 后的等待）、读 attempt.json、尽力同步一次、
-    传日志和事件并写状态（teardown_budget_s）、自毁。每一步都有时限。
+    结束 runner、训练进程和 rclone（宽限 + SIGKILL 后的等待）、读 attempt.json、同步（按两种
+    情况里较长的那个：容器重启后接手时给满 final_sync_timeout_min）、传日志和事件并写状态
+    （teardown_budget_s）、自毁。每一步都有时限。
     """
     return (
         watchdog_kill_grace_s(settings)
         + 2 * tuning["kill_wait_s"]
         + short_op_s(tuning)
-        + watchdog_sync_s(settings, tuning)
+        + watchdog_sync_s(settings, tuning, restart=True)
         + 2.0  # 每个目录的复制至少给 1 秒
         + tuning["teardown_budget_s"]
         + destroy_worst_case_s(tuning)

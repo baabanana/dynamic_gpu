@@ -318,7 +318,7 @@ def test_b4_not_root_falls_back_with_one_line_and_an_event(harness):
     event = _events(harness, states.EV_RUN_AS_ROOT)
     assert len(event) == 1 and event[0]["data"]["reason"] == "not_root"
     log = harness.log_text()
-    assert log.count("训练进程和 runner 同一用户运行") == 1
+    assert log.count("训练进程没有降权（原因 not_root") == 1
     uid = harness.get(layout.output_prefix(harness.job_id) + "uid").decode().strip()
     assert uid == str(os.getuid())
 

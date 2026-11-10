@@ -15,7 +15,7 @@ from dgpu.cli import _format_view
 from dgpu.contracts import INST_EXITED, BackendError, DgpuError
 from dgpu.orchestrator import Terminated
 from test_orchestrator_review import LaggyBackend, lookups_in, use_backend
-from test_orchestrator_support import Plan, World, make_config, make_spec
+from test_orchestrator_support import T0, Plan, World, make_config, make_spec, seed_job
 
 MIN = 60.0
 SUSPECT_FIELD = "suspect_labels"  # attempt.json 里创建结果未知的标签
@@ -316,3 +316,35 @@ def test_f5_failing_to_destroy_the_lost_instance_prints_a_gc_hint(tmp_path):
     loud = [line for line in world.messages if line.startswith("!!") and "dgpu gc" in line]
     assert loud
     assert world.events(job_id, states.EV_DESTROY_FAILED)
+
+
+# ================================================================ F7：降权没生效的原因看得见
+
+
+@pytest.mark.parametrize("dropped", [False, True])
+def test_f7_status_shows_whether_the_training_runs_as_root_and_why(tmp_path, dropped):
+    world = World(tmp_path)
+    job = "demo-260101000000-abcd"
+    seed_job(world.store, job, phase=states.RUNNING, hb_at=T0)
+    key = layout.heartbeat_key(job)
+    hb = world.doc(key)
+    hb["identity"] = (
+        {"dropped": True, "user": "dgpu", "uid": 1001, "reason": None, "detail": None}
+        if dropped
+        else {
+            "dropped": False,
+            "user": None,
+            "uid": None,
+            "reason": "pip_not_writable",
+            "reason_text": "pip 没有可写的安装位置",
+            "detail": "python3（/venv/main）的 site-packages 不可写",
+        }
+    )
+    world.store.put_json(key, hb)
+    view = world.orchestrator().status(job)
+    text = _format_view(view)
+    if dropped:
+        assert "以无特权用户 dgpu（uid 1001）运行" in text
+    else:
+        assert "没有降权" in text and "pip_not_writable" in text and "/venv/main" in text
+        assert view.to_dict()["identity"]["reason"] == "pip_not_writable"
