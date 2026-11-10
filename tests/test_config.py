@@ -241,6 +241,17 @@ def test_every_runner_setting_can_be_set(tmp_path):
     assert config.runner.to_dict() == {name: 7 for name in names}
 
 
+def test_runner_time_settings_accept_fractions(tmp_path):
+    text = "[runner]\nsync_interval_s = 1.5\nterm_grace_s = 7.5\nfinal_sync_timeout_min = 2.5\n"
+    config = load_config(_write(tmp_path, text), env={})
+    assert config.runner.sync_interval_s == 1.5
+    assert config.runner.term_grace_s == 7.5
+    assert config.runner.final_sync_timeout_min == 2.5
+    assert config.runner.to_dict()["term_grace_s"] == 7.5
+    assert set(RunnerSettings.TIME_FIELDS) <= set(config.runner.to_dict())
+    assert "max_log_mb" not in RunnerSettings.TIME_FIELDS
+
+
 def test_vast_filters_may_be_flat_or_in_subtable(tmp_path):
     flat = "[backends.vast]\nreliability = 0.9\nmax_bandwidth_usd_per_gb = 0.02\n"
     nested = "[backends.vast.filters]\nreliability = 0.9\nmax_bandwidth_usd_per_gb = 0.02\n"
@@ -363,7 +374,9 @@ INVALID = [
     ('[backends.autodl]\ncuda_v_from = "11.8"\n', ["backends.autodl.cuda_v_from", "整数"]),
     # runner 和顶层标量
     ("[runner]\nsync_interval_s = 0\n", ["runner.sync_interval_s", "不能小于 1"]),
-    ("[runner]\nheartbeat_interval_s = 1.5\n", ["runner.heartbeat_interval_s", "整数"]),
+    ('[runner]\nheartbeat_interval_s = "60"\n', ["runner.heartbeat_interval_s", "数字"]),
+    ("[runner]\nheartbeat_interval_s = 0.5\n", ["runner.heartbeat_interval_s", "不能小于 1"]),
+    ("[runner]\nmax_log_mb = 1.5\n", ["runner.max_log_mb", "整数"]),
     ("[runner]\nstall_timeout_min = -1\n", ["runner.stall_timeout_min", "不能小于 0"]),
     ("[runner]\nmax_log_mb = true\n", ["runner.max_log_mb", "整数"]),
     ('max_offers = "3"\n', ["max_offers", "整数"]),

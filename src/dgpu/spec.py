@@ -55,6 +55,8 @@ _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _URL_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://(.*)$")
 _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# $DGPU_DATA 下的目录名：runner 只接受这些字符（runner/main.py 的 SAFE_NAME_CHARS）
+_DATA_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 # ---------------------------------------------------------------- 入口
@@ -341,6 +343,14 @@ def _parse_data(raw: Any, base_dir: Path) -> tuple[DataRef, ...]:
             ref = _parse_remote(field, text, match.group(1), match.group(2))
         else:
             ref = _parse_local(field, text, base_dir)
+        if not _DATA_NAME_RE.match(ref.name) or ref.name in (".", ".."):
+            raise _err(
+                field,
+                f"数据目录名 {ref.name!r}（路径的最后一段，即 $DGPU_DATA 下的名字）"
+                "含有不支持的字符",
+                "目录名只能用英文字母、数字、点、下划线和连字符；把目录改名，"
+                "或者放进一个这样命名的目录里再引用",
+            )
         if ref.name in seen:
             raise _err(
                 field,

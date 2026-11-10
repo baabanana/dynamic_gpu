@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from dgpu import layout, states
 
@@ -172,17 +172,28 @@ class AutodlSettings:
 
 @dataclass(frozen=True)
 class RunnerSettings:
-    """下发给 runner 的参数，写进 spec.json 的 runner 段。"""
+    """下发给 runner 的参数，写进 spec.json 的 runner 段。
 
-    sync_interval_s: int = 120
-    heartbeat_interval_s: int = 60
-    stall_timeout_min: int = 60  # 0 关闭卡死检测
-    final_sync_timeout_min: int = 20
-    term_grace_s: int = 60  # SIGTERM 后多久 SIGKILL
+    时间类参数（TIME_FIELDS）可以是小数，runner 一律按浮点数读取；另外两个是整数。
+    """
+
+    TIME_FIELDS: ClassVar[tuple[str, ...]] = (
+        "sync_interval_s",
+        "heartbeat_interval_s",
+        "stall_timeout_min",
+        "final_sync_timeout_min",
+        "term_grace_s",
+    )
+
+    sync_interval_s: float = 120
+    heartbeat_interval_s: float = 60
+    stall_timeout_min: float = 60  # 0 关闭卡死检测
+    final_sync_timeout_min: float = 20
+    term_grace_s: float = 60  # SIGTERM 后多久 SIGKILL
     max_log_mb: int = 200
     data_sync_retries: int = 3
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, float]:
         return dict(self.__dict__)
 
 
@@ -321,10 +332,17 @@ class Backend(Protocol):
 
 # ---------------------------------------------------------------- 存储
 
+# 单个对象的上传上限：S3 / R2 单段 PutObject 最多 5 GiB。R2 的分段上传 ETag 不可靠，
+# dgpu 只做单段上传，更大的文件要用户自己用 rclone 传到 bucket，再用 r2:// 引用。
+SINGLE_UPLOAD_LIMIT = 5 * 1024**3
+
 
 @runtime_checkable
 class Store(Protocol):
-    """绑定到一个 bucket 的 S3 兼容存储。key 的约定见 layout.py。"""
+    """绑定到一个 bucket 的 S3 兼容存储。key 的约定见 layout.py。
+
+    put_bytes / put_file 的单个对象不超过 SINGLE_UPLOAD_LIMIT，超过时抛 StoreError。
+    """
 
     profile: StoreProfile
 

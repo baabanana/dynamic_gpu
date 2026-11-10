@@ -26,10 +26,7 @@ from dgpu.contracts import (
     BACKENDS,
     Config,
     ConfigError,
-    DataRef,
-    DataSource,
     DgpuError,
-    Store,
     StoreProfile,
 )
 from dgpu.orchestrator import GB, Deps, JobView, Orchestrator, redact, secret_values
@@ -48,7 +45,7 @@ def build_deps(config_path: str | None) -> Deps:
     """
     from dgpu.bundle import RunnerBundler
     from dgpu.config import load_config, resolve_config_path
-    from dgpu.packaging import pack_code, resolve_remote, upload_dataset
+    from dgpu.packaging import pack_code, resolve_data
     from dgpu.spec import load_spec
     from dgpu.store import open_store
 
@@ -64,10 +61,6 @@ def build_deps(config_path: str | None) -> Deps:
 
         backends[BACKEND_AUTODL] = AutodlBackend(config.autodl)
     store = open_store(primary_store_profile(config, list(backends)))
-
-    def resolve_data(store: Store, ref: DataRef) -> DataSource:
-        return upload_dataset(store, ref) if ref.is_local else resolve_remote(ref)
-
     return Deps(
         config=config,
         store=store,

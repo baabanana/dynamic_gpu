@@ -40,7 +40,13 @@ from botocore.exceptions import (
     ConnectionError as BotoConnectionError,
 )
 
-from dgpu.contracts import ConfigError, PreconditionFailed, StoreError, StoreProfile
+from dgpu.contracts import (
+    SINGLE_UPLOAD_LIMIT,
+    ConfigError,
+    PreconditionFailed,
+    StoreError,
+    StoreProfile,
+)
 
 __all__ = [
     "MAX_PRESIGN_TTL_S",
@@ -50,7 +56,7 @@ __all__ = [
     "open_store",
 ]
 
-SINGLE_PART_LIMIT = 5 * 1024**3  # S3 / R2 单段 PutObject 的上限
+SINGLE_PART_LIMIT = SINGLE_UPLOAD_LIMIT  # S3 / R2 单段 PutObject 的上限（5 GiB）
 MAX_PRESIGN_TTL_S = 7 * 24 * 3600  # SigV4 预签名 URL 最长 7 天
 
 DEFAULT_MAX_ATTEMPTS = 5  # 每个请求最多尝试的次数（含第一次）
@@ -476,7 +482,8 @@ class S3Store:
         return StoreError(
             f"无法上传 {what} 到 {self._where(key)}：超过单段上传上限 5 GiB。"
             "R2 的分段上传 ETag 不可靠，dgpu 只做单段上传。把文件拆小，"
-            "或者先用 rclone 把数据传到 bucket，再在 job.yaml 里用 bucket + prefix 引用"
+            "或者先用 rclone 把数据传到 bucket，再在 job.yaml 的 data 里写成 "
+            "r2://<bucket>/<目录> 引用"
         )
 
     def _precondition_failed(

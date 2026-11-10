@@ -128,6 +128,7 @@ FAILED 的原因：
 | `exit_code` | 训练命令非 0 退出 | 看日志，修代码后重新 `submit`（`retry` 还是旧代码） |
 | `stalled` | GPU 利用率为 0，且 60 分钟没有新日志 | 看日志最后几行，常见是数据加载卡住或死锁 |
 | `runner_crashed` | dgpu 在机器上的进程崩溃了 | 问用户后 `dgpu retry <job>` |
+| `signalled` | dgpu 在机器上的进程收到停止信号（容器被平台停止等），已提前收尾上传 | 问用户后 `dgpu retry <job>`，会从 checkpoint 接着跑 |
 | `final_sync` | 最后一次上传失败 | `dgpu status` 列出没传上去的文件，它们已随机器销毁，如实告诉用户 |
 | `fenced` | 已经有更新的一次尝试，这一次自己退出了 | 看最新那次尝试的状态 |
 

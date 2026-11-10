@@ -229,8 +229,9 @@ def test_startup_timeout_destroys_and_moves_on_with_new_attempt(tmp_path):
     assert world.doc(layout.attempt_key(job_id))["attempt"] == 2
     assert world.doc(layout.status_key(job_id))["attempt"] == 2
     assert len(world.events(job_id, states.EV_STARTUP_TIMEOUT)) == 1
-    fenced = world.events(job_id, states.EV_ATTEMPT_FENCED)
-    assert [(e["data"]["old_attempt"], e["data"]["new_attempt"]) for e in fenced] == [(1, 2)]
+    relaunch = world.events(job_id, states.EV_RELAUNCH)
+    assert [(e["data"]["old_attempt"], e["data"]["new_attempt"]) for e in relaunch] == [(1, 2)]
+    assert world.events(job_id, states.EV_ATTEMPT_FENCED) == []  # 这个名字留给 runner
     destroyed = world.events(job_id, states.EV_INSTANCE_DESTROYED)
     assert [e["data"]["instance_id"] for e in destroyed] == ["1"]
     assert secrets_left(world) == []

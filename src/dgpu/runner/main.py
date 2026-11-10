@@ -265,6 +265,7 @@ class Runner:
         self._checkpoint()
         self._preflight()
         self._checkpoint()
+        self._report_preflight_passed()
         self.training_started = True
         self._fetch_code_and_data()
         self._checkpoint()
@@ -478,7 +479,7 @@ class Runner:
         if reason == "signal":
             return Outcome(
                 states.FAILED,
-                states.REASON_RUNNER_CRASHED,
+                states.REASON_SIGNALLED,
                 message="runner 收到 %s，提前收尾" % (self.signal_name or "signal"),
             )
         if reason == "deadline":
@@ -666,6 +667,19 @@ class Runner:
             self._note("preflight 失败：%s" % message)
             self.events.emit(states.EV_PREFLIGHT_FAILED, message, {"problems": problems})
             raise StepFailed(Outcome(states.FAILED, states.REASON_PREFLIGHT, message=message))
+
+    def _report_preflight_passed(self) -> None:
+        """preflight 通过后立刻写一次心跳（step 已离开 preflight）。
+
+        CLI 看到 step 离开 preflight 才认为实例可用（preflight 失败要换机），不用等下一个
+        心跳周期。写失败只记录，心跳线程随后还会写。
+        """
+        self.step = "fetch"
+        try:
+            self._put_heartbeat()
+        except RcloneError as exc:
+            if not exc.blocked:
+                diag(COMPONENT, "heartbeat after preflight failed: %s" % exc)
 
     def _disk_need(self) -> Tuple[int, List[str]]:
         need = int(self.tuning["min_free_margin_mb"] * 1024 * 1024)
@@ -964,39 +978,51 @@ class Runner:
                 self._sync_fail_count = 0
                 self._sync_fail_last_event = None
 
-    def _sync_targets(self, timeout: float, tag: str, include_log: bool = True) -> Dict[str, str]:
-        """同步 output/、ckpt/（不含 *.tmp）和日志。返回 {目标: 错误}。"""
+    def _sync_targets(
+        self, timeout: float, tag: str, include_log: bool = True, end: Optional[float] = None
+    ) -> Dict[str, str]:
+        """同步 output/、ckpt/（不含 *.tmp）和日志。返回 {目标: 错误}。
+
+        end（单调时钟）：给了就只把剩下的时间给每一步，时间用完的步骤不再开始（记为失败），
+        整轮不超过 end。最终同步用它，所以总时长受 final_sync_timeout_min 约束。
+        """
         errors = {}
         steps = [
             (
                 "output",
-                lambda: self.rclone.copy_up(
+                lambda limit: self.rclone.copy_up(
                     self.paths.output,
                     layout.output_prefix(self.job_id),
-                    timeout=timeout,
+                    timeout=limit,
                     tag=tag,
                     guard=self._may_write,
                 ),
             ),
             (
                 "ckpt",
-                lambda: self.rclone.copy_up(
+                lambda limit: self.rclone.copy_up(
                     self.paths.ckpt,
                     layout.ckpt_prefix(self.job_id),
                     exclude=["*.tmp"],
-                    timeout=timeout,
+                    timeout=limit,
                     tag=tag,
                     guard=self._may_write,
                 ),
             ),
         ]
         if include_log and self.sink is not None:
-            steps.append(("log", lambda: self._upload_log(timeout, tag)))
+            steps.append(("log", lambda limit: self._upload_log(limit, tag)))
         for what, fn in steps:
             if what != "log" and self.fenced.is_set():
                 continue
+            limit = timeout
+            if end is not None:
+                limit = end - self.clock.monotonic()
+                if limit <= 0:
+                    errors[what] = "final sync time limit reached before this step"
+                    continue
             try:
-                fn()
+                fn(limit)
             except RcloneError as exc:
                 if not exc.blocked:
                     errors[what] = str(exc)
@@ -1055,7 +1081,7 @@ class Runner:
         while True:
             tries += 1
             remaining = end - self.clock.monotonic()
-            errors = self._sync_targets(max(1.0, remaining), "final", include_log=False)
+            errors = self._sync_targets(remaining, "final", include_log=False, end=end)
             failed = {key: value for key, value in errors.items() if key in ("output", "ckpt")}
             if not failed:
                 if tries > 1:
@@ -1167,7 +1193,9 @@ class Runner:
                     )
                 outcome.not_uploaded = not_uploaded
         self._stop_heartbeat_thread()
-        self._budget_end = self.clock.monotonic() + self.tuning["teardown_budget_s"]
+        # 收尾预算分两半：前一半给日志和事件，后一半留给最终状态，日志卡住也不会挤掉状态
+        half = self.tuning["teardown_budget_s"] / 2.0
+        self._budget_end = self.clock.monotonic() + half
         if not self.fenced.is_set():
             try:
                 doc = self._read_attempt(timeout=self._budget_timeout())
@@ -1178,18 +1206,25 @@ class Runner:
         if self.fenced.is_set() and not outcome.fenced:
             outcome.fenced = True
         self.outcome = outcome
+        # 本地先记下结论：之后 runner 死掉，watchdog 照这个结论补写状态
         self._write_final_marker(status_written=False)
-        if not self.fenced.is_set():
-            written = self._write_final_status(outcome)
-            self._write_final_marker(status_written=written)
+        fenced = self.fenced.is_set()
+        if fenced:
+            self._note("本 attempt 已被更新的 attempt 取代，不写最终状态")
+        else:
             self._note(
                 "最终状态 %s%s"
                 % (outcome.phase, "（%s）" % outcome.reason if outcome.reason else "")
             )
-        else:
-            self._note("本 attempt 已被更新的 attempt 取代，不写最终状态")
+        # 最终状态是自毁前最后一次写存储：CLI 看到终态就会销毁实例，日志和事件必须在它之前传完
         self._upload_final_log()
         self.events.flush(block=True, timeout=self._budget_timeout())
+        if not fenced:
+            self._budget_end = self.clock.monotonic() + half
+            written = self._write_final_status(outcome)
+            self._write_final_marker(status_written=written)
+            if not written:
+                diag(COMPONENT, "final status %s was not written" % outcome.phase)
 
     def _budget_left(self) -> float:
         return self._budget_end - self.clock.monotonic()

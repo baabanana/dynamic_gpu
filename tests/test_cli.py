@@ -315,11 +315,14 @@ def test_build_deps_wires_expected_external_names(tmp_path, monkeypatch):
 
     module("dgpu.config", resolve_config_path=resolve_config_path, load_config=lambda p: config)
     module("dgpu.spec", load_spec=lambda path, backend_override=None: "spec")
+
+    def resolve_data(store, ref):
+        return DataSource(ref.name, "uploaded" if ref.is_local else "remote", "p/")
+
     module(
         "dgpu.packaging",
-        pack_code=lambda code_dir, dest: None,
-        upload_dataset=lambda store, ref: DataSource(ref.name, "uploaded", "p/"),
-        resolve_remote=lambda ref: DataSource(ref.name, "remote", "p/"),
+        pack_code=lambda code_dir, dest, exclude=(): None,
+        resolve_data=resolve_data,
     )
     module("dgpu.store", open_store=open_store)
     module("dgpu.backends.vast", VastBackend=FakeVast)

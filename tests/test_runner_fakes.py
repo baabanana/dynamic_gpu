@@ -116,11 +116,35 @@ def _walk(path):
     return sorted(files)
 
 
+class _StoreLock:
+    """Lock shared with the integration tests' directory-backed Store: its conditional writes
+    check the current object and replace it under this lock, so they are atomic with respect
+    to the writes made here, as on S3."""
+
+    def __enter__(self):
+        path = _control("store.lock")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.handle = open(path, "a")  # noqa: SIM115 - closed in __exit__
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        self.handle.close()
+
+
+def _replace_remote(tmp, dst):
+    if dst.startswith(_root() + os.sep):
+        with _StoreLock():
+            os.replace(tmp, dst)
+    else:
+        os.replace(tmp, dst)
+
+
 def _atomic_copy(src, dst):
     os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
     tmp = f"{dst}.fake-{os.getpid()}"
     shutil.copy2(src, tmp)
-    os.replace(tmp, dst)
+    _replace_remote(tmp, dst)
 
 
 def _atomic_write(dst, data):
@@ -128,7 +152,7 @@ def _atomic_write(dst, data):
     tmp = f"{dst}.fake-{os.getpid()}"
     with open(tmp, "wb") as handle:
         handle.write(data)
-    os.replace(tmp, dst)
+    _replace_remote(tmp, dst)
 
 
 class Failure(Exception):

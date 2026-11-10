@@ -14,7 +14,7 @@ TOML 布局：
                                     # max_bandwidth_usd_per_gb、datacenter_only
     [backends.vast.filters]         # 过滤条件也可以写在这个子表里（与上面二选一）
     [backends.autodl]               # token、store、dc_list、cuda_v_from、base_url
-    [runner]                        # RunnerSettings 的字段
+    [runner]                        # RunnerSettings 的字段（时间类可以写小数）
 
 环境变量覆盖单个密钥：VAST_API_KEY、AUTODL_TOKEN；R2_ACCESS_KEY_ID、R2_SECRET_ACCESS_KEY
 作用于名为 r2 的存储。空字符串视为未设置。
@@ -276,12 +276,15 @@ def _parse_runner(table: _Table | None) -> RunnerSettings:
     defaults = RunnerSettings()
     if table is None:
         return defaults
-    values = {
-        f.name: table.integer(
-            f.name, default=getattr(defaults, f.name), minimum=_RUNNER_MIN.get(f.name, 0)
-        )
-        for f in dataclasses.fields(RunnerSettings)
-    }
+    values: dict[str, Any] = {}
+    for f in dataclasses.fields(RunnerSettings):
+        default = getattr(defaults, f.name)
+        minimum = _RUNNER_MIN.get(f.name, 0)
+        if f.name in RunnerSettings.TIME_FIELDS:  # 时间可以写小数，如 term_grace_s = 7.5
+            value = table.number(f.name, default=default, minimum=minimum)
+            values[f.name] = int(value) if float(value).is_integer() else value
+        else:
+            values[f.name] = table.integer(f.name, default=default, minimum=minimum)
     table.finish()
     return RunnerSettings(**values)
 
@@ -403,8 +406,11 @@ class _Table:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ConfigError(f"{self.field(key)} 应该是数字，现在是{_kind(value)}")
         if not math.isfinite(value) or value < minimum or (maximum is not None and value > maximum):
-            bound = f"{minimum} 到 {maximum} 之间" if maximum is not None else f"≥ {minimum}"
-            raise ConfigError(f"{self.field(key)} 应该在 {bound}，现在是 {value}")
+            if maximum is None:  # 与 integer() 的说法一致
+                raise ConfigError(f"{self.field(key)} 不能小于 {minimum}，现在是 {value}")
+            raise ConfigError(
+                f"{self.field(key)} 应该在 {minimum} 到 {maximum} 之间，现在是 {value}"
+            )
         return float(value)
 
     def boolean(self, key: str, *, default: bool) -> bool:

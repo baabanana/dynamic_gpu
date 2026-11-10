@@ -37,6 +37,7 @@ from dgpu.contracts import (
     INST_GONE,
     INST_RUNNING,
     INST_UNKNOWN,
+    SINGLE_UPLOAD_LIMIT,
     Backend,
     BackendError,
     Bundler,
@@ -57,6 +58,7 @@ from dgpu.contracts import (
     build_launch_doc,
     build_remote_spec,
 )
+from dgpu.runner import util as runner_util  # 只用标准库；实例存活时限的公式和 watchdog 共用
 
 # ---------------------------------------------------------------- 常量
 
@@ -71,9 +73,9 @@ CAS_BACKOFF_S = 1.0
 MIN_DISK_GB = 40
 AUTODL_DATA_DISK_GB = 50  # AutoDL 数据盘固定大小（设计 4.12）
 ORPHAN_MIN_AGE_S = 3600.0  # 存储里没有对应任务的实例，至少存在这么久才由 gc 销毁
-WATCHDOG_MARGIN_S = 600.0  # watchdog 在 max_hours + 收尾之后再给的 10 分钟
-DEADLINE_MARGIN_S = 1800.0  # gc 再多等 30 分钟，避免和 watchdog 抢
+DEADLINE_MARGIN_S = 1800.0  # 实例最晚自毁的时间之后 gc 再多等 30 分钟，避免和 watchdog 抢
 MAX_CONSECUTIVE_RUNNER_TIMEOUTS = 2
+PREFLIGHT_STEP = "preflight"  # runner 心跳里 preflight 期间的 step
 LAUNCH_URL_EXTRA_S = 3600  # 预签名 URL 有效期 = 启动超时 + runner 超时 + 1 小时
 DOCTOR_PREFIX = layout.ROOT + "/doctor/"
 GB = 1024**3
@@ -95,7 +97,8 @@ class Deps:
     store: Store
     backends: dict[str, Backend]
     bundler: Bundler
-    pack_code: Callable[[Path, Path], Any]  # 把代码目录打成 tar.gz 写到给定路径
+    # 把代码目录打成 tar.gz 写到给定路径；exclude 是不打进包的绝对路径（代码目录里的本地数据）
+    pack_code: Callable[..., Any]
     resolve_data: Callable[[Store, DataRef], DataSource]  # 本地数据先上传到存储
     clock: Callable[[], float]  # UTC epoch 秒；要和 runner 写的时间可比，所以是墙上时钟
     sleep: Callable[[float], None]
@@ -319,6 +322,8 @@ class Orchestrator:
         backend_name = spec.backend
         backend = self._backend(backend_name)
         self._check_store_profile(backend_name)
+        self._check_local_file_sizes(spec)
+        self._warn_foreign_buckets(spec)
 
         # 1. 搜机器。没有就报错，此时没有创建任何东西，也没有写存储。
         request, local_bytes, has_remote = self._build_request(spec, backend_name)
@@ -352,14 +357,13 @@ class Orchestrator:
             backend_name,
             layout.label(job_id, 1),
             deadline_at=self._deadline(request.max_hours),
+            now=now,
         )
-        attempt_doc["created_at"] = now
-        self.store.put_json(layout.attempt_key(job_id), attempt_doc, if_none_match=True)
+        self._create_doc(layout.attempt_key(job_id), attempt_doc)
         status_doc = states.new_status_doc(
-            job_id, 1, states.PROVISIONING, states.SRC_CLI, message="正在创建实例"
+            job_id, 1, states.PROVISIONING, states.SRC_CLI, message="正在创建实例", now=now
         )
-        status_doc["updated_at"] = now
-        self.store.put_json(layout.status_key(job_id), status_doc, if_none_match=True)
+        self._create_doc(layout.status_key(job_id), status_doc)
 
         # 4–6. 换机循环；任何异常都会销毁实例并写终态。
         ctx = _Launch(
@@ -442,6 +446,7 @@ class Orchestrator:
         """搜索候选机器并给出预估费用。不创建任何东西，不写存储。"""
         backend_name = spec.backend
         backend = self._backend(backend_name)
+        self._warn_foreign_buckets(spec)
         request, _, has_remote = self._build_request(spec, backend_name)
         found = backend.search(request)
         currency = CURRENCY_BY_BACKEND[backend_name]
@@ -598,7 +603,7 @@ class Orchestrator:
         new_attempt = int(new_doc["attempt"])
         self._event(
             job_id,
-            states.EV_ATTEMPT_FENCED,
+            states.EV_RELAUNCH,
             new_attempt,
             f"dgpu retry：attempt {old_attempt} 作废，改用 attempt {new_attempt}",
             {"old_attempt": old_attempt, "new_attempt": new_attempt, "why": "retry"},
@@ -720,6 +725,7 @@ class Orchestrator:
                     continue
                 try:
                     backend.destroy(inst.ref)
+                    self._confirm_gone(backend, inst.ref)  # 平台受理了不等于已经停止计费
                 except Exception as exc:
                     message = (
                         f"!! gc 销毁实例 {name}/{inst.ref.id}（标签 {label}）失败：{exc}。"
@@ -727,6 +733,15 @@ class Orchestrator:
                     )
                     self.echo(message)
                     report.failed.append(GcItem(name, inst.ref.id, label, job_id, attempt, message))
+                    if docs.exists:
+                        self._event(
+                            job_id,
+                            states.EV_DESTROY_FAILED,
+                            attempt,
+                            message,
+                            {"backend": name, "instance_id": inst.ref.id, "label": label},
+                            source=states.SRC_GC,
+                        )
                     continue
                 report.destroyed.append(item)
                 if docs.exists:
@@ -889,46 +904,37 @@ class Orchestrator:
         return self._await_runner(ctx, ref)
 
     def _await_runner(self, ctx: _Launch, ref: InstanceRef) -> _Outcome:
+        """等 runner 启动并通过 preflight。
+
+        runner 先写 RUNNING 和第一次心跳（step=preflight），再做 preflight；preflight 失败时
+        写 FAILED(preflight) 并自毁，这时要换机。所以心跳的 step 离开 preflight 才算启动成功。
+        """
         cfg = self.config
         job_id, attempt = ctx.job_id, ctx.attempt
         startup_deadline = self.clock() + cfg.startup_timeout_min * 60
         running_at: float | None = None
+        preflight_since: float | None = None  # 第一次看到本 attempt 心跳的时间
         last_phase = None
         while True:
+            ended = self._startup_status_outcome(ctx, ref)
+            if ended is not None:
+                return ended
+            now = self.clock()
             hb = self._read_doc(layout.heartbeat_key(job_id), "heartbeat.json")
             if hb is not None and hb[0].get("attempt") == attempt:
-                self.echo("runner 已启动（收到第一次心跳）。")
-                st = self._read_doc(layout.status_key(job_id), "status.json")
-                phase = states.RUNNING
-                if st is not None and st[0].get("attempt") == attempt:
-                    if st[0].get("phase") not in _CLI_PHASES:
-                        phase = st[0]["phase"]
-                return _Outcome("started", phase=phase)
-
-            st = self._read_doc(layout.status_key(job_id), "status.json")
-            if st is not None and st[0].get("attempt") == attempt:
-                doc = st[0]
-                if doc.get("phase") in states.TERMINAL_PHASES:
-                    if doc.get("reason") == states.REASON_PREFLIGHT:
-                        detail = (
-                            f"实例 {ref.id} preflight 失败：{doc.get('message') or '（无说明）'}"
-                        )
-                        self.echo(detail + "，换下一台")
-                        self._event(
-                            job_id,
-                            states.EV_PREFLIGHT_FAILED,
-                            attempt,
-                            detail,
-                            {"instance_id": ref.id},
-                        )
-                        self._destroy_ctx(ctx, ref, why="preflight 失败")
-                        return _Outcome("preflight", states.REASON_PREFLIGHT, True, detail)
-                    # runner 已经启动并结束（不是机器的问题），不换机。
+                if hb[0].get("step") != PREFLIGHT_STEP:
+                    self.echo("runner 已启动，preflight 通过。")
+                    return _Outcome("started", phase=self._started_phase(job_id, attempt))
+                if preflight_since is None:
+                    preflight_since = now
+                    self.echo("runner 已启动（收到第一次心跳），正在做 preflight……")
+                elif now - preflight_since >= cfg.runner_timeout_min * 60:
                     self.echo(
-                        f"runner 在第一次心跳前就结束了：{doc['phase']}（{doc.get('reason')}）"
+                        f"runner 的 preflight 超过 {cfg.runner_timeout_min} 分钟还没结束，"
+                        "不再等待；runner 仍在发心跳，"
+                        "preflight 失败时任务会以 FAILED(preflight) 结束。"
                     )
-                    self._destroy_ctx(ctx, ref, why=f"任务已结束（{doc['phase']}）")
-                    return _Outcome("ended", phase=doc["phase"])
+                    return _Outcome("started", phase=self._started_phase(job_id, attempt))
 
             att = self._read_doc(layout.attempt_key(job_id), "attempt.json")
             if att is None:
@@ -948,31 +954,65 @@ class Orchestrator:
             if state.phase != last_phase:
                 self.echo(f"实例 {ref.id} 状态：{state.phase}（{state.raw_status or '-'}）")
                 last_phase = state.phase
-            if running_at is None:
-                if state.phase == INST_RUNNING:
-                    running_at = now
-                elif state.phase in _DEAD_INSTANCE_PHASES:
-                    detail = (
-                        f"实例 {ref.id} 在启动阶段进入 {state.phase}"
-                        f"（平台状态 {state.raw_status or '-'}）"
-                    )
+            if state.phase in _DEAD_INSTANCE_PHASES:
+                # runner 可能在上面读过 status.json 之后才写最终状态并自毁：再看一次
+                ended = self._startup_status_outcome(ctx, ref)
+                if ended is not None:
+                    return ended
+                where = f"（平台状态 {state.raw_status or '-'}）"
+                if preflight_since is not None:
+                    detail = f"实例 {ref.id} 在 preflight 期间进入 {state.phase}{where}"
+                    return self._preflight_failed(ctx, ref, detail)
+                if running_at is None:
+                    detail = f"实例 {ref.id} 在启动阶段进入 {state.phase}{where}"
                     return self._startup_failed(ctx, ref, detail)
-                elif now >= startup_deadline:
-                    detail = (
-                        f"实例 {ref.id} 在 {cfg.startup_timeout_min} 分钟内没有进入运行状态"
-                        f"（平台状态 {state.raw_status or state.phase}）"
-                    )
-                    return self._startup_failed(ctx, ref, detail)
-            else:
-                if state.phase in _DEAD_INSTANCE_PHASES:
-                    detail = (
-                        f"实例 {ref.id} 运行后在第一次心跳前进入 {state.phase}，bootstrap 可能失败"
-                    )
-                    return self._runner_timeout(ctx, ref, detail)
-                if now >= running_at + cfg.runner_timeout_min * 60:
+                detail = f"实例 {ref.id} 运行后在第一次心跳前进入 {state.phase}，bootstrap 可能失败"
+                return self._runner_timeout(ctx, ref, detail)
+            if preflight_since is None:  # 还没有心跳
+                if running_at is None:
+                    if state.phase == INST_RUNNING:
+                        running_at = now
+                    elif now >= startup_deadline:
+                        detail = (
+                            f"实例 {ref.id} 在 {cfg.startup_timeout_min} 分钟内没有进入运行状态"
+                            f"（平台状态 {state.raw_status or state.phase}）"
+                        )
+                        return self._startup_failed(ctx, ref, detail)
+                elif now >= running_at + cfg.runner_timeout_min * 60:
                     detail = f"实例 {ref.id} 运行 {cfg.runner_timeout_min} 分钟后仍没有心跳"
                     return self._runner_timeout(ctx, ref, detail)
             self.sleep(POLL_STARTUP_S)
+
+    def _startup_status_outcome(self, ctx: _Launch, ref: InstanceRef) -> _Outcome | None:
+        """启动阶段 runner 已经写了本 attempt 的终态：preflight 失败就换机，否则任务已结束。"""
+        st = self._read_doc(layout.status_key(ctx.job_id), "status.json")
+        if st is None or st[0].get("attempt") != ctx.attempt:
+            return None
+        doc = st[0]
+        if doc.get("phase") not in states.TERMINAL_PHASES:
+            return None
+        if doc.get("reason") == states.REASON_PREFLIGHT:
+            detail = f"实例 {ref.id} preflight 失败：{doc.get('message') or '（无说明）'}"
+            return self._preflight_failed(ctx, ref, detail)
+        # runner 已经启动并结束（不是机器的问题），不换机。
+        self.echo(f"runner 在启动阶段就结束了：{doc['phase']}（{doc.get('reason') or '-'}）")
+        self._destroy_ctx(ctx, ref, why=f"任务已结束（{doc['phase']}）")
+        return _Outcome("ended", phase=doc["phase"])
+
+    def _started_phase(self, job_id: str, attempt: int) -> str:
+        st = self._read_doc(layout.status_key(job_id), "status.json")
+        if st is not None and st[0].get("attempt") == attempt:
+            if st[0].get("phase") not in _CLI_PHASES:
+                return st[0]["phase"]
+        return states.RUNNING
+
+    def _preflight_failed(self, ctx: _Launch, ref: InstanceRef, detail: str) -> _Outcome:
+        self.echo(detail + "，换下一台")
+        self._event(
+            ctx.job_id, states.EV_PREFLIGHT_FAILED, ctx.attempt, detail, {"instance_id": ref.id}
+        )
+        self._destroy_ctx(ctx, ref, why="preflight 失败")
+        return _Outcome("preflight", states.REASON_PREFLIGHT, True, detail)
 
     def _startup_failed(self, ctx: _Launch, ref: InstanceRef, detail: str) -> _Outcome:
         self.echo(detail + "，销毁并换下一台")
@@ -1106,7 +1146,7 @@ class Orchestrator:
         ctx.attempt = int(doc["attempt"])
         self._event(
             ctx.job_id,
-            states.EV_ATTEMPT_FENCED,
+            states.EV_RELAUNCH,
             ctx.attempt,
             f"换机：attempt {old} 作废，改用 attempt {ctx.attempt}（{why}）",
             {"old_attempt": old, "new_attempt": ctx.attempt, "why": why},
@@ -1140,6 +1180,13 @@ class Orchestrator:
                 "它可能仍在计费：请运行 `dgpu gc`，或到平台控制台手动销毁。"
             )
             self.echo(message)
+            self._event(
+                job_id,
+                states.EV_DESTROY_FAILED,
+                attempt,
+                message,
+                {"backend": ref.backend, "instance_id": ref.id, "label": ref.label, "why": why},
+            )
             raise DestroyFailed(ref, message) from exc
         self._event(
             job_id,
@@ -1231,7 +1278,12 @@ class Orchestrator:
         *,
         expect_attempt: int | None = None,
     ) -> dict[str, Any]:
-        """attempt.json 的读改写，用 If-Match 条件写；冲突时重读重试。"""
+        """attempt.json 的读改写，用 If-Match 条件写；冲突时重读重试。
+
+        每次写入带一个新的 writer 标记。条件写其实成功了、但响应丢失时，存储层的重试会
+        收到 PreconditionFailed；这时重新读取，存储里正是本次要写的文档（含 writer），
+        就算成功，不再重复执行 mutate（比如重复把 attempt + 1）。
+        """
         key = layout.attempt_key(job_id)
         for _ in range(CAS_TRIES):
             got = self._read_doc(key, "attempt.json")
@@ -1241,14 +1293,30 @@ class Orchestrator:
             if expect_attempt is not None and doc.get("attempt") != expect_attempt:
                 raise AttemptConflict(job_id, expect_attempt, doc.get("attempt"))
             new_doc = mutate(dict(doc))
+            new_doc["writer"] = states.new_writer_token()
             try:
                 self.store.put_json(key, new_doc, if_match=etag)
                 return new_doc
             except PreconditionFailed:
+                if self._landed(key, new_doc):
+                    return new_doc
                 self.sleep(CAS_BACKOFF_S)
         raise DgpuError(
             f"任务 {job_id} 的 attempt.json 连续 {CAS_TRIES} 次条件写冲突，请稍后重试。"
         )
+
+    def _landed(self, key: str, intended: dict[str, Any]) -> bool:
+        """条件写报“条件不满足”之后：存储里是否正是本次要写的文档（之前的请求其实已生效）。"""
+        got = self.store.get_json(key)
+        return got is not None and got[0] == intended
+
+    def _create_doc(self, key: str, doc: dict[str, Any]) -> None:
+        """只在对象不存在时创建（If-None-Match）。响应丢失后重试报“已存在”时，按内容判断。"""
+        try:
+            self.store.put_json(key, doc, if_none_match=True)
+        except PreconditionFailed:
+            if not self._landed(key, doc):
+                raise
 
     def _write_cli_status(self, job_id: str, attempt: int, phase: str, message: str) -> bool:
         """写 PROVISIONING / STARTING。runner 已接手（同一 attempt 的其他阶段）就不覆盖。"""
@@ -1263,9 +1331,13 @@ class Orchestrator:
                 if current == attempt and doc.get("phase") not in _CLI_PHASES:
                     return False
             new_doc = states.new_status_doc(
-                job_id, attempt, phase, states.SRC_CLI, message=redact(message, self._secrets)
+                job_id,
+                attempt,
+                phase,
+                states.SRC_CLI,
+                message=redact(message, self._secrets),
+                now=self.clock(),
             )
-            new_doc["updated_at"] = self.clock()
             try:
                 if got is None:
                     self.store.put_json(key, new_doc, if_none_match=True)
@@ -1300,8 +1372,8 @@ class Orchestrator:
                 states.SRC_CLI,
                 reason=reason,
                 message=redact(message, self._secrets),
+                now=self.clock(),
             )
-            new_doc["updated_at"] = self.clock()
             try:
                 if got is None:
                     self.store.put_json(key, new_doc, if_none_match=True)
@@ -1323,6 +1395,39 @@ class Orchestrator:
                 f"在配置文件的 [backends.{name}] 里填写凭据，或用 --backend 换一个。"
             )
         return backend
+
+    def _warn_foreign_buckets(self, spec: JobSpec) -> None:
+        """data 里引用了配置的 bucket 之外的 bucket：实例用同一个存储 token 去读，提醒权限。"""
+        own = self.store.profile.bucket
+        others = sorted(
+            {
+                ref.bucket
+                for ref in spec.data
+                if not ref.is_local and ref.bucket and ref.bucket != own
+            }
+        )
+        for bucket in others:
+            self.echo(
+                f"注意：data 里引用了 bucket {bucket}，它不是存储 {self.store.profile.name} 配置的 "
+                f"bucket {own}。实例用这个存储的 token 读取数据：token 必须有 bucket {bucket} 的"
+                "读权限，否则下载数据会失败（FAILED(data_sync)）。"
+            )
+
+    def _check_local_file_sizes(self, spec: JobSpec) -> None:
+        """本地数据里有超过单次上传上限的文件：上传任何东西之前就报错。"""
+        too_big = _oversized_local_files(spec, SINGLE_UPLOAD_LIMIT)
+        if not too_big:
+            return
+        name, path, size = too_big[0]
+        more = f"（另有 {len(too_big) - 1} 个）" if len(too_big) > 1 else ""
+        bucket = self.store.profile.bucket
+        raise DgpuError(
+            f"本地数据 {name} 里的文件 {path}（{size / GB:.1f} GiB）{more}超过存储单次上传的上限 "
+            f"{SINGLE_UPLOAD_LIMIT / GB:.0f} GiB，dgpu 不会分段上传它。"
+            "请先用 rclone 把这份数据传到 bucket"
+            f"（如 rclone copy <数据目录> <remote>:{bucket}/datasets/{name}），"
+            f"再在 job.yaml 的 data 里写成 r2://{bucket}/datasets/{name}。没有上传任何东西，也没有创建实例。"
+        )
 
     def _check_store_profile(self, backend_name: str) -> None:
         wanted = self.config.store_for(backend_name).name
@@ -1349,7 +1454,7 @@ class Orchestrator:
         return doc, etag
 
     def _read_request(self, job_id: str) -> tuple[GpuRequest, str]:
-        got = self._read_doc(_request_key(job_id), "request.json")
+        got = self._read_doc(layout.request_key(job_id), "request.json")
         if got is None:
             raise DgpuError(f"任务 {job_id} 缺少 request.json（GPU 需求），无法重试。")
         doc = got[0]
@@ -1451,9 +1556,11 @@ class Orchestrator:
         self, spec: JobSpec, job_id: str, backend_name: str, request: GpuRequest
     ) -> None:
         self.echo(f"打包代码 {spec.code} ……")
+        # data 里的本地目录单独上传；它们在代码目录里时不能再打进代码包
+        local_data = [Path(ref.local_path) for ref in spec.data if ref.local_path is not None]
         with tempfile.TemporaryDirectory(prefix="dgpu-") as tmp:
             archive = Path(tmp) / "code.tar.gz"
-            self.deps.pack_code(Path(spec.code), archive)
+            self.deps.pack_code(Path(spec.code), archive, exclude=local_data)
             self.store.put_file(layout.code_key(job_id), archive)
         sources: list[DataSource] = []
         for ref in spec.data:
@@ -1465,7 +1572,7 @@ class Orchestrator:
         )
         self.store.put_json(layout.spec_key(job_id), remote_spec, if_none_match=True)
         self.store.put_json(
-            _request_key(job_id),
+            layout.request_key(job_id),
             {
                 "version": states.SCHEMA_VERSION,
                 "job_id": job_id,
@@ -1482,17 +1589,16 @@ class Orchestrator:
         )
 
     def _deadline(self, max_hours: float) -> float:
-        """超过这个时间仍存在的实例可以被 gc 销毁：启动 + 训练 + 收尾 + watchdog 余量 + 30 分钟。"""
+        """超过这个时间仍存在的实例可以被 gc 销毁。
+
+        启动窗口 + 实例最晚自己消失的时间（watchdog 硬截止 + watchdog 收尾，和 runner 用同一个
+        公式、生产环境的默认调参）+ 30 分钟余量。
+        """
         cfg = self.config
-        return (
-            self.clock()
-            + (cfg.startup_timeout_min + cfg.runner_timeout_min) * 60
-            + max_hours * 3600
-            + cfg.runner.final_sync_timeout_min * 60
-            + cfg.runner.term_grace_s
-            + WATCHDOG_MARGIN_S
-            + DEADLINE_MARGIN_S
-        )
+        settings = runner_util.runner_settings({"runner": cfg.runner.to_dict()})
+        lifetime = runner_util.instance_lifetime_s(max_hours, settings, runner_util.DEFAULT_TUNING)
+        startup = (cfg.startup_timeout_min + cfg.runner_timeout_min) * 60
+        return self.clock() + startup + lifetime + DEADLINE_MARGIN_S
 
     def _event(
         self,
@@ -1507,9 +1613,8 @@ class Orchestrator:
         # 事件里常带平台返回的错误文本，写进存储前抹掉已知凭据（红线 2、7）
         message = redact(message, self._secrets)
         data = json.loads(redact(json.dumps(data or {}, ensure_ascii=False), self._secrets))
-        doc = states.new_event_doc(name, source, job_id, attempt, message, data)
         ts = self.clock()
-        doc["ts"] = ts
+        doc = states.new_event_doc(name, source, job_id, attempt, message, data, now=ts)
         try:
             self.store.put_json(layout.event_key(job_id, source, ts=ts), doc)
         except Exception as exc:  # 事件写失败不能打断清理，但要让人看到
@@ -1725,11 +1830,6 @@ def redact(text: str, secrets: tuple[str, ...]) -> str:
     return text
 
 
-def _request_key(job_id: str) -> str:
-    """GPU 需求，retry 换机时重新搜索用（layout.py 里没有，见报告）。"""
-    return layout.job_prefix(job_id) + "request.json"
-
-
 def _offer_data(offer: Offer) -> dict[str, Any]:
     return {
         "offer_id": offer.id,
@@ -1756,6 +1856,27 @@ def _local_data_bytes(spec: JobSpec) -> int:
                     if not os.path.islink(full):
                         total += os.path.getsize(full)
     return total
+
+
+def _oversized_local_files(spec: JobSpec, limit: int) -> list[tuple[str, str, int]]:
+    """本地数据里大于 limit 的文件：(数据名, 路径, 大小)，从大到小。
+
+    指向文件的符号链接按目标大小算；不进入指向目录的链接（上传前 packaging 还会再查一遍）。
+    """
+    found: list[tuple[str, str, int]] = []
+    for ref in spec.data:
+        if ref.local_path is None:
+            continue
+        for root, _dirs, files in os.walk(ref.local_path):
+            for name in files:
+                full = os.path.join(root, name)
+                try:
+                    size = os.stat(full).st_size
+                except OSError:
+                    continue  # 坏链接等：上传时 packaging 会报清楚的错
+                if size > limit:
+                    found.append((ref.name, full, size))
+    return sorted(found, key=lambda item: item[2], reverse=True)
 
 
 def _job_sort_key(job_id: str) -> tuple[str, str]:

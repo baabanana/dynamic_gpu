@@ -337,6 +337,21 @@ def test_local_data_must_be_a_directory(tmp_path):
     _error(_write(tmp_path, dict(BASE, data=["data.zip"])), "data[0]", "不是目录")
 
 
+@pytest.mark.parametrize("name", ["my data", "数据集", "a+b", "x:y"])
+def test_data_names_the_runner_would_reject_are_refused(tmp_path, name):
+    (tmp_path / name).mkdir()
+    _error(_write(tmp_path, dict(BASE, data=[f"./{name}"])), "data[0]", "不支持的字符")
+    _error(_write(tmp_path, dict(BASE, data=[f"r2://bkt/sets/{name}"])), "data[0]", "不支持的字符")
+
+
+def test_data_names_with_dots_dashes_and_underscores_are_fine(tmp_path):
+    (tmp_path / "coco8_v1.2-small").mkdir()
+    spec = load_spec(
+        _write(tmp_path, dict(BASE, data=["./coco8_v1.2-small", "r2://bkt/a/B.c-d_e"]))
+    )
+    assert [ref.name for ref in spec.data] == ["coco8_v1.2-small", "B.c-d_e"]
+
+
 def test_local_and_remote_data_with_same_name_are_rejected(tmp_path):
     (tmp_path / "coco8").mkdir()
     path = _write(tmp_path, dict(BASE, data=["r2://bkt/coco8", "./coco8"]))

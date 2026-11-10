@@ -44,7 +44,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dgpu import layout, states
-from dgpu.contracts import DataRef, DataSource, PreconditionFailed, SpecError, Store
+from dgpu.contracts import (
+    SINGLE_UPLOAD_LIMIT,
+    DataRef,
+    DataSource,
+    PreconditionFailed,
+    SpecError,
+    Store,
+)
 
 # 任意层级的文件名或目录名匹配到就排除，代码包和数据集都适用
 ALWAYS_EXCLUDED = (".git", ".env*", "*.pem", "*.key", "__pycache__", ".venv")
@@ -423,14 +430,19 @@ def _sha256_file(path: Path) -> str:
 # ---------------------------------------------------------------- 数据集
 
 
-def hash_dataset(path: Path) -> DatasetManifest:
-    """计算本地数据目录的内容哈希和文件清单。目录为空或含坏链接时抛 SpecError。"""
+def hash_dataset(path: Path, *, max_file_bytes: int = SINGLE_UPLOAD_LIMIT) -> DatasetManifest:
+    """计算本地数据目录的内容哈希和文件清单。
+
+    目录为空、含坏链接，或有文件超过 max_file_bytes（存储单次上传的上限）时抛 SpecError；
+    大小在读文件算哈希之前检查。
+    """
     root = _check_dir(path, "数据目录")
     found, excluded = _walk_dataset(root)
     if not found:
         raise SpecError(
             f"数据目录 {root} 里没有文件（或者都被默认规则排除了）。检查 job.yaml 的 data 路径。"
         )
+    _check_file_sizes(root, [(rel, os.stat(root / rel).st_size) for rel in found], max_file_bytes)
     files: list[DatasetFile] = []
     for rel in sorted(found):
         with _open_for_read(root / rel, "数据文件") as handle:
@@ -511,6 +523,9 @@ def upload_dataset(
         manifest = hash_dataset(root)
     elif manifest.root != root:
         raise ValueError(f"manifest 属于 {manifest.root}，不是 {root}")
+    _check_file_sizes(
+        root, [(item.path, item.size) for item in manifest.files], SINGLE_UPLOAD_LIMIT
+    )
 
     prefix = layout.dataset_prefix(manifest.content_hash)
     marker = layout.dataset_complete_key(manifest.content_hash)
@@ -531,6 +546,22 @@ def upload_dataset(
     except PreconditionFailed:
         pass  # 另一个进程同时上传了同样的内容并先写了标记，结果相同
     return source
+
+
+def _check_file_sizes(root: Path, files: list[tuple[str, int]], limit: int) -> None:
+    """有文件超过存储单次上传的上限时，在上传任何东西之前报错，指给用户 rclone + r2:// 的做法。"""
+    too_big = sorted((item for item in files if item[1] > limit), key=lambda i: i[1], reverse=True)
+    if not too_big:
+        return
+    rel, size = too_big[0]
+    more = f"（另有 {len(too_big) - 1} 个文件也超过）" if len(too_big) > 1 else ""
+    gib = 1024**3
+    raise SpecError(
+        f"数据目录 {root} 里的 {rel}（{size / gib:.1f} GiB）{more}超过存储单次上传的上限 "
+        f"{limit / gib:g} GiB，dgpu 不会分段上传它，所以没有上传任何文件。请先用 rclone 把整个"
+        f"目录传到 bucket（如 rclone copy {root} <remote>:<bucket>/datasets/{root.name}），"
+        f"再在 job.yaml 的 data 里写成 r2://<bucket>/datasets/{root.name}。"
+    )
 
 
 def _check_unchanged(manifest: DatasetManifest) -> None:
@@ -564,3 +595,8 @@ def resolve_remote(ref: DataRef) -> DataSource:
         raise ValueError(f"data {ref.name!r} 不是存储里的数据，用 upload_dataset")
     prefix = ref.prefix if ref.prefix.endswith("/") else ref.prefix + "/"
     return DataSource(name=ref.name, bucket=ref.bucket, prefix=prefix)
+
+
+def resolve_data(store: Store, ref: DataRef) -> DataSource:
+    """data 的一项 → 实例可以拉取的 DataSource：本地目录先上传到存储，存储里的直接转换。"""
+    return upload_dataset(store, ref) if ref.is_local else resolve_remote(ref)

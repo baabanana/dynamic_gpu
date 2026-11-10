@@ -141,8 +141,9 @@ def test_wait_retries_relaunch_with_next_attempt(tmp_path):
     assert world.backend.creates() == ["o1", "o1"]
     assert world.backend.launches["2"].attempt == 2
     assert world.doc(layout.attempt_key(job_id))["attempt"] == 2
-    fenced = world.events(job_id, states.EV_ATTEMPT_FENCED)
-    assert [(e["data"]["old_attempt"], e["data"]["new_attempt"]) for e in fenced] == [(1, 2)]
+    relaunch = world.events(job_id, states.EV_RELAUNCH)
+    assert [(e["data"]["old_attempt"], e["data"]["new_attempt"]) for e in relaunch] == [(1, 2)]
+    assert world.events(job_id, states.EV_ATTEMPT_FENCED) == []  # 这个名字留给 runner
     destroyed = [e["data"]["instance_id"] for e in world.events(job_id, "instance_destroyed")]
     assert destroyed[0] == "1"
 

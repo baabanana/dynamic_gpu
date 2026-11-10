@@ -482,6 +482,7 @@ def test_runner_killed_watchdog_syncs_reports_and_destroys(harness):
 
 
 def test_runner_sigterm_tears_down_cleanly(harness):
+    """SIGTERM (container stopped): the runner finishes up itself, reason `signalled`."""
     harness.prepare(run="echo c > $DGPU_CKPT/c.pt; echo started; sleep 300")
     harness.start()
     harness.wait_running()
@@ -492,7 +493,7 @@ def test_runner_sigterm_tears_down_cleanly(harness):
     status = harness.status()
     assert (status["phase"], status["reason"], status["source"]) == (
         states.FAILED,
-        states.REASON_RUNNER_CRASHED,
+        states.REASON_SIGNALLED,
         states.SRC_RUNNER,
     ), harness.diagnostics()
     assert "SIGTERM" in status["message"]
@@ -505,7 +506,16 @@ def test_runner_sigterm_tears_down_cleanly(harness):
 def test_watchdog_hard_deadline_kills_a_stuck_runner(harness):
     """Layer 2: runner stuck (SIGSTOP) -> at max_hours + final sync + margin the watchdog kills
     everything, records the deadline and destroys."""
-    harness.tuning["watchdog_margin_s"] = 0.5
+    # The hard deadline now covers the runner's whole worst-case teardown (util.
+    # teardown_worst_case_s); shrink those time limits so the deadline is ~12 s away.
+    harness.tuning.update(
+        watchdog_margin_s=0.5,
+        small_op_timeout_s=2.0,
+        thread_join_s=0.5,
+        teardown_budget_s=2.0,
+        destroy_attempts=1,
+        destroy_http_timeout_s=2.0,
+    )
     harness.prepare(run="sleep 300", max_hours=0.0006, final_sync_timeout_min=0.005)
     harness.start()
     harness.wait_running()

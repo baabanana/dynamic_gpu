@@ -98,6 +98,11 @@ def attempt_key(job_id: str) -> str:
     return job_prefix(job_id) + "attempt.json"
 
 
+def request_key(job_id: str) -> str:
+    """GPU 需求（型号、卡数、价格上限、时长、磁盘、镜像），CLI 在 retry 换机时重新搜索用。"""
+    return job_prefix(job_id) + "request.json"
+
+
 def secrets_key(job_id: str, attempt: int) -> str:
     """本次尝试的启动文档（含存储凭据），只通过预签名 URL 下发。"""
     return job_prefix(job_id) + "secrets-%d.json" % attempt

@@ -107,6 +107,7 @@ class Sim:
     job_id: str
     running_at: float | None = None
     first_hb: float | None = None
+    preflight_done: bool = False
     done: bool = False
     saw_launch_doc: bool | None = None
     log_lines: int = 0
@@ -181,6 +182,7 @@ class World:
         self.sleeps = 0
         self.on_sleep: list[Callable[[World], None]] = []
         self.data_uploads: list[str] = []
+        self.pack_excludes: list[list[Path]] = []
 
     # ---- 注入点
 
@@ -199,7 +201,8 @@ class World:
     def echo(self, message: str) -> None:
         self.messages.append(message)
 
-    def pack_code(self, code_dir: Path, dest: Path) -> None:
+    def pack_code(self, code_dir: Path, dest: Path, *, exclude: Any = ()) -> None:
+        self.pack_excludes.append([Path(path) for path in exclude])
         with tarfile.open(dest, "w:gz") as tar:
             tar.add(code_dir, arcname=".")
 
@@ -317,13 +320,18 @@ class World:
             if fenced:
                 self._self_destroy(sim)
                 return
+            # 和真实 runner 一样：先写 RUNNING 和第一次心跳（step=preflight），再做 preflight
+            sim.first_hb = self.now
+            self._status(sim, states.RUNNING)
+            self._heartbeat(sim, "preflight")
+            return
+        if not sim.preflight_done:
+            sim.preflight_done = True
             if plan.runner == "preflight":
                 self._status(sim, states.FAILED, states.REASON_PREFLIGHT, "nvidia-smi failed")
                 self._self_destroy(sim)
                 return
-            sim.first_hb = self.now
-            self._status(sim, states.RUNNING)
-            self._heartbeat(sim, "fetch")
+            self._heartbeat(sim, "fetch")  # preflight 通过后立刻写一次心跳
             return
         if fenced:
             self._self_destroy(sim)

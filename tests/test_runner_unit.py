@@ -15,7 +15,7 @@ import time
 import pytest
 
 from dgpu import layout, states
-from dgpu.runner import archive, gpu, procs
+from dgpu.runner import archive, gpu, procs, util
 from dgpu.runner.destroy import (
     DestroyResult,
     SelfDestroyer,
@@ -24,7 +24,8 @@ from dgpu.runner.destroy import (
 from dgpu.runner.logsink import LogSink, Pump
 from dgpu.runner.main import Runner
 from dgpu.runner.rclone import Rclone, RcloneError
-from dgpu.runner.util import Paths, load_tuning, runner_settings, scrubbed
+from dgpu.runner.util import DEFAULT_TUNING, Paths, load_tuning, runner_settings, scrubbed
+from dgpu.runner.watchdog import Watchdog
 from dgpu.testing import TEST_PROFILE
 from test_runner_harness import Harness
 
@@ -346,6 +347,103 @@ def test_runner_settings_default_and_accept_fractions():
     settings = runner_settings({"runner": {"final_sync_timeout_min": 0.05, "max_log_mb": "x"}})
     assert settings["final_sync_timeout_min"] == 0.05
     assert settings["max_log_mb"] == 200.0 and settings["heartbeat_interval_s"] == 60.0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"final_sync_timeout_min": 120.0, "term_grace_s": 600.0},
+        {"final_sync_timeout_min": 1.0, "term_grace_s": 0.0},
+    ],
+)
+@pytest.mark.parametrize(
+    "tuning_overrides", [{}, {"destroy_attempts": 30, "teardown_budget_s": 900}]
+)
+def test_watchdog_hard_deadline_always_exceeds_the_runners_worst_teardown(
+    overrides, tuning_overrides
+):
+    """Item 9: the watchdog must never kill a runner that is still within its own time limits."""
+    settings = runner_settings({"runner": overrides})
+    tuning = dict(DEFAULT_TUNING, **tuning_overrides)
+    max_hours = 2.0
+    worst = util.teardown_worst_case_s(settings, tuning)
+    hard = util.watchdog_hard_deadline_s(max_hours, settings, tuning)
+    # 每一项时限都算进去了
+    assert worst >= (
+        settings["term_grace_s"]
+        + settings["final_sync_timeout_min"] * 60
+        + tuning["teardown_budget_s"]
+        + tuning["destroy_attempts"] * tuning["destroy_http_timeout_s"]
+        + (tuning["destroy_attempts"] - 1) * tuning["destroy_interval_s"]
+    )
+    assert hard - max_hours * 3600 - worst == tuning["watchdog_margin_s"] >= 120  # 几分钟
+    lifetime = util.instance_lifetime_s(max_hours, settings, tuning)
+    assert lifetime > hard + util.destroy_worst_case_s(tuning)
+
+
+def test_default_runner_teardown_exceeds_the_old_fixed_margin():
+    """The old margin (final sync + 10 min) was shorter than the runner's default worst case."""
+    settings = runner_settings({})
+    old = settings["final_sync_timeout_min"] * 60 + 600
+    assert util.teardown_worst_case_s(settings, DEFAULT_TUNING) > old
+
+
+def test_final_sync_total_is_bounded_by_its_setting(fake):
+    """Output and ckpt share the final-sync time; a hung copy cannot double it."""
+    fake.prepare(run="true", final_sync_timeout_min=0.05)  # 3 s
+    runner = _in_process_runner(fake, CountingDestroyer())
+    runner._load_launch()
+    runner._load_spec()
+    for folder in (runner.paths.output, runner.paths.ckpt):
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "f.bin"), "wb") as handle:
+            handle.write(b"x")
+    fake.add_rule("copy", "", mode="hang")
+    started = time.monotonic()
+    ok, missing, error = runner._final_sync()
+    elapsed = time.monotonic() - started
+    assert not ok and sorted(missing) == ["ckpt/f.bin", "output/f.bin"]
+    assert 2.5 < elapsed < 4.0, elapsed  # 不是 2 × 3 秒
+
+
+def _in_process_watchdog(h: Harness, destroyer) -> Watchdog:
+    tuning = load_tuning({"DGPU_RUNNER_TUNING": json.dumps(h.tuning)})
+    return Watchdog(
+        Paths(str(h.work)),
+        tuning=tuning,
+        environ=h.env(),
+        rclone_binary=str(h.bin / "rclone"),
+        destroyer=destroyer,
+    )
+
+
+def test_watchdog_self_destroys_even_if_its_takeover_fails(fake):
+    fake.prepare(run="true")
+    destroyer = CountingDestroyer()
+    watchdog = _in_process_watchdog(fake, destroyer)
+
+    def boom():
+        raise RuntimeError("takeover bug")
+
+    watchdog._crash_takeover = boom
+    assert watchdog.run() == 0  # 没有 runner 持锁：当作 runner 已退出
+    assert destroyer.calls == 1
+
+
+def test_watchdog_self_destroys_even_if_killing_fails_at_the_hard_deadline(fake):
+    fake.prepare(run="true")
+    destroyer = CountingDestroyer()
+    watchdog = _in_process_watchdog(fake, destroyer)
+    watchdog._setup()
+
+    def boom():
+        raise RuntimeError("kill bug")
+
+    watchdog._kill_everything = boom
+    with pytest.raises(RuntimeError):
+        watchdog._on_hard_deadline("test")
+    assert destroyer.calls == 1
 
 
 def test_scrubbed_prefixes():

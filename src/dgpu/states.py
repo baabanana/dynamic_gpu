@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import secrets
 import time
 from typing import Any, Dict, Optional
 
@@ -41,6 +42,7 @@ REASON_SETUP = "setup"  # setup 命令非 0 退出
 REASON_EXIT_CODE = "exit_code"  # run 命令非 0 退出
 REASON_STALLED = "stalled"  # 卡死检测触发
 REASON_RUNNER_CRASHED = "runner_crashed"  # runner 进程消失，由 watchdog 收尾
+REASON_SIGNALLED = "signalled"  # runner 收到 SIGTERM / SIGINT（容器被停止等），提前收尾
 REASON_FINAL_SYNC = "final_sync"  # 最终上传在时限内没有成功
 REASON_FENCED = "fenced"  # 发现更新的 attempt，本 attempt 自行退出
 
@@ -63,6 +65,8 @@ EV_ATTEMPT_FENCED = "attempt_fenced"
 EV_GC_DESTROYED = "gc_destroyed"
 EV_INSTANCE_DESTROYED = "instance_destroyed"
 EV_DATASET_UPLOADED = "dataset_uploaded"
+EV_DESTROY_FAILED = "destroy_failed"  # CLI 一侧销毁实例失败或无法确认，实例可能仍在计费
+EV_RELAUNCH = "relaunch"  # CLI 换机或重试：attempt + 1（runner 一侧发现后写 attempt_fenced）
 
 EVENT_NAMES = (
     EV_OFFER_REJECTED,
@@ -82,6 +86,8 @@ EVENT_NAMES = (
     EV_GC_DESTROYED,
     EV_INSTANCE_DESTROYED,
     EV_DATASET_UPLOADED,
+    EV_DESTROY_FAILED,
+    EV_RELAUNCH,
 )
 
 # 事件来源（写进事件文件名和内容）
@@ -130,6 +136,19 @@ def now() -> float:
     return time.time()
 
 
+def _now(value: Optional[float]) -> float:
+    return time.time() if value is None else value
+
+
+def new_writer_token() -> str:
+    """attempt.json 的 writer 字段：每次写入换一个随机值。
+
+    条件写成功但响应丢失时，重试会收到“条件不满足”；重新读取后，存储里的文档带着自己
+    这次写入的 writer 和内容，就说明那次写入其实已经生效。
+    """
+    return secrets.token_hex(8)
+
+
 def new_attempt_doc(
     job_id: str,
     attempt: int,
@@ -137,10 +156,12 @@ def new_attempt_doc(
     label: str,
     instance_id: Optional[str] = None,
     deadline_at: Optional[float] = None,
+    now: Optional[float] = None,
 ) -> Dict[str, Any]:
     """attempt.json：当前有效的 attempt。只由 CLI 用条件写更新。
 
     runner 每次心跳读取它：attempt 比自己大，或 cancel 为 True，就停止并收尾。
+    now：时间戳（默认当前时间），调用方有自己的时钟时传入。
     """
     return {
         "version": SCHEMA_VERSION,
@@ -150,8 +171,9 @@ def new_attempt_doc(
         "label": label,
         "instance_id": instance_id,
         "cancel": False,
-        "created_at": now(),
+        "created_at": _now(now),
         "deadline_at": deadline_at,  # 超过这个时间仍存在的实例可以被 gc 销毁
+        "writer": new_writer_token(),  # 本次写入的随机标记，见 new_writer_token
     }
 
 
@@ -164,6 +186,7 @@ def new_status_doc(
     exit_code: Optional[int] = None,
     message: Optional[str] = None,
     not_uploaded: Optional[list] = None,
+    now: Optional[float] = None,
 ) -> Dict[str, Any]:
     """status.json：任务阶段。"""
     return {
@@ -176,7 +199,7 @@ def new_status_doc(
         "message": message,  # 给人看的一句话
         "not_uploaded": not_uploaded or [],  # final_sync 失败时没传上去的文件
         "source": source,
-        "updated_at": now(),
+        "updated_at": _now(now),
     }
 
 
@@ -189,6 +212,7 @@ def new_heartbeat_doc(
     last_log_at: Optional[float] = None,
     synced_bytes: int = 0,
     last_sync_at: Optional[float] = None,
+    now: Optional[float] = None,
 ) -> Dict[str, Any]:
     """heartbeat.json：runner 每个心跳周期覆盖写一次。
 
@@ -200,7 +224,7 @@ def new_heartbeat_doc(
         "attempt": attempt,
         "phase": phase,
         "step": step,
-        "ts": now(),
+        "ts": _now(now),
         "gpu_util": gpu_util,
         "last_log_at": last_log_at,
         "synced_bytes": synced_bytes,
@@ -215,6 +239,7 @@ def new_event_doc(
     attempt: Optional[int] = None,
     message: str = "",
     data: Optional[Dict[str, Any]] = None,
+    now: Optional[float] = None,
 ) -> Dict[str, Any]:
     """events/ 下的一条事件。name 必须在 EVENT_NAMES 里。"""
     if name not in EVENT_NAMES:
@@ -225,7 +250,7 @@ def new_event_doc(
         "source": source,
         "job_id": job_id,
         "attempt": attempt,
-        "ts": now(),
+        "ts": _now(now),
         "message": message,
         "data": data or {},
     }

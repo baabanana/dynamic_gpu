@@ -44,7 +44,9 @@ DEFAULT_TUNING = {
     "destroy_http_timeout_s": 30.0,
     "vast_api_base": "https://console.vast.ai",
     "watchdog_poll_s": 2.0,
-    "watchdog_margin_s": 600.0,  # 硬截止 = max_hours + final_sync_timeout + 这个余量
+    # 硬截止 = max_hours + runner 最坏收尾时间（teardown_worst_case_s）+ 这个余量；余量覆盖
+    # 公式里没算的零碎等待（SIGKILL 后等进程消失、每次存储操作至少 1 秒等）
+    "watchdog_margin_s": 300.0,
     "watchdog_spec_wait_s": 1800.0,  # runner 一直没读到 spec 时，watchdog 最多等多久
     "watchdog_sync_timeout_s": 600.0,  # runner 崩溃后 watchdog 尽力同步一次的时限
     "boot_watchdog_wait_s": 1800.0,  # AutoDL 前台模式：runner 退出后最多等 watchdog 多久
@@ -137,6 +139,61 @@ def runner_settings(spec: Dict[str, Any]) -> Dict[str, float]:
         except (TypeError, ValueError):
             settings[key] = default
     return settings
+
+
+# ---------------------------------------------------------------- 时限（runner、watchdog、CLI）
+
+
+def destroy_worst_case_s(tuning: Dict[str, Any]) -> float:
+    """自毁最多用多久：每次 HTTP 请求的时限，加上两次之间的间隔。"""
+    attempts = max(1, int(tuning["destroy_attempts"]))
+    return (
+        attempts * tuning["destroy_http_timeout_s"] + (attempts - 1) * tuning["destroy_interval_s"]
+    )
+
+
+def teardown_worst_case_s(settings: Dict[str, float], tuning: Dict[str, Any]) -> float:
+    """runner 从决定停止（如到达 max_hours）到自毁结束最多用多久：各步骤时限之和。
+
+    结束训练进程（term_grace_s）、停后台线程、写 UPLOADING、最终同步（final_sync_timeout）、
+    列出没传上去的文件、写日志事件和最终状态（teardown_budget_s）、自毁。
+    """
+    small = tuning["small_op_timeout_s"]
+    return (
+        settings["term_grace_s"]
+        + 2 * tuning["thread_join_s"]
+        + 3 * small  # UPLOADING 状态；output/、ckpt/ 各列一次
+        + settings["final_sync_timeout_min"] * 60.0
+        + tuning["teardown_budget_s"]
+        + destroy_worst_case_s(tuning)
+    )
+
+
+def watchdog_hard_deadline_s(
+    max_hours: float, settings: Dict[str, float], tuning: Dict[str, Any]
+) -> float:
+    """watchdog 的硬截止（从第一次启动算起）：总比 runner 最坏的收尾多出 watchdog_margin_s。"""
+    return (
+        max_hours * 3600.0 + teardown_worst_case_s(settings, tuning) + tuning["watchdog_margin_s"]
+    )
+
+
+def watchdog_teardown_worst_case_s(settings: Dict[str, float], tuning: Dict[str, Any]) -> float:
+    """watchdog 到达硬截止后最多用多久：结束进程、传日志和事件、写状态、自毁。"""
+    return (
+        min(settings["term_grace_s"], 10.0)
+        + 5 * tuning["small_op_timeout_s"]
+        + destroy_worst_case_s(tuning)
+    )
+
+
+def instance_lifetime_s(
+    max_hours: float, settings: Dict[str, float], tuning: Dict[str, Any]
+) -> float:
+    """runner 启动之后，实例最晚在多久之内自己消失（watchdog 硬截止 + watchdog 收尾）。"""
+    return watchdog_hard_deadline_s(max_hours, settings, tuning) + watchdog_teardown_worst_case_s(
+        settings, tuning
+    )
 
 
 def backoff(base: float, attempt: int, cap: float) -> float:
