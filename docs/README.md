@@ -4,6 +4,7 @@
 |---|---|---|
 | [dgpu-design.md](dgpu-design.md) | dgpu 调度工具的设计：任务约定、销毁保证、失败模式、验收标准 | 设计已确认（2026-11-10）；4.12、4.13 为新增草案 |
 | [dgpu-implementation-plan.md](dgpu-implementation-plan.md) | 分阶段并行开发方案：契约、工作包、探针、集成与评审 | 草案 |
+| [dgpu-review-2026-11-10.md](dgpu-review-2026-11-10.md) | 对抗式评审问题清单：问题、核实方式、修复状态和对应测试 | 已修复，待复核 |
 | [usage.md](usage.md) | 使用说明：安装、配置、写 job.yaml、命令、数据、停止计费的保证 | 草案（尚未在真实平台验证） |
 | [../skills/dgpu/SKILL.md](../skills/dgpu/SKILL.md) | Claude 用的 Skill：环境检查、job.yaml、标准流程、按结果处理、安全规则 | 草案（尚未在真实平台验证） |
 | [../examples/yolo/README.md](../examples/yolo/README.md) | YOLO 示例：coco8 上训练 YOLO26n、中断续跑、费用估算 | 草案（尚未在真实平台验证） |

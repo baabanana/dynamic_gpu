@@ -129,7 +129,7 @@ DGPU_DATA=$PWD/datasets DGPU_OUTPUT=/tmp/yolo-smoke/output DGPU_CKPT=/tmp/yolo-s
 
 | 现象 | 处理 |
 |---|---|
-| 日志里有 `libGL.so.1: cannot open shared object file` | 镜像缺 OpenCV 需要的系统库。把 `setup` 改成 `apt-get update && apt-get install -y libgl1 libglib2.0-0 && python -m pip install ultralytics==8.4.208`，或装完 ultralytics 后把 `opencv-python` 换成 `opencv-python-headless` |
+| 日志里有 `libGL.so.1: cannot open shared object file` | 镜像缺 OpenCV 需要的系统库。训练默认不以 root 运行，`setup` 里不能 `apt-get install`。把 `setup` 改成 `python -m pip install ultralytics==8.4.208 opencv-python-headless`；确实要装系统包时在 `job.yaml` 里加 `run_as_root: true`（训练代码因此能读到 R2 密钥） |
 | 报 `找不到 .../data.yaml` | 数据集目录里没有 `data.yaml`，或 `DATASET` 和目录名不一致 |
 | AutoDL 上下载 `yolo26n.pt` 失败 | 权重从 GitHub 下载，AutoDL 上可能很慢。先在本机下载 `yolo26n.pt` 放进代码目录 |
 | 续跑后日志写“从头训练” | 日志里写了原因：没有 checkpoint、读不出来，或 checkpoint 已经训练完 |
