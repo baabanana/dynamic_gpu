@@ -88,6 +88,7 @@ class Plan:
     boot: str = "ok"  # ok | stuck（一直 loading）| exits（启动时退出）
     boot_s: float = 60.0  # loading → running 用时
     # ok | none（不发心跳）| preflight（preflight 失败并自毁）| crash（运行后、心跳前退出）
+    # | ends（preflight 后立刻以 final_phase 结束并自毁）
     runner: str = "ok"
     hb_delay_s: float = 30.0  # running → 第一次心跳
     run_s: float | None = None  # 第一次心跳后多久结束；None 表示一直跑
@@ -341,7 +342,19 @@ class World:
                 self._status(sim, states.FAILED, states.REASON_PREFLIGHT, "nvidia-smi failed")
                 self._self_destroy(sim)
                 return
+            if plan.runner == "ends":  # preflight 后立刻以 final_phase 结束（如下载数据失败）
+                self._status(sim, plan.final_phase, plan.final_reason, "ended right away")
+                self._self_destroy(sim)
+                return
             self._heartbeat(sim, "fetch")  # preflight 通过后立刻写一次心跳
+            return
+        since_hb = self.now - sim.first_hb
+        if plan.die_after_s is not None and since_hb >= plan.die_after_s:
+            # 失联：实例还在计费，但不再心跳，也不再响应取消和隔离
+            if plan.die_platform_phase and backend.instances[sim.iid].phase != (
+                plan.die_platform_phase
+            ):
+                backend.set_phase(sim.iid, plan.die_platform_phase)
             return
         if fenced:
             self._self_destroy(sim)
@@ -349,14 +362,6 @@ class World:
         if attempt_doc.get("cancel"):
             self._status(sim, states.CANCELLED, message="cancelled by user")
             self._self_destroy(sim)
-            return
-        since_hb = self.now - sim.first_hb
-        if plan.die_after_s is not None and since_hb >= plan.die_after_s:
-            # 失联：实例还在计费，但不再心跳
-            if plan.die_platform_phase and backend.instances[sim.iid].phase != (
-                plan.die_platform_phase
-            ):
-                backend.set_phase(sim.iid, plan.die_platform_phase)
             return
         self._heartbeat(sim)
         if plan.log:

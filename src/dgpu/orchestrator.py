@@ -1333,16 +1333,18 @@ class Orchestrator:
             f"报价 {ctx.offer.price_per_hour if ctx.offer else '?'}）"
         )
         self.echo(detail + "，销毁并换下一台")
+        offer_data = _offer_data(ctx.offer) if ctx.offer else {}
         self._event(
             ctx.job_id,
             states.EV_OFFER_REJECTED,
             ctx.attempt,
             detail,
             {
+                **offer_data,
+                "offer_price_per_hour": offer_data.get("price_per_hour"),
                 "instance_id": ref.id,
-                "price_per_hour": price,
+                "price_per_hour": price,  # 实例创建后平台报的实际价格
                 "max_price_per_hour": ceiling,
-                **(_offer_data(ctx.offer) if ctx.offer else {}),
             },
         )
         self._destroy_ctx(ctx, ref, why="实际价格高于上限")
