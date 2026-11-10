@@ -316,14 +316,15 @@ def test_unknown_create_outcome_is_resolved_by_label(tmp_path):
     assert status["phase"] == states.FAILED and "read timed out" in status["message"]
 
 
-def test_retryable_create_error_that_did_create_is_cleaned_and_next_offer_used(tmp_path):
+def test_retryable_create_error_that_did_create_adopts_the_instance(tmp_path):
+    # 创建请求报错，但实例其实建好了、按标签查得到：接管它，不销毁、不换机（用户 2026-11-10）
     world = World(tmp_path)
     world.backend.raise_after_create["o1"] = BackendError("gateway timeout", retryable=True)
     result = world.orchestrator().submit(make_spec(tmp_path))
-    assert world.backend.destroyed == ["1"]
-    assert result.instance.id == "2" and result.attempt == 2  # 可能有实例存在过，换新 attempt
+    assert world.backend.destroyed == [] and world.backend.creates() == ["o1"]
+    assert result.instance.id == "1" and result.attempt == 1
     (event,) = world.events(result.job_id, states.EV_CREATE_FAILED)
-    assert event["data"]["found_by_label"] == ["1"]
+    assert event["data"]["adopted_instance"] == "1"
 
 
 def test_label_lookup_is_exact_not_prefix(tmp_path):
@@ -458,9 +459,17 @@ def test_main_api_keys_never_reach_storage_or_bootstrap(tmp_path):
 def test_backend_error_text_with_a_key_is_redacted_everywhere_we_write(tmp_path):
     world = World(tmp_path)
     leaky = f"401 unauthorized for Authorization: Bearer {MAIN_VAST_KEY}"
-    world.backend.raise_after_create["o1"] = BackendError(leaky, retryable=True)
+    real_create = world.backend.create
+
+    def create(offer, launch):
+        if offer.id == "o1":  # 结果未知，实例也没有出现
+            world.backend.calls.append(("create", offer.id))
+            raise BackendError(leaky, retryable=True)
+        return real_create(offer, launch)
+
+    world.backend.create = create
     world.backend.raise_after_create["o2"] = BackendError(leaky)  # 不可重试：直接失败
-    with pytest.raises(BackendError):
+    with pytest.raises(DgpuError):
         world.orchestrator().submit(make_spec(tmp_path))
     job_id = only_job_id(world)
     assert world.events(job_id, states.EV_CREATE_FAILED)[0]["message"].count("***") == 1

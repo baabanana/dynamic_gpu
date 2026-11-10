@@ -305,19 +305,27 @@ class AutodlBackend:
     # ------------------------------------------------------------ create
 
     def create(self, offer: Offer, launch: LaunchSpec) -> InstanceRef:
-        region, gpu_name = _parse_offer_id(offer)
+        """创建部署。平台明确拒绝（业务错误码、4xx）、或请求没有发出时，错误带
+        created=False（确定没有创建）；超时、断连、5xx 按名称确认，仍然不知道时 created 为
+        None。"""
+        try:
+            region, gpu_name = _parse_offer_id(offer)
+        except BackendError as exc:
+            raise BackendError(str(exc), created=False) from None
         gpu_num = max(1, offer.gpu_count)
         token = self._settings.token
         if token and any(token in text for text in (launch.bootstrap_cmd, launch.image)):
             raise BackendError(
                 "拒绝创建 AutoDL 部署：启动命令或镜像字段里出现了 AutoDL token。"
-                "部署列表会显示 cmd，平台 key 不能进入实例（设计红线 2），检查 bootstrap 生成逻辑"
+                "部署列表会显示 cmd，平台 key 不能进入实例（设计红线 2），检查 bootstrap 生成逻辑",
+                created=False,
             )
         price_to = self._price_to_milli(launch.max_price_per_hour, gpu_num)
         if price_to < 1:
             raise BackendError(
                 f"每小时价格上限 {launch.max_price_per_hour} 元太低，换算成 AutoDL 的"
-                "“元×1000”后为 0，不可能调度到机器。调高 limits.max_cny_per_hour"
+                "“元×1000”后为 0，不可能调度到机器。调高 limits.max_cny_per_hour",
+                created=False,
             )
         label = launch.label
         body = {
@@ -358,6 +366,10 @@ class AutodlBackend:
                 ) from None
             if _matches(exc, _DUPLICATE_NAME_MARKERS):  # 之前的请求其实已经建好了
                 return self._recover_create(launch, exc, sent=True, fallback=exc)
+            exc.created = False  # 平台回答了业务错误码：确定没有创建
+            raise
+        except BackendError as exc:
+            exc.created = False  # 平台回答了 4xx（没有响应信封）：确定没有创建
             raise
         uuid = data.get("deployment_uuid") if isinstance(data, dict) else None
         if not isinstance(uuid, str) or not uuid:
@@ -399,9 +411,11 @@ class AutodlBackend:
         if fallback is not None and last_lookup_ok:
             raise fallback
         if last_lookup_ok:
+            # 按名称暂时没查到不等于没有创建：部署列表可能晚一点才显示它（created 为 None，
+            # 编排会继续按标签查找一段时间）
             raise BackendError(
-                f"创建 AutoDL 部署 {label} 失败（{cause}）；已按名称确认平台上没有这个部署，"
-                "可以重试或换下一个地区",
+                f"创建 AutoDL 部署 {label} 失败（{cause}）；按名称暂时没有查到这个部署，"
+                "可以换下一个地区；它如果稍后出现，dgpu 会按标签找到并处理",
                 retryable=True,
             )
         if not sent:
@@ -409,6 +423,7 @@ class AutodlBackend:
                 f"创建 AutoDL 部署 {label} 的请求没有发出（{cause}），平台上不会有这个部署；"
                 "检查网络后重试",
                 retryable=True,
+                created=False,
             )
         raise BackendError(
             f"创建 AutoDL 部署 {label} 的结果未知（{cause}），按名称查询也失败了"

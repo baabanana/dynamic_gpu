@@ -53,18 +53,26 @@ class PreconditionFailed(StoreError):
 
 
 class BackendError(DgpuError):
-    """平台 API 调用失败。retryable 表示换一台机器或稍后重试可能成功。"""
+    """平台 API 调用失败。retryable 表示换一台机器或稍后重试可能成功。
 
-    def __init__(self, message: str, *, retryable: bool = False):
+    created 只对 Backend.create 抛出的错误有意义（评审 F3）：
+    - False：确定没有创建实例。平台回答了并明确拒绝（4xx、业务错误码、限流），或者请求根本
+      没有发出（参数检查失败、连接没建立）。编排不再按标签查找，也不提示 gc。
+    - None（默认）：不知道。超时、断连、5xx、响应无法识别，以及“按标签暂时没查到”——实例
+      可能稍后才出现，编排按标签耐心查找、记下可疑标签。
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False, created: bool | None = None):
         super().__init__(message)
         self.retryable = retryable
+        self.created = created
 
 
 class OfferUnavailable(BackendError):
-    """选中的机器已被租走、无库存或创建被拒绝。换下一个 offer。"""
+    """选中的机器已被租走、无库存或创建被拒绝。换下一个 offer。确定没有创建实例。"""
 
     def __init__(self, message: str):
-        super().__init__(message, retryable=True)
+        super().__init__(message, retryable=True, created=False)
 
 
 # ---------------------------------------------------------------- 任务规格（job.yaml）
@@ -217,6 +225,8 @@ class Config:
     startup_timeout_min: int = 15
     runner_timeout_min: int = 5
     max_offers: int = 5
+    # create 结果未知时，按标签查找多久（秒）再下结论“没有创建”（评审 F1，用户 2026-11-10 决定）
+    create_lookup_s: int = 120
     lost_after_min: int = 10
     gc_stale_min: int = 30
     local_data_confirm_gb: float = 5.0
@@ -341,7 +351,9 @@ class Backend(Protocol):
         """创建实例并打上 launch.label。
 
         机器不可用抛 OfferUnavailable。请求超时等结果未知的情况，实现必须先按
-        label 查询：已创建就返回它，确认没创建才抛 BackendError(retryable=True)。
+        label 查询：已创建就返回它，没查到才抛 BackendError(retryable=True)。
+        平台明确拒绝、或请求没有发出时，错误带 created=False；结果未知（包括按标签暂时
+        没查到）时 created 为 None，编排会继续按标签查找一段时间（见 BackendError）。
         """
 
     def get(self, ref: InstanceRef) -> InstanceState:

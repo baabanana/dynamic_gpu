@@ -362,13 +362,18 @@ class VastBackend:
     # ------------------------------------------------------------ create
 
     def create(self, offer: Offer, launch: LaunchSpec) -> InstanceRef:
+        """创建实例。平台明确拒绝、或请求没有发出时，错误带 created=False（确定没有创建）；
+        超时、断连、5xx 按标签确认，仍然不知道时 created 为 None。"""
         if offer.backend != self.name:
-            raise BackendError(f"offer {offer.id} 属于 {offer.backend} 后端，不能在 Vast 上创建")
+            raise BackendError(
+                f"offer {offer.id} 属于 {offer.backend} 后端，不能在 Vast 上创建", created=False
+            )
         onstart = launch.bootstrap_cmd
         if len(onstart) > ONSTART_MAX_CHARS:
             raise BackendError(
                 f"启动命令有 {len(onstart)} 个字符，超过 Vast onstart 的上限 {ONSTART_MAX_CHARS}。"
-                "没有创建实例；这是 bootstrap 命令生成的问题，需要缩短启动命令。"
+                "没有创建实例；这是 bootstrap 命令生成的问题，需要缩短启动命令。",
+                created=False,
             )
         # 不发送 env：凭据只通过预签名 URL 下发（设计 4.13），平台主 key 永不进入实例。
         body = {
@@ -381,8 +386,8 @@ class VastBackend:
             "cancel_unavail": True,
             "target_state": "running",
         }
-        path = f"/api/v0/asks/{_path_id(offer.id, 'offer')}/"
         try:
+            path = f"/api/v0/asks/{_path_id(offer.id, 'offer')}/"
             resp = self._request(
                 "PUT",
                 path,
@@ -393,6 +398,10 @@ class VastBackend:
             )
         except _OutcomeUnknown as exc:
             return self._recover_create(launch, reason=str(exc))
+        except BackendError as exc:
+            # 非幂等请求只在平台回答了时才抛 BackendError（key 无效、限流），或者根本没发出
+            # （ID 不合法）：确定没有创建
+            raise BackendError(str(exc), retryable=exc.retryable, created=False) from None
 
         data = _json(resp)
         if resp.is_success:
@@ -418,7 +427,8 @@ class VastBackend:
             )
         raise self._error(
             f"Vast 拒绝创建实例（offer {offer.id}，{self._describe(resp)}）。没有创建实例；"
-            "检查镜像名和磁盘大小。"
+            "检查镜像名和磁盘大小。",
+            created=False,
         )
 
     def _recover_create(self, launch: LaunchSpec, *, reason: str) -> InstanceRef:
@@ -453,10 +463,12 @@ class VastBackend:
                 return matches[0].ref
             confirmed_absent = True
         if confirmed_absent:
+            # 按标签暂时没查到不等于没有创建：平台的列表可能晚一点才显示它（created 为 None，
+            # 编排会继续按标签查找一段时间）
             raise BackendError(
                 self._redact(
-                    f"Vast 创建请求结果未知（{reason}），按标签 {label} 查询确认没有创建实例。"
-                    "可以重试或换下一台机器。"
+                    f"Vast 创建请求结果未知（{reason}），按标签 {label} 暂时没有查到实例。"
+                    "可以换下一台机器；实例如果稍后出现，dgpu 会按标签找到并处理。"
                 ),
                 retryable=True,
             )
@@ -710,8 +722,10 @@ class VastBackend:
             text = text.replace(key, "***")
         return text
 
-    def _error(self, message: str, *, retryable: bool = False) -> BackendError:
-        return BackendError(self._redact(message), retryable=retryable)
+    def _error(
+        self, message: str, *, retryable: bool = False, created: bool | None = None
+    ) -> BackendError:
+        return BackendError(self._redact(message), retryable=retryable, created=created)
 
     def _auth_error(self, what: str, resp: httpx.Response) -> BackendError:
         missing = "" if self._settings.api_key else "当前没有配置 API key。"

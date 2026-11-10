@@ -65,6 +65,7 @@ _TOP_SCALARS: dict[str, tuple[type, float]] = {
     "startup_timeout_min": (int, 1),
     "runner_timeout_min": (int, 1),
     "max_offers": (int, 1),
+    "create_lookup_s": (int, 0),
     "lost_after_min": (int, 1),
     "gc_stale_min": (int, 1),
     "local_data_confirm_gb": (float, 0),

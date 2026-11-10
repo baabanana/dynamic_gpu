@@ -640,7 +640,8 @@ def test_create_timeout_then_not_found_is_retryable(backend, platform, sleeps):
         backend.create(offer(), launch(attempt=1))
     assert not isinstance(info.value, OfferUnavailable)
     assert info.value.retryable is True
-    assert "确认平台上没有" in str(info.value)
+    assert info.value.created is None  # 暂时没查到不等于没有创建：编排还会查一段时间
+    assert "暂时没有查到" in str(info.value)
     assert platform.count("create") == 1
     assert platform.count("list") == len(autodl.CREATE_RECOVERY_DELAYS_S)
     assert sleeps == list(autodl.CREATE_RECOVERY_DELAYS_S)
@@ -674,6 +675,56 @@ def test_create_connect_error_with_failing_lookup_is_retryable(backend, platform
     with pytest.raises(BackendError) as info:
         backend.create(offer(), launch())
     assert info.value.retryable is True  # 连接没建立，请求不可能被受理
+    assert info.value.created is False
+
+
+# ---------------------------------------------------------------- 评审 F3：确定没创建 / 结果未知
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        api_error("ImageNotFound", "镜像不存在"),
+        api_error("Fail", "余额不足"),
+        api_error("BadRequest", "bad request", status=400),
+        httpx.Response(404, text="not found"),  # 没有响应信封的 4xx
+    ],
+    ids=["image", "balance", "400 envelope", "404 bare"],
+)
+def test_f3_definite_rejection_says_not_created(backend, platform, sleeps, response):
+    platform.fail["create"] = [response]
+    with pytest.raises(BackendError) as info:
+        backend.create(offer(), launch())
+    assert not isinstance(info.value, OfferUnavailable)
+    assert info.value.created is False
+    assert platform.count("list") == 0 and sleeps == []
+
+
+def test_f3_checks_before_sending_say_not_created(backend, platform):
+    with pytest.raises(BackendError) as info:
+        backend.create(offer(), launch(price=0.0001))
+    assert info.value.created is False
+    with pytest.raises(BackendError) as info:
+        backend.create(offer(), launch(cmd=f"echo {TOKEN}"))
+    assert info.value.created is False
+    assert platform.count("create") == 0
+
+
+def test_f3_no_stock_says_not_created(backend, platform):
+    platform.fail["create"] = [api_error("NoStock", "库存不足")]
+    with pytest.raises(OfferUnavailable) as info:
+        backend.create(offer(), launch())
+    assert info.value.created is False
+
+
+@pytest.mark.parametrize(
+    "failure", [httpx.ReadTimeout("timed out"), httpx.Response(502)], ids=["timeout", "5xx"]
+)
+def test_f3_unknown_outcome_stays_unknown(backend, platform, failure):
+    platform.fail["create"] = [failure]
+    with pytest.raises(BackendError) as info:
+        backend.create(offer(), launch())
+    assert info.value.created is None and info.value.retryable is True
 
 
 def test_create_duplicate_name_error_adopts_the_existing_deployment(backend, platform):

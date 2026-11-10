@@ -915,3 +915,54 @@ def test_no_authorization_header_without_key(api):
     backend = VastBackend(VastSettings(base_url=BASE), client=httpx.Client(), sleep=lambda s: None)
     backend.search(REQ)
     assert "Authorization" not in route.calls.last.request.headers
+
+
+# ---------------------------------------------------------------- 评审 F3：确定没创建 / 结果未知
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(400, json={"success": False, "error": "invalid_args", "msg": "bad image"}),
+        httpx.Response(422, json={"msg": "disk too small"}),
+        httpx.Response(401, json={"error": "auth_error", "msg": "Invalid user key"}),
+    ],
+    ids=["400 bad image", "422", "401"],
+)
+def test_f3_definite_rejection_says_not_created(api, sleeps, response):
+    api.put("/api/v0/asks/123/").side_effect = [response]
+    lookups = api.get("/api/v1/instances/").respond(json={"instances": []})
+    with pytest.raises(BackendError) as info:
+        make_backend(sleeps).create(OFFER, LAUNCH)
+    assert info.value.created is False
+    assert not lookups.called and sleeps == []  # 平台回答了：不用按标签确认
+
+
+def test_f3_requests_never_sent_say_not_created(api):
+    with pytest.raises(BackendError) as info:
+        make_backend().create(make_offer("1", backend="autodl"), LAUNCH)
+    assert info.value.created is False
+    too_long = LaunchSpec(JOB, 1, "img", "x" * 5000, disk_gb=40, max_price_per_hour=0.5)
+    with pytest.raises(BackendError) as info:
+        make_backend().create(OFFER, too_long)
+    assert info.value.created is False
+
+
+def test_f3_offer_unavailable_says_not_created(api):
+    api.put("/api/v0/asks/123/").respond(410, json={"error": "no_such_ask"})
+    with pytest.raises(OfferUnavailable) as info:
+        make_backend().create(OFFER, LAUNCH)
+    assert info.value.created is False
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [httpx.ReadTimeout("timed out"), httpx.Response(502, text="bad gateway")],
+    ids=["timeout", "5xx"],
+)
+def test_f3_unknown_outcome_stays_unknown(api, sleeps, outcome):
+    api.put("/api/v0/asks/123/").side_effect = [outcome]
+    api.get("/api/v1/instances/").respond(json={"instances": []})
+    with pytest.raises(BackendError) as info:
+        make_backend(sleeps).create(OFFER, LAUNCH)
+    assert info.value.created is None and info.value.retryable

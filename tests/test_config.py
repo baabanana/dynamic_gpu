@@ -35,6 +35,7 @@ SECRET = "S3CR3T-do-not-print"
 FULL = f"""
 disk_gb = 80
 max_offers = 3
+create_lookup_s = 45
 local_data_confirm_gb = 2.5
 
 [stores.r2]
@@ -197,6 +198,7 @@ def test_full_config_is_parsed(tmp_path):
     )
     assert config.runner == RunnerSettings(sync_interval_s=60, stall_timeout_min=0)
     assert (config.disk_gb, config.max_offers, config.local_data_confirm_gb) == (80, 3, 2.5)
+    assert config.create_lookup_s == 45
     assert config.store_for("autodl") is oss
     assert SECRET not in repr(config)
 
@@ -383,6 +385,8 @@ INVALID = [
     ("max_offers = 0\n", ["max_offers", "不能小于 1"]),
     ("disk_gb = 40.5\n", ["disk_gb", "整数"]),
     ("startup_timeout_min = 0\n", ["startup_timeout_min"]),
+    ("create_lookup_s = -1\n", ["create_lookup_s", "不能小于 0"]),
+    ("create_lookup_s = 1.5\n", ["create_lookup_s", "整数"]),
     ("local_data_confirm_gb = -1\n", ["local_data_confirm_gb"]),
     ("local_data_confirm_gb = inf\n", ["local_data_confirm_gb"]),
 ]

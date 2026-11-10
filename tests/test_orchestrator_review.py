@@ -25,7 +25,8 @@ from dgpu.contracts import (
     StoreError,
 )
 from dgpu.orchestrator import (
-    CREATE_UNKNOWN_LOOKUP_DELAYS_S,
+    LABEL_LOOKUP_EVERY_S,
+    LABEL_LOOKUP_OFFSETS_S,
     StoreUnreachable,
     Terminated,
 )
@@ -90,6 +91,16 @@ def use_backend(world: World, backend: SimBackend) -> SimBackend:
     return backend
 
 
+def lookups_in(window_s: float) -> int:
+    """按标签查找的窗口里一共查几次（0、2、5、10、20、30 秒，之后每 15 秒，最后在窗口末尾）。"""
+    offsets = [x for x in LABEL_LOOKUP_OFFSETS_S if x < window_s]
+    nxt = LABEL_LOOKUP_OFFSETS_S[-1] + LABEL_LOOKUP_EVERY_S
+    while nxt < window_s:
+        offsets.append(nxt)
+        nxt += LABEL_LOOKUP_EVERY_S
+    return len(offsets) + 1  # 窗口末尾再查最后一次
+
+
 # ================================================================ A1：SIGTERM / SIGHUP
 
 
@@ -150,9 +161,9 @@ def test_a2_unknown_create_outcome_is_reported_honestly_and_the_late_instance_is
     job_id = only_job_id(world)
     label = layout.label(job_id, 1)
 
-    # 按标签查了好几次（有间隔），而不是查一次就下结论
+    # 按标签查满了窗口（create_lookup_s，默认 120 秒），而不是查一次就下结论
     lookups = [call for call in backend.calls if call == ("list", label)]
-    assert len(lookups) == len(CREATE_UNKNOWN_LOOKUP_DELAYS_S)
+    assert len(lookups) == lookups_in(world.config.create_lookup_s)
     status = world.doc(layout.status_key(job_id))
     assert status["phase"] == states.CANCELLED
     assert "结果未知" in status["message"] and label in status["message"]

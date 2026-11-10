@@ -366,6 +366,15 @@ def _format_view(view: JobView) -> str:
         lines.append(f"  说明：{view.message}")
     if view.not_uploaded:
         lines.append(f"  未上传的文件：{'、'.join(view.not_uploaded)}")
+    identity = _format_identity(view.identity)
+    if identity:
+        lines.append(f"  训练进程：{identity}")
+    if view.suspect_labels:
+        lines.append(
+            f"  !! 创建结果未知的实例标签：{'、'.join(view.suspect_labels)}。这样的实例如果晚到："
+            "Vast 上拿不到启动文档会自毁，`dgpu wait` 结束时和 `dgpu gc` 也会销毁它；"
+            "用 `dgpu gc --dry-run` 和平台控制台确认没有遗留。"
+        )
     if view.cancel_requested and view.phase not in states.TERMINAL_PHASES:
         lines.append("  已请求取消，等待 runner 收尾")
     if view.lost:
@@ -375,6 +384,21 @@ def _format_view(view: JobView) -> str:
         )
     lines.append(f"  状态更新于 {_fmt_time(view.status_updated_at)}")
     return "\n".join(lines)
+
+
+def _format_identity(identity: dict[str, Any] | None) -> str:
+    """心跳里的训练进程身份 → 一行说明（评审 F7：降权没生效时原因要看得见）。"""
+    if not identity:
+        return ""
+    if identity.get("dropped"):
+        return f"以无特权用户 {identity.get('user') or '-'}（uid {identity.get('uid')}）运行"
+    reason = identity.get("reason") or "-"
+    detail = identity.get("detail") or ""
+    return (
+        f"没有降权，和 runner 同一用户运行，能读到存储凭据（原因 {reason}"
+        + (f"：{detail}" if detail else "")
+        + "）"
+    )
 
 
 @cli.command()

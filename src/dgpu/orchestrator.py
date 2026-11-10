@@ -23,7 +23,7 @@ import re
 import secrets
 import signal
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -80,10 +80,12 @@ PREFLIGHT_STEP = "preflight"  # runner 心跳里 preflight 期间的 step
 LAUNCH_URL_EXTRA_S = 3600  # 预签名 URL 有效期 = 启动超时 + runner 超时 + 1 小时
 DOCTOR_PREFIX = layout.ROOT + "/doctor/"
 GB = 1024**3
-# 创建请求的结果未知、又要放弃这次启动时（Ctrl-C、SIGTERM、出错），按标签重复查几次再下结论。
-# 和后端自己确认 create 结果的间隔同一量级（Vast 2、10 秒，AutoDL 2、5、10 秒）。
-CREATE_UNKNOWN_LOOKUP_DELAYS_S = (0.0, 2.0, 5.0, 10.0)
+# 创建请求的结果未知时，按标签查找的时间点（从开始查找算起的秒数），之后每 LABEL_LOOKUP_EVERY_S
+# 查一次，直到 config.create_lookup_s（从调用 create 算起，后端自己查找的时间也算在内）。
+LABEL_LOOKUP_OFFSETS_S = (0.0, 2.0, 5.0, 10.0, 20.0, 30.0)
+LABEL_LOOKUP_EVERY_S = 15.0
 LATE_INSTANCE_GC_MIN = 10  # 结果未知时，提示用户多少分钟后跑 dgpu gc
+SUSPECT_FIELD = "suspect_labels"  # attempt.json 里“创建结果未知、实例可能晚到”的标签
 # 刚创建的实例在平台上短时间内可能查不到（列表、详情接口有延迟）：这段时间里 GONE 当作还在调度，
 # 销毁它时也多观察这么久，确认它没有“晚到”
 CREATE_GONE_GRACE_S = 90.0
@@ -228,6 +230,10 @@ class JobView:
     # 本 attempt 最后一次有动静（心跳；没有心跳时是 status.json / attempt.json 的写入）到现在
     # 多久，用存储的时钟算。终态时为 None。
     silence_s: float | None = None
+    # 创建结果未知、实例可能晚到的标签（attempt.json 的 suspect_labels）
+    suspect_labels: list[str] = field(default_factory=list)
+    # 训练进程的身份（runner 写进心跳的 identity：是否降权、用户、没降权的原因）
+    identity: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -336,6 +342,10 @@ class _Launch:
     ref: InstanceRef | None = None  # 当前存活、尚未销毁的实例
     label: str | None = None  # 当前 create 用的标签
     create_unknown: bool = False  # create 已调用但结果未知
+    create_started: float | None = None  # 调用 create 的时间（按标签查找的窗口从这里算）
+    # 本次 submit / retry 里创建结果未知、按标签查满窗口也没找到的标签。返回前（成功或失败）
+    # 和中止时再查一次；仍然查不到就大声提示并记进 attempt.json（评审 F1）
+    suspects: list[str] = field(default_factory=list)
     offer: Offer | None = None
     created_at: float | None = None  # ref 创建成功的时间（本机时钟，只用来算刚创建的宽限期）
     seen_alive: bool = False  # 平台的 get 至少有一次查到过 ref（不是 GONE）
@@ -435,22 +445,6 @@ class Orchestrator:
             self.echo(f"任务 ID：{job_id}")
             self._upload_job_files(spec, job_id, backend_name, request, archive, listings)
         bundle = self.bundler.ensure_uploaded(self.store)
-        now = self.clock()
-        attempt_doc = states.new_attempt_doc(
-            job_id,
-            1,
-            backend_name,
-            layout.label(job_id, 1),
-            deadline_at=self._deadline(request.max_hours),
-            now=now,
-        )
-        self._create_doc(layout.attempt_key(job_id), attempt_doc)
-        status_doc = states.new_status_doc(
-            job_id, 1, states.PROVISIONING, states.SRC_CLI, message="正在创建实例", now=now
-        )
-        self._create_doc(layout.status_key(job_id), status_doc)
-
-        # 4–6. 换机循环；任何异常都会销毁实例并写终态。
         ctx = _Launch(
             job_id=job_id,
             backend_name=backend_name,
@@ -462,7 +456,27 @@ class Orchestrator:
             cost_ceiling=ceiling,
             currency=currency,
         )
-        return self._launch(ctx)
+
+        def prelude() -> None:
+            # attempt.json、status.json 一写下去就在中止处理之内（评审 F4）：之后的信号或异常
+            # 都会写终态，不会留下永远 PROVISIONING 的任务
+            now = self.clock()
+            attempt_doc = states.new_attempt_doc(
+                job_id,
+                1,
+                backend_name,
+                layout.label(job_id, 1),
+                deadline_at=self._deadline(request.max_hours),
+                now=now,
+            )
+            self._create_doc(layout.attempt_key(job_id), attempt_doc)
+            status_doc = states.new_status_doc(
+                job_id, 1, states.PROVISIONING, states.SRC_CLI, message="正在创建实例", now=now
+            )
+            self._create_doc(layout.status_key(job_id), status_doc)
+
+        # 3'–6. 初始状态和换机循环；任何异常都会销毁实例并写终态。
+        return self._launch(ctx, prelude)
 
     # ============================================================ 查询
 
@@ -648,6 +662,9 @@ class Orchestrator:
                     return WaitOutcome(states.LOST)
                 retries -= 1
                 self.echo(f"任务已确认失联（{verdict[1]}），自动重试（还剩 {retries} 次）")
+                # 失联已经确认：不管换机成不成功，先销毁 attempt ≤ 失联的那个 attempt 的实例
+                # （已退出的 Vast 实例仍按磁盘计费；评审 F5）。retry 自己还会再确认一次。
+                self._destroy_lost_instances(job_id, view)
                 try:
                     self.retry(job_id)
                 except DgpuError as exc:
@@ -660,6 +677,42 @@ class Orchestrator:
                 last_shown = None
                 continue
             self.sleep(POLL_WAIT_S)
+
+    def _destroy_lost_instances(self, job_id: str, view: JobView) -> None:
+        """确认失联后销毁 attempt ≤ view.attempt 的实例。失败时大声提示 gc，不抛异常。"""
+        lost_attempt = int(view.attempt or 0)
+        try:
+            got = self._read_doc(layout.attempt_key(job_id), "attempt.json")
+            if got is None:
+                return
+            att = got[0]
+            if int(att.get("attempt") or 0) != lost_attempt:
+                return  # 另一个 dgpu 进程已经换了 attempt：它负责旧实例
+            backend = self.backends.get(att.get("backend"))
+            if backend is None:
+                raise DgpuError(f"没有 {att.get('backend')} 平台的凭据")
+            self._destroy_job_instances(
+                job_id,
+                backend,
+                att,
+                why=f"attempt {lost_attempt} 已确认失联",
+                max_attempt=lost_attempt,
+            )
+        except Exception as exc:  # noqa: BLE001 - 大声报告，换机照常进行（retry 会再确认）
+            message = (
+                f"!! 任务 {job_id} 已确认失联，但销毁 attempt {lost_attempt} 的实例失败：{exc}。"
+                "它可能仍在计费（已退出的 Vast 实例仍按磁盘计费）：请稍后运行 `dgpu gc`，"
+                "或到平台控制台检查。"
+            )
+            self.echo(message)
+            if not isinstance(exc, DestroyFailed):  # DestroyFailed 已经写过 destroy_failed
+                self._event(
+                    job_id,
+                    states.EV_DESTROY_FAILED,
+                    lost_attempt,
+                    message,
+                    {"why": "lost_cleanup", "instance_id": view.instance_id},
+                )
 
     def _status_patiently(self, job_id: str) -> JobView:
         """status()，但存储暂时不可用（网络、5xx、限流）时退避重试，总共最多 STORE_OUTAGE_MAX_S。"""
@@ -813,15 +866,6 @@ class Orchestrator:
                 "这次没有创建实例。"
             ) from None
         new_attempt = int(new_doc["attempt"])
-        self._event(
-            job_id,
-            states.EV_RELAUNCH,
-            new_attempt,
-            f"dgpu retry：attempt {old_attempt} 作废，改用 attempt {new_attempt}",
-            {"old_attempt": old_attempt, "new_attempt": new_attempt, "why": "retry"},
-        )
-        self.echo(f"重试任务 {job_id}：attempt {old_attempt} → {new_attempt}")
-        self._write_cli_status(job_id, new_attempt, states.PROVISIONING, "重试：正在创建实例")
         ctx = _Launch(
             job_id=job_id,
             backend_name=backend_name,
@@ -833,7 +877,20 @@ class Orchestrator:
             cost_ceiling=ceiling,
             currency=currency,
         )
-        return self._launch(ctx)
+
+        def prelude() -> None:
+            # attempt 已经推进：从这里起的信号或异常都写终态（评审 F4）
+            self._event(
+                job_id,
+                states.EV_RELAUNCH,
+                new_attempt,
+                f"dgpu retry：attempt {old_attempt} 作废，改用 attempt {new_attempt}",
+                {"old_attempt": old_attempt, "new_attempt": new_attempt, "why": "retry"},
+            )
+            self.echo(f"重试任务 {job_id}：attempt {old_attempt} → {new_attempt}")
+            self._write_cli_status(job_id, new_attempt, states.PROVISIONING, "重试：正在创建实例")
+
+        return self._launch(ctx, prelude)
 
     def cancel(self, job_id: str, force: bool = False) -> JobView:
         """在 attempt.json 里设置 cancel，由 runner 收尾；force 时直接销毁实例并写 CANCELLED。"""
@@ -1027,6 +1084,10 @@ class Orchestrator:
                 {"backend": name, "instance_id": inst.ref.id, "label": label},
                 source=states.SRC_GC,
             )
+            try:  # 晚到的实例已经销毁：不再在 status 里列为“可能晚到”
+                self._remove_suspects(job_id, [label])
+            except DgpuError as exc:
+                self.echo(f"警告：更新任务 {job_id} 的可疑标签失败（{exc}）。")
 
     def doctor(self) -> list[CheckResult]:
         """检查配置、存储读写和各平台 API。每项独立，不因为一项失败而中断。"""
@@ -1054,7 +1115,7 @@ class Orchestrator:
 
     # ============================================================ 换机循环
 
-    def _launch(self, ctx: _Launch) -> SubmitResult:
+    def _launch(self, ctx: _Launch, prelude: Callable[[], None] | None = None) -> SubmitResult:
         cfg = self.config
         tries = 0
         runner_timeouts = 0
@@ -1063,6 +1124,8 @@ class Orchestrator:
         last_detail = ""
         limit = min(len(ctx.offers), cfg.max_offers)
         try:
+            if prelude is not None:
+                prelude()
             for offer in ctx.offers:
                 if tries >= cfg.max_offers:
                     break
@@ -1085,6 +1148,7 @@ class Orchestrator:
                         self._destroy_ctx(ctx, ctx.ref, why=f"任务已结束（{phase}）")
                     if ctx.ref is not None:
                         self.echo(f"任务 {ctx.job_id} 已在实例 {ctx.ref.id} 上运行。")
+                    self._recheck_suspects(ctx)
                     return SubmitResult(
                         job_id=ctx.job_id,
                         attempt=ctx.attempt,
@@ -1122,6 +1186,9 @@ class Orchestrator:
                 message += f"（最后一次：{last_detail}）"
             if tries >= cfg.max_offers and len(ctx.offers) > tries:
                 message += f"；已达到 max_offers={cfg.max_offers}"
+            unknown = self._recheck_suspects(ctx)
+            if unknown:
+                message += f"；{self._suspect_hint(unknown)}"
             self._write_terminal_if_absent(
                 ctx.job_id, ctx.attempt, states.FAILED, last_reason, message
             )
@@ -1140,40 +1207,81 @@ class Orchestrator:
         ctx.label = launch.label
         ctx.ref = None
         ctx.create_unknown = True
+        ctx.create_started = self.clock()
+        adopted = False
         try:
             ref = ctx.backend.create(offer, launch)
-        except OfferUnavailable as exc:
-            ctx.create_unknown = False
-            detail = f"offer {offer.id} 不可用：{exc}"
-            self.echo(detail + "，换下一台")
-            self._event(job_id, states.EV_CREATE_FAILED, attempt, detail, _offer_data(offer))
-            return _Outcome("create_failed", states.REASON_NO_OFFER, False, detail)
         except BackendError as exc:
+            if exc.created is False:
+                # 平台明确拒绝，或请求根本没发出：确定没有创建，不查标签、不提示 gc（评审 F3）
+                ctx.create_unknown = False
+                if not (exc.retryable or isinstance(exc, OfferUnavailable)):
+                    raise DgpuError(
+                        f"平台拒绝创建实例（{ctx.backend_name} offer {offer.id}）：{exc}"
+                        "（没有创建实例）"
+                    ) from None
+                detail = f"offer {offer.id} 不可用：{exc}"
+                self.echo(detail + "，换下一台")
+                self._event(job_id, states.EV_CREATE_FAILED, attempt, detail, _offer_data(offer))
+                return _Outcome("create_failed", states.REASON_NO_OFFER, False, detail)
             if not exc.retryable:
-                raise
-            # 契约要求后端确认没创建才抛 retryable；这里再按标签查一次，宁可多一次 API 调用。
-            found = self._lookup_label(ctx.backend, launch.label)
-            ctx.create_unknown = False
-            for stray in found:
-                ctx.ref = stray
-                self._destroy_ctx(ctx, stray, why="创建请求报错，但按标签查到了实例")
-            detail = f"在 offer {offer.id} 上创建失败：{exc}"
-            self.echo(detail + "，换下一台")
+                raise  # 结果未知且后端让停下：中止路径按标签耐心查找
+            # 结果未知（超时、断连、5xx，后端按标签暂时没查到）：请求可能已经执行、实例可能稍后
+            # 才出现在列表里。按标签查满窗口（create_lookup_s，从调用 create 算起）。
+            self.echo(
+                f"在 offer {offer.id} 上创建实例的结果未知（{exc}）。按标签 {launch.label} "
+                f"查找，最多等 {self._lookup_left(ctx):.0f} 秒……"
+            )
+            found = self._poll_labels(
+                ctx.backend, [launch.label], until=self._lookup_deadline(ctx)
+            ).get(launch.label, [])
+            if not found:
+                ctx.create_unknown = False
+                detail = (
+                    f"在 offer {offer.id} 上创建实例的结果未知（{exc}），按标签 {launch.label} "
+                    f"查了 {self.config.create_lookup_s} 秒没有找到"
+                )
+                self.echo(detail + "，换下一台")
+                self._add_suspects(ctx, [launch.label])
+                self._event(
+                    job_id,
+                    states.EV_CREATE_FAILED,
+                    attempt,
+                    detail,
+                    {**_offer_data(offer), "suspect_label": launch.label},
+                )
+                # 下一次创建换新的 attempt 和标签：晚到的实例就是旧 attempt，它的启动文档已经
+                # 删掉，bootstrap 拿不到就自毁（Vast），dgpu wait 收尾和 gc 也会销毁它。
+                return _Outcome("create_failed", states.REASON_NO_OFFER, True, detail)
+            ref = found[0]
+            adopted = True
+            waited = self.clock() - (ctx.create_started or self.clock())
+            for extra in found[1:]:  # 同一个标签不该有两台；多出来的销毁
+                self._destroy(
+                    ctx.backend,
+                    extra,
+                    job_id=job_id,
+                    attempt=attempt,
+                    why="同一个标签出现了不止一台实例",
+                )
+            message = (
+                f"创建请求报错（{exc}），但 {waited:.0f} 秒后按标签 {launch.label} 找到了实例 "
+                f"{ref.id}：接管它，按正常流程等待启动"
+            )
+            self.echo(message)
             self._event(
                 job_id,
                 states.EV_CREATE_FAILED,
                 attempt,
-                detail,
-                {**_offer_data(offer), "found_by_label": [ref.id for ref in found]},
+                message,
+                {**_offer_data(offer), "adopted_instance": ref.id, "waited_s": waited},
             )
-            # 不是平台明确的拒绝：请求可能已经执行，实例可能稍后才出现在列表里。下一次创建
-            # 换新的 attempt 和标签，晚到的实例就是旧 attempt：它的 runner 被隔离，gc 会销毁它。
-            return _Outcome("create_failed", states.REASON_NO_OFFER, True, detail)
         ctx.ref = ref
         ctx.created_at = self.clock()
-        ctx.seen_alive = False
+        ctx.seen_alive = adopted  # 按标签查到过：平台已经能看见它
         ctx.create_unknown = False
-        self.echo(f"已创建实例 {ref.id}（标签 {launch.label}），等待启动……")
+        if not adopted:
+            self.echo(f"已创建实例 {ref.id}（标签 {launch.label}），等待启动……")
         self._record_instance(ctx, ref)
         self._write_cli_status(
             job_id, attempt, states.STARTING, f"实例 {ref.id} 已创建，等待 runner 启动"
@@ -1378,9 +1486,10 @@ class Orchestrator:
         """异常路径：销毁（可能）创建的实例，写终态，删启动文档。返回需要大声报告的问题。
 
         Ctrl-C、SIGTERM、SIGHUP（Terminated）都是 KeyboardInterrupt，走同一条路径。
-        create 的结果未知时，按标签重复查几次；仍然查不到就如实说“结果未知”，绝不说
-        “已销毁”，并把这个 attempt 作废：晚到的实例的 runner 会被隔离，gc 把它当作旧 attempt
-        销毁。
+        create 的结果未知时，按标签查到窗口（create_lookup_s，从调用 create 算起）结束，再按一次
+        Ctrl-C 可以跳过等待；本次 submit / retry 里更早的可疑标签也再查一次。仍然查不到就如实
+        说“结果未知”，绝不说“已销毁”，把标签记进 attempt.json，并把这个 attempt 作废：晚到的
+        实例拿不到启动文档，Vast 上 bootstrap 会自毁；dgpu wait 收尾和 gc 也会销毁它。
         """
         problems: list[str] = []
         interrupted = isinstance(exc, KeyboardInterrupt)
@@ -1399,44 +1508,76 @@ class Orchestrator:
             self.echo(message)
             problems.append(message)
 
-        # 1. 销毁已创建或可能已创建的实例
+        # 1. 销毁已创建的实例
         destroyed: list[str] = []
-        unknown_label: str | None = None
         why = f"启动被中断（{how}）" if interrupted else "启动异常退出"
+
+        def destroy(ref: InstanceRef) -> bool:
+            try:
+                self._destroy_ctx(ctx, ref, why=why)
+            except DestroyFailed as destroy_exc:
+                problems.append(str(destroy_exc))
+                return False
+            destroyed.append(ref.id)
+            return True
+
         try:
-            refs: list[InstanceRef] = []
             if ctx.ref is not None:
-                refs.append(ctx.ref)
-            elif ctx.create_unknown and ctx.label:
-                unknown_label = ctx.label  # 查到之前都算结果未知
-                refs.extend(self._lookup_label_patiently(ctx.backend, ctx.label))
-                if refs:
-                    unknown_label = None
-            for ref in refs:
-                try:
-                    self._destroy_ctx(ctx, ref, why=why)
-                    destroyed.append(ref.id)
-                except DestroyFailed as destroy_exc:
-                    problems.append(str(destroy_exc))
+                destroy(ctx.ref)
         except BaseException as cleanup_exc:
             report("销毁实例", cleanup_exc)
+
+        # 2. 创建结果未知的标签：这次的 create（查满窗口）和更早的可疑标签（再查一次）
+        current = ctx.label if (ctx.ref is None and ctx.create_unknown and ctx.label) else None
+        labels = ([current] if current else []) + [x for x in ctx.suspects if x != current]
+        unknown: list[str] = []
+        if labels:
+            found: dict[str, list[InstanceRef]] = {}
+            until = self._lookup_deadline(ctx) if current else self.clock()
+            left = until - self.clock()
+            if left > 0:
+                self.echo(
+                    f"创建实例的请求结果未知：按标签 {current} 查找它，最多再等 {left:.0f} 秒"
+                    "（找到就销毁）。再按一次 Ctrl-C 跳过等待。"
+                )
+            try:
+                self._poll_labels(ctx.backend, labels, until=until, found=found)
+            except KeyboardInterrupt:
+                self.echo("跳过等待：不再按标签查找。")
+            resolved: list[str] = []
+            try:
+                for label, refs in found.items():
+                    ok = True
+                    for ref in refs:
+                        ok = destroy(ref) and ok
+                    if ok:
+                        resolved.append(label)
+            except BaseException as cleanup_exc:
+                report("销毁按标签找到的实例", cleanup_exc)
+            unknown = [label for label in labels if label not in resolved]
+            ctx.suspects = []
+            if resolved:
+                self._remove_suspects(ctx.job_id, resolved)
         fenced_by_other = isinstance(exc, AttemptConflict | _CancelRequested)
-        if unknown_label is not None:
-            message = (
-                f"!! 创建实例的请求结果未知：按标签 {unknown_label} 查了 "
-                f"{len(CREATE_UNKNOWN_LOOKUP_DELAYS_S)} 次都没找到实例，"
-                "但它可能稍后才出现并开始计费。"
-                f"请在 {LATE_INSTANCE_GC_MIN} 分钟后运行 `dgpu gc`（它会销毁这个任务留下的实例），"
-                "并到平台控制台确认。"
-            )
+        if unknown:
+            message = self._suspect_warning(unknown)
             self.echo(message)
             problems.append(message)
-            if not fenced_by_other:
-                try:
-                    self._fence_unknown_attempt(ctx, unknown_label)
-                except BaseException as cleanup_exc:
-                    report("作废 attempt", cleanup_exc)
-        # 2. 写终态（runner 已写或已被别的进程接管时不写）
+            try:
+                if current in unknown and not fenced_by_other:
+                    self._fence_unknown_attempt(ctx, current, unknown)
+                else:
+                    self._add_suspects(ctx, unknown)
+                self._event(
+                    ctx.job_id,
+                    states.EV_CREATE_FAILED,
+                    ctx.attempt,
+                    message,
+                    {"why": "create_outcome_unknown", "suspect_labels": unknown},
+                )
+            except BaseException as cleanup_exc:
+                report("记录结果未知的标签", cleanup_exc)
+        # 3. 写终态（runner 已写或已被别的进程接管时不写）
         if not fenced_by_other:
             if interrupted:
                 phase, reason = states.CANCELLED, None
@@ -1446,70 +1587,200 @@ class Orchestrator:
                 message = f"启动过程中出错：{exc}"
             if destroyed:
                 message += f"；已销毁实例 {'、'.join(destroyed)}"
-            if unknown_label is not None:
-                message += (
-                    f"；创建实例的结果未知，标签为 {unknown_label} 的实例可能稍后出现并计费，"
-                    f"请在 {LATE_INSTANCE_GC_MIN} 分钟后运行 `dgpu gc`（它会销毁这个实例）"
-                )
+            if unknown:
+                message += f"；{self._suspect_hint(unknown)}"
             elif problems:
                 message += "；有实例可能没有销毁，见 `dgpu gc`"
             try:
                 self._write_terminal_if_absent(ctx.job_id, ctx.attempt, phase, reason, message)
             except BaseException as cleanup_exc:
                 report("写终态", cleanup_exc)
-        # 3. 删掉含存储凭据的启动文档
+        # 4. 删掉含存储凭据的启动文档
         try:
             self.store.delete(layout.secrets_key(ctx.job_id, launch_attempt))
         except BaseException as cleanup_exc:
             report("删除启动文档", cleanup_exc)
         return problems
 
-    def _lookup_label_patiently(self, backend: Backend, label: str) -> list[InstanceRef]:
-        """按标签查几次（刚创建的实例可能稍后才出现在列表里）。查询本身出错也继续查。"""
+    # ------------------------------------------------------------ 创建结果未知的标签
+
+    def _lookup_deadline(self, ctx: _Launch) -> float:
+        """按标签查找的截止时间：调用 create 之后 create_lookup_s 秒（后端自己查找的时间也算）。"""
+        start = ctx.create_started if ctx.create_started is not None else self.clock()
+        return start + max(0.0, float(self.config.create_lookup_s))
+
+    def _lookup_left(self, ctx: _Launch) -> float:
+        return max(0.0, self._lookup_deadline(ctx) - self.clock())
+
+    def _poll_labels(
+        self,
+        backend: Backend,
+        labels: list[str],
+        *,
+        until: float,
+        found: dict[str, list[InstanceRef]] | None = None,
+    ) -> dict[str, list[InstanceRef]]:
+        """按精确标签查找实例，直到都找到或到达 until（至少查一轮，到点时再查最后一次）。
+
+        时间点见 LABEL_LOOKUP_OFFSETS_S、LABEL_LOOKUP_EVERY_S。查询本身出错也继续查。
+        结果逐步写进 found（被 Ctrl-C 打断时调用方仍能拿到已经找到的）。
+        """
+        found = {} if found is None else found
+        pending = [label for label in labels if label not in found]
+        start = self.clock()
+        offsets = _lookup_offsets()
         errors: list[str] = []
-        for delay in CREATE_UNKNOWN_LOOKUP_DELAYS_S:
-            if delay:
-                self.sleep(delay)
-            try:
-                found = self._lookup_label(backend, label)
-            except Exception as exc:  # noqa: BLE001 - 平台暂时不可用：记下来，下一次再查
-                errors.append(f"{type(exc).__name__}: {exc}")
-                continue
-            if found:
-                return found
-        if errors:
-            self.echo(f"按标签 {label} 查询实例时出错 {len(errors)} 次，最后一次：{errors[-1]}")
-        return []
+        while True:
+            for label in list(pending):
+                try:
+                    refs = self._lookup_label(backend, label)
+                except Exception as exc:  # noqa: BLE001 - 平台暂时不可用：记下来，下一次再查
+                    errors.append(f"{type(exc).__name__}: {exc}")
+                    continue
+                if refs:
+                    found[label] = refs
+                    pending.remove(label)
+            now = self.clock()
+            if not pending or now >= until:
+                break
+            target = until
+            for offset in offsets:
+                if start + offset > now:
+                    target = min(start + offset, until)
+                    break
+            self.sleep(max(0.0, target - now))
+        if errors and pending:
+            self.echo(
+                f"按标签 {'、'.join(pending)} 查询实例时出错 {len(errors)} 次，"
+                f"最后一次：{errors[-1]}"
+            )
+        return found
 
-    def _fence_unknown_attempt(self, ctx: _Launch, label: str) -> None:
-        """create 结果未知、要放弃这次启动：把 attempt + 1，作废可能晚到的实例。
+    def _suspect_warning(self, labels: list[str]) -> str:
+        names = "、".join(labels)
+        return (
+            f"!! 创建实例的请求结果未知：按标签 {names} 没有找到实例，但它可能稍后才出现并开始"
+            "计费。Vast 上这样的实例拿不到启动文档，会自己销毁；为保险起见，请在 "
+            f"{LATE_INSTANCE_GC_MIN} 分钟后运行 `dgpu gc`（它会销毁这个任务留下的实例），"
+            "并到平台控制台确认。标签已记进任务状态，`dgpu status` 会显示。"
+        )
 
-        晚到实例的 runner 启动时读到更大的 attempt 就自行退出（不写状态），gc 把它当作旧
-        attempt 销毁。终态随后写给新的 attempt。
+    @staticmethod
+    def _suspect_hint(labels: list[str]) -> str:
+        return (
+            f"创建实例的结果未知，标签为 {'、'.join(labels)} 的实例可能稍后出现并计费，"
+            f"请在 {LATE_INSTANCE_GC_MIN} 分钟后运行 `dgpu gc`（它会销毁这个实例）"
+        )
+
+    def _add_suspects(self, ctx: _Launch, labels: list[str]) -> None:
+        """记下创建结果未知的标签：本次调用里（返回前再查）和 attempt.json 里（status、wait、
+        gc 会看到）。"""
+        for label in labels:
+            if label not in ctx.suspects:
+                ctx.suspects.append(label)
+
+        def add(doc: dict[str, Any]) -> dict[str, Any]:
+            known = [str(x) for x in doc.get(SUSPECT_FIELD) or []]
+            doc[SUSPECT_FIELD] = known + [x for x in labels if x not in known]
+            return doc
+
+        try:
+            self._update_attempt(ctx.job_id, add)
+        except DgpuError as exc:
+            self.echo(
+                f"!! 没能把结果未知的标签 {'、'.join(labels)} 记进 attempt.json（{exc}）："
+                f"请在 {LATE_INSTANCE_GC_MIN} 分钟后运行 `dgpu gc`。"
+            )
+
+    def _remove_suspects(self, job_id: str, labels: list[str]) -> None:
+        """这些标签的实例已经找到并销毁（或接管），从 attempt.json 的可疑标签里去掉。"""
+        if not labels:
+            return
+        got = self._read_doc(layout.attempt_key(job_id), "attempt.json")
+        if got is None or not any(x in (got[0].get(SUSPECT_FIELD) or []) for x in labels):
+            return
+
+        def remove(doc: dict[str, Any]) -> dict[str, Any]:
+            doc[SUSPECT_FIELD] = [x for x in doc.get(SUSPECT_FIELD) or [] if x not in labels]
+            return doc
+
+        try:
+            self._update_attempt(job_id, remove)
+        except DgpuError as exc:
+            self.echo(f"警告：更新 attempt.json 的可疑标签失败（{exc}），不影响任务。")
+
+    def _recheck_suspects(self, ctx: _Launch) -> list[str]:
+        """submit / retry 返回前：本次结果未知的标签再查一次，找到就销毁；返回仍然查不到的。"""
+        labels = list(ctx.suspects)
+        if not labels:
+            return []
+        found = self._poll_labels(ctx.backend, labels, until=self.clock())
+        resolved = []
+        for label, refs in found.items():
+            ok = True
+            for ref in refs:
+                try:
+                    self._destroy(
+                        ctx.backend,
+                        ref,
+                        job_id=ctx.job_id,
+                        attempt=ctx.attempt,
+                        why=f"创建结果曾未知、晚到的实例（标签 {label}）",
+                    )
+                    self.echo(f"标签 {label} 的实例 {ref.id} 晚到了，已销毁。")
+                except DestroyFailed:
+                    ok = False  # _destroy 已经大声输出并写了 destroy_failed
+            if ok:
+                resolved.append(label)
+                ctx.suspects.remove(label)
+        self._remove_suspects(ctx.job_id, resolved)
+        unknown = [label for label in labels if label not in resolved]
+        if unknown:
+            message = self._suspect_warning(unknown)
+            self.echo(message)
+            self._event(
+                ctx.job_id,
+                states.EV_CREATE_FAILED,
+                ctx.attempt,
+                message,
+                {"why": "create_outcome_unknown", "suspect_labels": unknown},
+            )
+        ctx.suspects = []
+        return unknown
+
+    def _fence_unknown_attempt(self, ctx: _Launch, label: str, suspects: list[str]) -> None:
+        """create 结果未知、要放弃这次启动：把 attempt + 1，作废可能晚到的实例，同时记下可疑标签。
+
+        晚到的实例拿不到启动文档（已删除），Vast 上 bootstrap 自毁；它的 runner 万一起来了，
+        也会读到更大的 attempt 自行退出。gc 把它当作旧 attempt 销毁。终态随后写给新的 attempt。
         """
         old = ctx.attempt
 
         def bump(doc: dict[str, Any]) -> dict[str, Any]:
             new_attempt = int(doc["attempt"]) + 1
+            known = [str(x) for x in doc.get(SUSPECT_FIELD) or []]
             doc.update(
                 attempt=new_attempt,
                 label=layout.label(ctx.job_id, new_attempt),
                 instance_id=None,
                 created_at=self.clock(),
             )
+            doc[SUSPECT_FIELD] = known + [x for x in suspects if x not in known]
             return doc
 
         try:
             doc = self._update_attempt(ctx.job_id, bump, expect_attempt=old)
         except AttemptConflict:
-            return  # 别的进程已经推进了 attempt：旧 attempt 同样被作废
+            # 别的进程已经推进了 attempt：旧 attempt 同样被作废；标签照样记下
+            self._add_suspects(ctx, suspects)
+            return
         ctx.attempt = int(doc["attempt"])
         self._event(
             ctx.job_id,
             states.EV_RELAUNCH,
             ctx.attempt,
             f"attempt {old} 的创建结果未知（标签 {label}），作废它，改记为 attempt {ctx.attempt}；"
-            "晚到的实例会被隔离，由 gc 销毁",
+            "晚到的实例拿不到启动文档会自毁（Vast），也会被 dgpu wait 收尾和 gc 销毁",
             {
                 "old_attempt": old,
                 "new_attempt": ctx.attempt,
@@ -1707,10 +1978,10 @@ class Orchestrator:
         *,
         why: str,
         max_attempt: int,
-    ) -> None:
-        """销毁这个任务在该平台上 attempt ≤ max_attempt 的实例。
+    ) -> list[InstanceRef]:
+        """销毁这个任务在该平台上 attempt ≤ max_attempt 的实例，返回平台上还在、被销毁的实例。
 
-        包括 attempt.json 记录的和按标签查到的。
+        包括 attempt.json 记录的和按标签查到的（创建结果未知、晚到的旧 attempt 实例也在内）。
 
         max_attempt 是这次销毁所依据的判断（“attempt N 已结束”“attempt N 要被替换”）里的 N。
         更新的 attempt 的实例属于并发的另一个 dgpu 进程（比如刚完成的 retry），不归这里销毁。
@@ -1733,6 +2004,7 @@ class Orchestrator:
                 )
                 continue
             refs.setdefault(state.ref.id, state.ref)
+        alive: list[InstanceRef] = []
         for ref in refs.values():
             # 平台说已经没有了也照样发一次销毁（刚创建的实例可能只是还没出现在查询结果里）
             gone = backend.get(ref).phase == INST_GONE
@@ -1745,6 +2017,9 @@ class Orchestrator:
                 why=why,
                 already_gone=gone,
             )
+            if not gone:
+                alive.append(ref)
+        return alive
 
     def _cleanup_after_end(self, job_id: str, seen_attempt: int | None) -> tuple[str, ...]:
         """任务到终态后确认实例已销毁（AutoDL 需要 CLI 删除部署记录），删掉残留的启动文档。
@@ -1798,10 +2073,25 @@ class Orchestrator:
                 {"backend": att.get("backend"), "label": label, "why": "no_credentials"},
             )
             return tuple(problems)
+        suspects = [str(x) for x in att.get(SUSPECT_FIELD) or []]
         try:
-            self._destroy_job_instances(
+            removed = self._destroy_job_instances(
                 job_id, backend, att, why="任务已结束，清理实例", max_attempt=upto
             )
+            if suspects:
+                late = [ref for ref in removed if ref.label in suspects]
+                for ref in late:
+                    self.echo(
+                        f"已销毁晚到的实例 {ref.backend}/{ref.id}（标签 {ref.label}）："
+                        "它的创建请求当时结果未知。"
+                    )
+                missing = [x for x in suspects if x not in {ref.label for ref in late}]
+                if missing:
+                    self.echo(
+                        f"创建结果未知的标签 {'、'.join(missing)} 现在没有对应的实例"
+                        "（多半没有创建）；之后如果出现，`dgpu gc` 会销毁它。"
+                    )
+                self._remove_suspects(job_id, [ref.label for ref in late])
         except DestroyFailed as exc:
             problems.append(str(exc))  # _destroy 已经大声输出并写了 destroy_failed
         except Exception as exc:  # noqa: BLE001 - 平台或存储出错：大声报告，任务结果照常返回
@@ -2319,6 +2609,8 @@ class Orchestrator:
             last_sync_at=hb_current.get("last_sync_at") if hb_current else None,
             lost=lost,
             silence_s=silence,
+            suspect_labels=[str(x) for x in (att or {}).get(SUSPECT_FIELD) or []],
+            identity=_identity_of(hb_current),
         )
 
     def _load_job_docs(self, job_id: str) -> _JobDocs:
@@ -2352,6 +2644,10 @@ class Orchestrator:
         hb = docs.heartbeat.doc if docs.heartbeat else None
         current = (att or {}).get("attempt") or (st or {}).get("attempt")
         if current is not None and attempt < current:
+            if inst.ref.label in ((att or {}).get(SUSPECT_FIELD) or []):
+                return True, (
+                    f"旧 attempt（当前是 attempt {current}）：创建请求当时结果未知、晚到的实例"
+                )
             return True, f"旧 attempt（当前是 attempt {current}）"
         if (
             st is not None
@@ -2501,6 +2797,23 @@ def _offer_data(offer: Offer) -> dict[str, Any]:
         "currency": offer.currency,
         "region": offer.region,
     }
+
+
+def _identity_of(heartbeat: dict[str, Any] | None) -> dict[str, Any] | None:
+    """runner 写进心跳的训练进程身份（identity：dropped、user、uid、reason、detail）。"""
+    if heartbeat is None:
+        return None
+    identity = heartbeat.get("identity")
+    return dict(identity) if isinstance(identity, dict) else None
+
+
+def _lookup_offsets() -> Iterator[float]:
+    """按标签查找的时间点（秒，从开始查找算起）：0、2、5、10、20、30，之后每 15 秒一次。"""
+    yield from LABEL_LOOKUP_OFFSETS_S
+    offset = LABEL_LOOKUP_OFFSETS_S[-1]
+    while True:
+        offset += LABEL_LOOKUP_EVERY_S
+        yield offset
 
 
 def _terminal_for_current(view: JobView) -> bool:
