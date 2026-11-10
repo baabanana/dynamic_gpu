@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# dgpu 构建产物与本地状态
+/bundle/
+*.tar.gz
+
+# 凭据：永远不提交
+.env
+.env.*
+*.pem
+*.key
+config.toml
+
+# macOS
+.DS_Store
