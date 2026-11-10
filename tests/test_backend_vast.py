@@ -761,6 +761,59 @@ def test_balance_without_credit_field_is_none(api):
     assert make_backend().balance() is None
 
 
+# 2026-11-10 在真实 API 上看到的原文（key 有效，但没有读取账户信息的权限）
+NO_PRIVILEGE_MSG = (
+    "Your key lacks proper privileges to perform this action as it requires you to have "
+    "logged in using Two Factor Authentication"
+)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"success": False, "error": "auth_error", "msg": NO_PRIVILEGE_MSG},
+        {"success": False, "msg": NO_PRIVILEGE_MSG},
+        {"detail": NO_PRIVILEGE_MSG},
+    ],
+)
+def test_balance_without_account_permission_is_unknown_not_an_invalid_key(
+    api, sleeps, caplog, payload
+):
+    route = api.get("/api/v0/users/current/").respond(401, json=payload)
+    backend = make_backend(sleeps)
+    caplog.set_level("WARNING")
+    assert backend.balance() is None
+    assert backend.balance() is None
+    assert backend.balance_note == "key 没有读取账户信息的权限"
+    assert route.call_count == 2 and sleeps == []  # 不重试
+    warnings = [r for r in caplog.records if "cannot read account info" in r.getMessage()]
+    assert len(warnings) == 1  # 只警告一次
+    assert KEY not in caplog.text
+
+
+def test_balance_with_an_invalid_key_is_still_a_hard_failure(api, sleeps):
+    api.get("/api/v0/users/current/").respond(
+        401, json={"success": False, "error": "auth_error", "msg": "Invalid user key"}
+    )
+    backend = make_backend(sleeps)
+    with pytest.raises(BackendError, match="API key"):
+        backend.balance()
+    assert backend.balance_note == ""
+
+
+def test_get_reports_the_label_the_platform_actually_stored(api):
+    """平台截断或改写了 label：get 返回平台上的 label，编排据此发现并按 ID 销毁。"""
+    api.get("/api/v0/instances/9001/").respond(
+        json={"instances": instance_row(label=LABEL[:16], status="loading")}
+    )
+    state = make_backend().get(REF)
+    assert state.ref.id == "9001" and state.ref.label == LABEL[:16]
+    api.get("/api/v0/instances/9001/").respond(
+        json={"instances": instance_row(label=None, status="loading")}
+    )
+    assert make_backend().get(REF).ref.label == LABEL  # 平台没给 label 时保留创建时的
+
+
 # ---------------------------------------------------------------- 认证与凭据
 
 

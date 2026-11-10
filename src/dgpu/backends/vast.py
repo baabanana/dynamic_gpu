@@ -100,6 +100,13 @@ UNAVAILABLE_HINTS = (
 AUTH_ERRORS = ("auth_error", "unauthorized", "invalid_api_key", "invalid_user_key")
 AUTH_HINTS = ("invalid user key", "invalid api key", "api key")
 
+# key 有效、但没有读取账户信息的权限：GET /api/v0/users/current/ 返回 401，说明里提到权限或
+# 两步验证。2026-11-10 在真实 API 上看到的原文：“Your key lacks proper privileges to perform
+# this action as it requires you to have logged in using Two Factor Authentication”。
+# 这时余额未知（balance 返回 None），不是 key 无效。
+NO_PERMISSION_HINTS = ("privilege", "two factor", "two-factor", "2fa")
+BALANCE_NO_PERMISSION_NOTE = "key 没有读取账户信息的权限"
+
 # 429 且 error=search_quota_exceeded 是当日搜索配额用完，到 UTC 午夜才恢复，重试没有意义 [CLI]。
 SEARCH_QUOTA_ERROR = "search_quota_exceeded"
 
@@ -167,6 +174,8 @@ class VastBackend:
         self._owns_client = client is None
         self._client = client if client is not None else httpx.Client(timeout=TIMEOUT)
         self._sleep = sleep
+        # balance() 返回 None 时的原因（给 doctor 和 submit 显示）；空串表示没有问题
+        self.balance_note = ""
 
     def __repr__(self) -> str:  # 不把 key 打进日志
         return f"VastBackend(base_url={self._base_url!r})"
@@ -582,7 +591,19 @@ class VastBackend:
     # ------------------------------------------------------------ balance
 
     def balance(self) -> Balance | None:
-        resp = self._request("GET", "/api/v0/users/current/", what="查询余额")
+        """账户余额。key 有效但没有读取账户信息的权限时返回 None，并在 balance_note 写明原因
+        （只警告一次）；key 无效仍然抛 BackendError。"""
+        resp = self._request("GET", "/api/v0/users/current/", what="查询余额", raw_auth=True)
+        if _is_auth_failure(resp):
+            if not _says_no_permission(resp):
+                raise self._auth_error("查询余额", resp)
+            if not self.balance_note:
+                log.warning(
+                    "vast: the API key cannot read account info (%s); balance is unknown",
+                    self._describe(resp),
+                )
+            self.balance_note = BALANCE_NO_PERMISSION_NOTE
+            return None
         if not resp.is_success:
             raise self._error(f"Vast 查询余额失败（{self._describe(resp)}）。", retryable=True)
         data = _json(resp)
@@ -608,10 +629,12 @@ class VastBackend:
         attempts: int = ATTEMPTS,
         timeout: httpx.Timeout = TIMEOUT,
         idempotent: bool = True,
+        raw_auth: bool = False,
     ) -> httpx.Response:
         """发请求并统一处理暂时性错误，返回其余所有响应（含 4xx）由调用方解释。
 
-        - 401/403，或响应体表明 key 无效：抛 BackendError，提示检查 API key，不重试。
+        - 401/403，或响应体表明 key 无效：抛 BackendError，提示检查 API key，不重试
+          （raw_auth 时把响应原样返回，由调用方区分“key 无效”和“key 权限不够”）。
         - 429：被限流的请求没有被执行，任何调用都可以等待后重试（与 [CLI] 一致）；
           当日搜索配额用完不重试。
         - 5xx、超时、连接错误：幂等调用按指数退避重试；非幂等调用（create）结果未知，
@@ -636,6 +659,8 @@ class VastBackend:
                     raise _OutcomeUnknown(self._redact(last)) from None
             else:
                 if _is_auth_failure(resp):
+                    if raw_auth:
+                        return resp
                     raise self._auth_error(what, resp)
                 if resp.status_code == 429:
                     last = self._describe(resp)
@@ -747,6 +772,19 @@ def _is_auth_failure(resp: httpx.Response) -> bool:
     return error in AUTH_ERRORS or any(hint in message for hint in AUTH_HINTS)
 
 
+def _says_no_permission(resp: httpx.Response) -> bool:
+    """401/403 的说明是“权限不够、需要两步验证”，而不是“key 无效”。"""
+    data = _json(resp)
+    if isinstance(data, dict):
+        text = " ".join(str(data.get(k) or "") for k in ("error", "msg", "detail", "message"))
+    else:
+        text = resp.text if resp.content else ""
+    text = text.lower()
+    if any(hint in text for hint in ("invalid user key", "invalid api key", "invalid_api_key")):
+        return False
+    return any(hint in text for hint in NO_PERMISSION_HINTS)
+
+
 def _says_unavailable(data: Any) -> bool:
     if not isinstance(data, dict):
         return False
@@ -851,7 +889,11 @@ def _unwrap_instance(data: Any, instance_id: str) -> tuple[bool, dict[str, Any] 
 
 
 def _state_from_row(row: dict[str, Any], ref: InstanceRef) -> InstanceState:
+    """实例行 → InstanceState。标签取平台上存的 label（编排据此确认标签没有被平台改写）。"""
     raw = row.get("actual_status")
+    label = row.get("label")
+    if isinstance(label, str) and label and label != ref.label:
+        ref = InstanceRef(backend=ref.backend, id=ref.id, label=label)
     return InstanceState(
         ref=ref,
         phase=map_status(raw),

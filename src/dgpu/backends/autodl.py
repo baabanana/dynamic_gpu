@@ -16,6 +16,7 @@ https://www.autodl.com/docs/common_api/ 。文档没写、这里只能假设的�
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -433,7 +434,12 @@ class AutodlBackend:
     # ------------------------------------------------------------ destroy
 
     def destroy(self, ref: InstanceRef) -> None:
-        """删除部署（运行中的部署平台会先停后删）。已不存在算成功。"""
+        """删除部署（运行中的部署平台会先停后删）。已不存在算成功。
+
+        部署列表里查不到时也照样发 DELETE：刚创建的部署可能还没出现在列表里。这时没法核对
+        名称（红线 3 的检查只在查到记录时做；ref 本来就来自 dgpu 自己创建或按 dgpu 标签列出
+        的部署），平台回答“不存在”之类的错误就算已删除。
+        """
         if not ref.id:
             return
         last_error: BackendError | None = None
@@ -446,17 +452,30 @@ class AutodlBackend:
             except BackendError as exc:
                 last_error = exc
                 continue
-            if record is None:
-                return
-            name = str(record.get("name") or "")
-            if not name.startswith(layout.LABEL_PREFIX):
-                raise BackendError(
-                    f"拒绝删除 AutoDL 部署 {ref.id}：它的名称 {name!r} 不是 dgpu 标签，"
-                    "不是 dgpu 创建的部署（设计红线 3）。检查传入的实例 ID"
-                )
+            if record is not None:
+                name = str(record.get("name") or "")
+                if not name.startswith(layout.LABEL_PREFIX):
+                    raise BackendError(
+                        f"拒绝删除 AutoDL 部署 {ref.id}：它的名称 {name!r} 不是 dgpu 标签，"
+                        "不是 dgpu 创建的部署（设计红线 3）。检查传入的实例 ID"
+                    )
             try:
                 self._request("DELETE", PATH_DEPLOYMENT, {"deployment_uuid": ref.id})
                 return
+            except AutodlApiError as exc:
+                if record is None:
+                    # 列表里没有、平台也拒绝删除：按“已经不存在”处理
+                    log.info("AutoDL 部署 %s 查不到，DELETE 返回 %s，按已删除处理", ref.id, exc)
+                    return
+                last_error = exc
+                log.warning(
+                    "删除 AutoDL 部署 %s（%s）失败（第 %d/%d 次）：%s",
+                    ref.id,
+                    ref.label,
+                    attempt + 1,
+                    attempts,
+                    exc,
+                )
             except BackendError as exc:
                 last_error = exc
                 log.warning(
@@ -513,6 +532,10 @@ class AutodlBackend:
         body = {"page_index": 1, "page_size": 10, "deployment_uuid": uuid}
         data = self._request("POST", PATH_DEPLOYMENT_LIST, body)
         batch = _page_items(data)
+        total = data.get("result_total")
+        if not batch and _is_int(total) and total > 0:  # 分页从 0 开始：第 1 页是空的
+            data = self._request("POST", PATH_DEPLOYMENT_LIST, {**body, "page_index": 0})
+            batch = _page_items(data)
         for item in batch:
             if item.get("uuid") == uuid:
                 return item
@@ -525,18 +548,43 @@ class AutodlBackend:
         return None
 
     def _paginate(self, path: str, body: dict[str, Any]) -> list[dict[str, Any]]:
+        """翻完整个列表。文档没写 page_index 从 0 还是从 1 开始，所以不猜，而是看响应：
+
+        - 第 1 页是空的、但 result_total 不为 0：分页从 0 开始，改从第 0 页重新翻；
+        - 翻完后条数比 result_total 少：可能从 0 开始、第 1 页其实是第二页，补读第 0 页
+          （按记录去重，平台把第 0 页当作第 1 页时也不会重复）。
+        """
         items: list[dict[str, Any]] = []
-        page = 1
+        seen: set[str] = set()
+
+        def add(batch: list[dict[str, Any]]) -> None:
+            for item in batch:
+                key = _item_key(item)
+                if key not in seen:
+                    seen.add(key)
+                    items.append(item)
+
+        page, fetched, zero_based = 1, 0, False
+        total: Any = None
         while True:
             data = self._request("POST", path, {**body, "page_index": page, "page_size": PAGE_SIZE})
             batch = _page_items(data)
-            items.extend(batch)
-            if not batch:
-                break
+            fetched += 1
             max_page = data.get("max_page")
             total = data.get("result_total")
+            if page == 1 and fetched == 1 and not batch and _is_int(total) and total > 0:
+                log.warning(
+                    "AutoDL %s 的第 1 页是空的，但 result_total=%d：按从 0 开始的分页重新读取",
+                    path,
+                    total,
+                )
+                page, fetched, zero_based = 0, 0, True
+                continue
+            add(batch)
+            if not batch:
+                break
             if _is_int(max_page) and max_page > 0:
-                if page >= max_page:
+                if fetched >= max_page:
                     break
             elif _is_int(total):
                 if len(items) >= total:
@@ -544,10 +592,20 @@ class AutodlBackend:
             elif len(batch) < PAGE_SIZE:
                 break
             page += 1
-            if page > MAX_PAGES:
+            if fetched >= MAX_PAGES:
                 raise BackendError(
                     f"AutoDL {path} 的分页超过 {MAX_PAGES} 页，列表可能不完整，停止查询。"
                     "在控制台清理旧部署后重试"
+                )
+        if not zero_based and _is_int(total) and 0 < len(items) < total:
+            data = self._request("POST", path, {**body, "page_index": 0, "page_size": PAGE_SIZE})
+            add(_page_items(data))
+            if len(items) < total:
+                log.warning(
+                    "AutoDL %s 翻完只拿到 %d 条，result_total=%d（列表在翻页期间可能有变化）",
+                    path,
+                    len(items),
+                    total,
                 )
         return items
 
@@ -706,6 +764,14 @@ def _parse_stock(data: Any) -> list[tuple[str, int, int]]:
     return result
 
 
+def _item_key(item: dict[str, Any]) -> str:
+    """列表记录的去重键：部署和容器都有 uuid；没有时用整条记录。"""
+    uuid = item.get("uuid")
+    if isinstance(uuid, str) and uuid:
+        return "uuid:" + uuid
+    return "json:" + json.dumps(item, sort_keys=True, default=str)
+
+
 def _page_items(data: Any) -> list[dict[str, Any]]:
     if not isinstance(data, dict):
         raise _MalformedResponse("AutoDL 列表接口的 data 不是对象")
@@ -723,11 +789,18 @@ def _state_from_record(
     *,
     ref: InstanceRef | None = None,
 ) -> InstanceState:
-    """把部署记录和（可选的）容器列表合成一个 InstanceState，规则见文件开头的映射表。"""
+    """把部署记录和（可选的）容器列表合成一个 InstanceState，规则见文件开头的映射表。
+
+    ref 的标签取平台上的部署名（调用方据此确认标签没有被平台改写）。
+    """
     if ref is None:
         ref = InstanceRef(
             backend=BACKEND_AUTODL, id=str(record.get("uuid")), label=str(record.get("name"))
         )
+    else:
+        name = record.get("name")
+        if isinstance(name, str) and name and name != ref.label:
+            ref = InstanceRef(backend=ref.backend, id=ref.id, label=name)
     dep_status = str(record.get("status") or "")
     candidates: list[tuple[str, str, dict[str, Any] | None]] = []
     for container in containers or []:

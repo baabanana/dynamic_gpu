@@ -140,6 +140,7 @@ class FakeAutodl:
         self.before: dict[str, Any] = {}
         self.honor_uuid_filter = True
         self.page_size_cap: int | None = None
+        self.page_base = 1  # 分页从几开始（文档没写；0 表示从 0 开始）
         self._ids = (f"{n:015x}" for n in itertools.count(0xA000))
         router.post("/api/v1/dev/deployment/list").mock(
             side_effect=self._handle("list", self._list)
@@ -195,7 +196,7 @@ class FakeAutodl:
         if self.page_size_cap:
             size = min(size, self.page_size_cap)
         page = body["page_index"]
-        start = (page - 1) * size
+        start = max(0, page - self.page_base) * size  # 小于起始页时平台按第一页处理
         return ok(
             {
                 "list": items[start : start + size],
@@ -802,7 +803,26 @@ def test_destroy_is_idempotent(backend, platform):
     backend.destroy(ref("d1"))
     backend.destroy(ref("d1"))
     backend.destroy(ref("never-existed"))
-    assert platform.count("delete") == 1
+    assert platform.deployments == []
+    # 列表里查不到也照样发 DELETE（刚创建的部署可能还没出现在列表里）；平台回答“不存在”算成功
+    sent = [b["deployment_uuid"] for b in platform.bodies("delete")]
+    assert sent == ["d1", "d1", "never-existed"]
+
+
+def test_destroy_sends_delete_for_a_deployment_not_yet_listed(backend, platform):
+    """刚创建的部署还没出现在列表里：照样按 UUID 删除，不能当作已经不存在就返回。"""
+    platform.honor_uuid_filter = True
+    hidden = deployment("d-new", LABEL)
+    platform.add(hidden)
+    platform.deployments.remove(hidden)  # 列表暂时查不到
+
+    def delete_hidden():
+        platform.deployments.append(hidden)  # DELETE 到达时它已经在平台上了
+
+    platform.before["delete"] = delete_hidden
+    backend.destroy(ref("d-new"))
+    assert platform.bodies("delete") == [{"deployment_uuid": "d-new"}]
+    assert platform.deployments == []
 
 
 def test_destroy_treats_not_found_error_after_race_as_success(backend, platform, sleeps):
@@ -810,8 +830,9 @@ def test_destroy_treats_not_found_error_after_race_as_success(backend, platform,
     platform.add(deployment("d1", LABEL))
     platform.before["delete"] = platform.deployments.clear
     backend.destroy(ref("d1"))
-    assert platform.count("delete") == 1
-    assert platform.count("list") == 2  # 再查一次确认已不存在
+    # 再查一次已不存在，再发一次 DELETE，平台回答“不存在”：算成功
+    assert platform.count("delete") == 2
+    assert platform.count("list") == 2
     assert sleeps == [autodl.DESTROY_RETRY_DELAYS_S[0]]
 
 
@@ -895,6 +916,40 @@ def test_list_dedupes_and_stops_without_max_page(backend, platform, router):
     platform.fail["list"] = [ok(page)]
     assert [s.ref.id for s in backend.list()] == ["d1"]
     assert platform.count("list") == 1
+
+
+@pytest.mark.parametrize(("cap", "count"), [(None, 3), (2, 5), (2, 4)])
+def test_list_handles_zero_based_paging_without_guessing(backend, platform, cap, count):
+    """文档没写分页从 0 还是 1 开始：第 1 页空而总数不为 0、或翻完条数不够时补读第 0 页。"""
+    platform.page_base = 0
+    platform.page_size_cap = cap
+    for n in range(1, count + 1):
+        platform.add(deployment(f"d{n}", layout.label(JOB_ID, n)))
+    states = backend.list()
+    assert sorted(s.ref.id for s in states) == [f"d{n}" for n in range(1, count + 1)]
+    assert 0 in [b["page_index"] for b in platform.bodies("list")]
+
+
+def test_list_with_one_based_paging_never_needs_page_zero(backend, platform):
+    platform.page_size_cap = 2
+    for n in range(1, 6):
+        platform.add(deployment(f"d{n}", layout.label(JOB_ID, n)))
+    assert len(backend.list()) == 5
+    assert [b["page_index"] for b in platform.bodies("list")] == [1, 2, 3]
+
+
+def test_get_sees_containers_on_a_zero_based_container_list(backend, platform):
+    platform.page_base = 0
+    platform.add(deployment("d1", LABEL), [container("d1", "running")])
+    state = backend.get(ref("d1"))
+    assert state.phase == INST_RUNNING and "container=running" in state.raw_status
+
+
+def test_get_reports_the_name_the_platform_actually_stored(backend, platform):
+    """平台截断或改写了部署名：get 返回平台上的名字，编排据此发现并按 ID 销毁。"""
+    platform.add(deployment("d1", LABEL[:20]))
+    state = backend.get(ref("d1"))
+    assert state.ref.id == "d1" and state.ref.label == LABEL[:20]
 
 
 def test_list_refuses_to_page_forever(backend, platform, monkeypatch):
