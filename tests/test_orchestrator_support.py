@@ -408,7 +408,7 @@ def seed_job(
     store.put_json(layout.spec_key(job_id), {"version": 1, "job_id": job_id})
     if with_request:
         store.put_json(
-            layout.job_prefix(job_id) + "request.json",
+            layout.request_key(job_id),
             {
                 "version": 1,
                 "job_id": job_id,

@@ -692,6 +692,8 @@ def test_list_returns_only_matching_labels(api):
     exited = next(s for s in states if s.ref.id == "6")
     assert exited.phase == INST_EXITED
     assert exited.ref.backend == "vast"
+    # gc 的年龄判断要用创建时间（start_date，epoch 秒）
+    assert all(s.created_at == 1762770000.5 for s in states)
 
     assert [s.ref.id for s in backend.list(f"dgpu-{JOB}-")] == ["6"]
 

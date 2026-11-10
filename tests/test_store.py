@@ -681,45 +681,46 @@ def test_unsorted_listing_is_sorted_and_continuation_is_followed():
 
 
 # ================================================================ download_prefix 的路径安全
+# 这几条对 MemoryStore 和 S3Store 都跑（store fixture），替身和真实实现的行为一致。
 
 
 @pytest.mark.parametrize("bad", ["../evil.txt", "a/../../evil.txt", "a/../.."])
-def test_download_prefix_refuses_keys_escaping_dest(s3, tmp_path, bad):
+def test_download_prefix_refuses_keys_escaping_dest(store, tmp_path, bad):
     prefix = "dgpu/jobs/j1/output/"
-    s3.put_bytes(prefix + "aaa-first.txt", b"ok")  # 排在前面，也不能被写下来
-    s3.put_bytes(prefix + bad, b"evil")
+    store.put_bytes(prefix + "aaa-first.txt", b"ok")  # 排在前面，也不能被写下来
+    store.put_bytes(prefix + bad, b"evil")
     dest = tmp_path / "work" / "dest"
 
     with pytest.raises(StoreError, match="拒绝下载"):
-        s3.download_prefix(prefix, dest)
+        store.download_prefix(prefix, dest)
     assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
 
 
-def test_download_prefix_refuses_to_follow_symlinks_out_of_dest(s3, tmp_path):
+def test_download_prefix_refuses_to_follow_symlinks_out_of_dest(store, tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     dest = tmp_path / "dest"
     dest.mkdir()
     (dest / "link").symlink_to(outside, target_is_directory=True)
-    s3.put_bytes("p/link/evil.txt", b"evil")
+    store.put_bytes("p/link/evil.txt", b"evil")
 
     with pytest.raises(StoreError, match="拒绝下载"):
-        s3.download_prefix("p/", dest)
+        store.download_prefix("p/", dest)
     assert list(outside.iterdir()) == []
 
 
-def test_download_prefix_directory_markers_and_single_object(s3, tmp_path):
-    s3.put_bytes("p/", b"")  # 控制台建的“文件夹”
-    s3.put_bytes("p/empty-dir/", b"")
-    s3.put_bytes("p/f.txt", b"f")
+def test_download_prefix_directory_markers_and_single_object(store, tmp_path):
+    store.put_bytes("p/", b"")  # 控制台建的“文件夹”
+    store.put_bytes("p/empty-dir/", b"")
+    store.put_bytes("p/f.txt", b"f")
 
-    assert s3.download_prefix("p/", tmp_path / "a") == 1
+    assert store.download_prefix("p/", tmp_path / "a") == 1
     assert (tmp_path / "a" / "empty-dir").is_dir()
     assert (tmp_path / "a" / "f.txt").read_bytes() == b"f"
     # 前缀不以 / 结尾也能用；前缀正好是一个对象时按文件名落盘
-    assert s3.download_prefix("p", tmp_path / "b") == 1
+    assert store.download_prefix("p", tmp_path / "b") == 1
     assert (tmp_path / "b" / "f.txt").read_bytes() == b"f"
-    assert s3.download_prefix("p/f.txt", tmp_path / "c") == 1
+    assert store.download_prefix("p/f.txt", tmp_path / "c") == 1
     assert (tmp_path / "c" / "f.txt").read_bytes() == b"f"
 
 
@@ -751,10 +752,10 @@ def test_get_bytes_rejects_negative_start(s3):
         s3.get_bytes("k", start=-1)
 
 
-def test_download_prefix_refuses_keys_that_collide_locally(s3, tmp_path):
-    s3.put_bytes("p/a.txt", b"one")
-    s3.put_bytes("p//a.txt", b"two")  # 不同的 key，落到同一个本地文件
+def test_download_prefix_refuses_keys_that_collide_locally(store, tmp_path):
+    store.put_bytes("p/a.txt", b"one")
+    store.put_bytes("p//a.txt", b"two")  # 不同的 key，落到同一个本地文件
 
     with pytest.raises(StoreError, match="同一个本地文件"):
-        s3.download_prefix("p/", tmp_path / "out")
+        store.download_prefix("p/", tmp_path / "out")
     assert not (tmp_path / "out" / "a.txt").exists()

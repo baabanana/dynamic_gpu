@@ -224,9 +224,16 @@ class Config:
 
 @dataclass(frozen=True)
 class GpuRequest:
+    """搜索条件。
+
+    max_price_per_hour：整台实例每小时的总价上限（后端自己的货币），即 job.yaml 的
+    max_usd_per_hour / max_cny_per_hour。包括全部 count 张卡和磁盘，不含流量费：
+    Vast 是算力价 + disk_gb 的存储价；AutoDL 是整个容器（不是每卡）的价格。
+    """
+
     names: tuple[str, ...]
     count: int
-    max_price_per_hour: float  # 后端自己的货币
+    max_price_per_hour: float
     max_hours: float
     disk_gb: int
     image: str
@@ -234,13 +241,21 @@ class GpuRequest:
 
 @dataclass(frozen=True)
 class Offer:
+    """一个候选。
+
+    price_per_hour 与 GpuRequest.max_price_per_hour 同一口径：整台实例（全部卡 + 磁盘）每小时
+    的总价，不含流量费，可以直接和上限比较。Vast 是算力价加按 disk_gb 计的存储价；AutoDL
+    的库存接口不给价格，填的是价格上限（details.price_is_upper_bound），实际价格在创建后的
+    InstanceState.price_per_hour 里（同样是整个容器的价格）。
+    """
+
     backend: str
     id: str  # Vast：offer id；AutoDL：地区码
     gpu_name: str
     gpu_count: int
     price_per_hour: float
     currency: str
-    est_total: float  # 按 max_hours 估算的总价（算力 + 磁盘 + 流量），用于排序和展示
+    est_total: float  # price_per_hour × max_hours（不含流量费），用于排序和展示
     region: str = ""
     details: dict[str, Any] = field(default_factory=dict)  # 展示用：可靠性、带宽、库存等
 
@@ -291,8 +306,10 @@ class InstanceState:
     ref: InstanceRef
     phase: str
     raw_status: str = ""  # 平台原始状态字符串，排查用
-    price_per_hour: float | None = None
-    created_at: float | None = None  # epoch 秒
+    price_per_hour: float | None = None  # 整台实例的总价，口径同 Offer.price_per_hour
+    # 创建时间（epoch 秒）。平台返回了就必须填（Vast 的 start_date、AutoDL 部署的 created_at）：
+    # gc 靠它判断“存储里没有记录的实例”和“启动卡住的实例”有多老；None 时 gc 只能保守地保留
+    created_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -324,7 +341,12 @@ class Backend(Protocol):
         """销毁实例并停止计费。幂等：已不存在不报错。返回前须确认平台已受理。"""
 
     def list(self, label_prefix: str = layout.LABEL_PREFIX) -> list[InstanceState]:
-        """列出标签以 label_prefix 开头的实例。绝不返回其他实例。"""
+        """列出标签以 label_prefix 开头的实例。绝不返回其他实例。
+
+        label_prefix 必须以 layout.LABEL_PREFIX（"dgpu-"）开头，空串也不行（否则会匹配用户
+        所有带标签的实例）。不满足时实现抛 ValueError（VastBackend、FakeBackend），或者至少
+        只返回标签以 dgpu- 开头的实例（AutoDL 的部署名）。
+        """
 
     def balance(self) -> Balance | None:
         """账户余额；平台不提供时返回 None。"""

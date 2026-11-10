@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from dgpu import layout
@@ -26,6 +26,7 @@ from dgpu.contracts import (
     OfferUnavailable,
     PreconditionFailed,
     Store,
+    StoreError,
     StoreProfile,
 )
 
@@ -98,13 +99,46 @@ class MemoryStore:
         return sorted(names)
 
     def download_prefix(self, prefix: str, dest: Path) -> int:
-        count = 0
+        """与 S3Store 一致：先检查全部 key 再写。
+
+        - 相对路径含 ..、或会落到 dest 之外（含经由 dest 里的符号链接）：StoreError，什么都不写；
+        - 两个 key 落到同一个本地文件（如 p/a 和 p//a）：StoreError，什么都不写；
+        - 以 / 结尾的目录占位对象只建目录，不计数；前缀正好是一个对象时按文件名落盘。
+        """
+        root = Path(dest).resolve()
+        files: list[tuple[str, Path]] = []
+        dirs: list[Path] = []
+        claimed: dict[Path, str] = {}
         for key in self.list(prefix):
-            target = Path(dest) / key[len(prefix) :]
+            rel = key[len(prefix) :].lstrip("/")
+            if not rel:
+                if key.endswith("/"):
+                    continue  # 前缀本身的目录占位对象
+                rel = PurePosixPath(key).name  # 前缀正好是一个对象
+            parts = PurePosixPath(rel).parts
+            target = root.joinpath(*parts).resolve() if parts else root
+            if ".." in parts or target == root or not target.is_relative_to(root):
+                raise StoreError(
+                    f"拒绝下载 {key}：它的相对路径 {rel!r} 会写到目标目录 {root} 之外。"
+                    "没有写入任何文件。"
+                )
+            if not key.endswith("/") and target in claimed:
+                raise StoreError(
+                    f"{claimed[target]} 和 {key} 会下载到同一个本地文件 {target}。"
+                    "没有写入任何文件。"
+                )
+            claimed[target] = key
+            if key.endswith("/"):
+                dirs.append(target)
+            else:
+                files.append((key, target))
+        root.mkdir(parents=True, exist_ok=True)
+        for directory in dirs:
+            directory.mkdir(parents=True, exist_ok=True)
+        for key, target in files:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(self.objects[key])
-            count += 1
-        return count
+        return len(files)
 
     def presign_get(self, key: str, ttl_s: int) -> str:
         return f"https://presigned.invalid/{self.profile.bucket}/{key}?ttl={ttl_s}"
@@ -170,6 +204,11 @@ class FakeBackend:
 
     def list(self, label_prefix: str = layout.LABEL_PREFIX) -> list[InstanceState]:
         self.calls.append(("list", label_prefix))
+        # 和 VastBackend 一样：前缀必须以 dgpu- 开头，空前缀会匹配所有带标签的实例
+        if not label_prefix or not label_prefix.startswith(layout.LABEL_PREFIX):
+            raise ValueError(
+                f"label_prefix must start with {layout.LABEL_PREFIX!r}, got {label_prefix!r}"
+            )
         return [
             state for state in self.instances.values() if state.ref.label.startswith(label_prefix)
         ]

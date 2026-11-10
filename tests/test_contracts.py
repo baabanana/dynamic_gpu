@@ -66,6 +66,34 @@ def test_keys_live_under_job_prefix():
     assert not layout.dataset_complete_key("h").startswith(layout.dataset_prefix("h"))
 
 
+def test_request_key_lives_under_job_prefix():
+    assert layout.request_key("j1") == layout.job_prefix("j1") + "request.json"
+
+
+def test_integration_event_names_and_reasons():
+    for name in (states.EV_DESTROY_FAILED, states.EV_RELAUNCH):
+        assert name in states.EVENT_NAMES
+        assert states.new_event_doc(name, states.SRC_CLI, "j1")["name"] == name
+    assert (states.EV_DESTROY_FAILED, states.EV_RELAUNCH) == ("destroy_failed", "relaunch")
+    assert states.REASON_SIGNALLED == "signalled"
+    assert len(set(states.EVENT_NAMES)) == len(states.EVENT_NAMES)
+
+
+def test_doc_builders_take_an_optional_timestamp():
+    assert states.new_attempt_doc("j1", 1, "vast", "dgpu-j1-a1", now=5.0)["created_at"] == 5.0
+    assert states.new_status_doc("j1", 1, states.RUNNING, "cli", now=6.0)["updated_at"] == 6.0
+    assert states.new_heartbeat_doc("j1", 1, states.RUNNING, "run", now=7.0)["ts"] == 7.0
+    assert states.new_event_doc(states.EV_RELAUNCH, "cli", "j1", now=8.0)["ts"] == 8.0
+    before = states.now()
+    assert states.new_status_doc("j1", 1, states.RUNNING, "cli")["updated_at"] >= before
+
+
+def test_attempt_doc_carries_a_fresh_writer_token():
+    first = states.new_attempt_doc("j1", 1, "vast", "dgpu-j1-a1")
+    second = states.new_attempt_doc("j1", 1, "vast", "dgpu-j1-a1")
+    assert first["writer"] and first["writer"] != second["writer"]
+
+
 def test_event_keys_sort_by_time():
     assert layout.event_key("j", "cli", ts=1.0) < layout.event_key("j", "cli", ts=2.0)
 
@@ -167,6 +195,11 @@ def test_fake_backend_lifecycle_and_label_filter():
         backend.create(offers[0], launch)
     ref = backend.create(offers[1], launch)
     assert [state.ref for state in backend.list()] == [ref]
+
+    for bad in ("", "someone-", "dgp"):
+        with pytest.raises(ValueError, match="dgpu-"):
+            backend.list(bad)
+    assert [state.ref for state in backend.list("dgpu-j1-a")] == [ref]
 
     backend.destroy(ref)
     backend.destroy(ref)

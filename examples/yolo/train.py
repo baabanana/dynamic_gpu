@@ -30,6 +30,12 @@ from typing import Any
 
 CKPT_NAME = "last.pt"  # 放在 $DGPU_CKPT 里的 checkpoint 文件名
 DONE_NAME = "DONE"  # 训练完成后写在 $DGPU_OUTPUT 里的标记
+# 训练完成后先写在 $DGPU_CKPT 里的标记，以及最终权重的备份目录。$DGPU_CKPT 随 checkpoint
+# 同步、换机重试时恢复（$DGPU_OUTPUT 不恢复），所以机器在训练完之后、DONE 和输出传完之前
+# 宕机时，重试能从这里认出“已经训练完”，把权重放回输出目录，而不是从头再训练一遍。
+COMPLETE_NAME = "COMPLETE.json"
+FINAL_DIR_NAME = "final"
+FINAL_WEIGHTS = ("best.pt", "last.pt")  # Ultralytics 在 <输出>/run/weights/ 下的最终权重
 RUN_NAME = "run"  # Ultralytics 的输出在 $DGPU_OUTPUT/run/
 DATA_YAML_NAME = "data.yaml"  # 数据集目录里的 YOLO 数据描述
 RESOLVED_YAML_NAME = "data.dgpu.yaml"  # 改写成绝对路径后的副本
@@ -220,14 +226,57 @@ def prepare_data_yaml(dataset_dir: Path) -> Path:
     return dst
 
 
-def write_done(output_dir: Path, info: Mapping[str, Any]) -> Path:
-    """在输出目录写 DONE 标记（先写 .tmp 再 rename）。"""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / DONE_NAME
+def _write_json_atomic(path: Path, info: Mapping[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(dict(info), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(str(tmp), str(path))
     return path
+
+
+def write_done(output_dir: Path, info: Mapping[str, Any]) -> Path:
+    """在输出目录写 DONE 标记（先写 .tmp 再 rename）。"""
+    return _write_json_atomic(output_dir / DONE_NAME, info)
+
+
+def save_completion(ckpt_dir: Path, weights_dir: Path, info: Mapping[str, Any]) -> Path:
+    """训练正常结束后、写 DONE 之前调用：最终权重备份到 $DGPU_CKPT/final/，最后写完成标记。
+
+    每个文件都是先写 .tmp 再 rename（dgpu 同步时跳过 *.tmp），标记最后写，所以存储里有
+    标记就说明备份的权重是完整的。
+    """
+    saved = []
+    for name in FINAL_WEIGHTS:
+        src = weights_dir / name
+        if src.is_file():
+            atomic_copy(src, ckpt_dir / FINAL_DIR_NAME / name)
+            saved.append(name)
+    return _write_json_atomic(ckpt_dir / COMPLETE_NAME, dict(info, final_weights=saved))
+
+
+def read_completion(ckpt_dir: Path) -> dict[str, Any] | None:
+    """$DGPU_CKPT 里的完成标记（换机重试时随 checkpoint 恢复）；没有或读不出来返回 None。"""
+    path = ckpt_dir / COMPLETE_NAME
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def restore_outputs(ckpt_dir: Path, output_dir: Path) -> list[str]:
+    """把 $DGPU_CKPT/final/ 里备份的权重放回 $DGPU_OUTPUT/run/weights/（已有的不覆盖）。
+
+    放回之后 runner 的最终同步会把它们重新传到存储的 output/。返回放回的文件名。
+    """
+    weights = output_dir / RUN_NAME / "weights"
+    restored = []
+    for name in FINAL_WEIGHTS:
+        src = ckpt_dir / FINAL_DIR_NAME / name
+        if src.is_file() and not (weights / name).exists():
+            atomic_copy(src, weights / name)
+            restored.append(name)
+    return restored
 
 
 # ---------------------------------------------------------------- 主流程
@@ -240,6 +289,16 @@ def main(env: Mapping[str, str] | None = None) -> int:
         done = settings.output_dir / DONE_NAME
         if done.exists():
             log(f"{done} 已存在：这个任务已经训练完，不再重复训练")
+            return 0
+        completion = read_completion(settings.ckpt_dir)
+        if completion is not None:
+            # 上一次尝试训练完了，但机器在写 DONE、传完输出之前中断：不重新训练
+            restored = restore_outputs(settings.ckpt_dir, settings.output_dir)
+            log(
+                "checkpoint 里有完成标记：上一次尝试已经训练完，不再重复训练；"
+                f"从 checkpoint 放回了 {', '.join(restored) or '（没有需要放回的文件）'}"
+            )
+            write_done(settings.output_dir, dict(completion, recovered=True, restored=restored))
             return 0
         data_yaml = prepare_data_yaml(settings.data_dir / settings.dataset)
     except ExampleError as exc:
@@ -265,17 +324,17 @@ def main(env: Mapping[str, str] | None = None) -> int:
         resume=decision.resume,
     )
 
-    write_done(
-        settings.output_dir,
-        {
-            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "model": settings.model,
-            "epochs": settings.epochs,
-            "resumed": decision.resume,
-            "ultralytics": getattr(ultralytics, "__version__", "unknown"),
-            "weights": f"{RUN_NAME}/weights/best.pt",
-        },
-    )
+    info = {
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "model": settings.model,
+        "epochs": settings.epochs,
+        "resumed": decision.resume,
+        "ultralytics": getattr(ultralytics, "__version__", "unknown"),
+        "weights": f"{RUN_NAME}/weights/best.pt",
+    }
+    # 先在 $DGPU_CKPT 里记下“训练完了”（会被同步、换机时恢复），再写 DONE
+    save_completion(settings.ckpt_dir, settings.output_dir / RUN_NAME / "weights", info)
+    write_done(settings.output_dir, info)
     log(f"训练完成，结果在 {settings.output_dir / RUN_NAME}")
     return 0
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import os
 import shutil
@@ -11,13 +12,14 @@ from pathlib import Path
 
 import pytest
 
-from dgpu import layout
-from dgpu.contracts import DataRef, DataSource, SpecError, StoreError
+from dgpu import layout, packaging
+from dgpu.contracts import SINGLE_UPLOAD_LIMIT, DataRef, DataSource, SpecError, StoreError
 from dgpu.packaging import (
     FIXED_MTIME,
     hash_dataset,
     list_code_files,
     pack_code,
+    resolve_data,
     resolve_remote,
     upload_dataset,
 )
@@ -564,3 +566,40 @@ def test_resolve_remote():
     assert resolve_remote(DataRef(name="c", bucket="bkt", prefix="c")).prefix == "c/"
     with pytest.raises(ValueError):
         resolve_remote(DataRef(name="local", local_path=Path("/tmp/x")))
+
+
+def test_resolve_data_uploads_local_dirs_and_converts_remote_refs(tmp_path):
+    root = _tree(tmp_path / "set", DATA)
+    store = MemoryStore()
+    local = resolve_data(store, _local_ref(root, "coco"))
+    assert local.bucket == store.profile.bucket and local.prefix.startswith("dgpu/datasets/")
+    assert store.exists(layout.dataset_complete_key(hash_dataset(root).content_hash))
+    remote = resolve_data(store, DataRef(name="c", bucket="bkt", prefix="sets/c/"))
+    assert remote == DataSource(name="c", bucket="bkt", prefix="sets/c/")
+
+
+# ---------------------------------------------------------------- 单次上传上限（5 GiB）
+
+
+def test_file_over_the_upload_limit_is_refused_before_hashing(tmp_path, monkeypatch):
+    root = _tree(tmp_path / "set", {"a.txt": "x" * 10, "b.txt": "y"})
+
+    def no_hashing(handle):
+        raise AssertionError("hashed before checking sizes")
+
+    monkeypatch.setattr(packaging, "_sha256_stream", no_hashing)
+    with pytest.raises(SpecError) as info:
+        hash_dataset(root, max_file_bytes=5)
+    message = str(info.value)
+    assert "a.txt" in message and "rclone" in message and "r2://" in message
+
+
+def test_upload_refuses_an_oversized_manifest_without_writing(tmp_path):
+    root = _tree(tmp_path / "set", DATA)
+    manifest = hash_dataset(root)
+    huge = dataclasses.replace(manifest.files[0], size=SINGLE_UPLOAD_LIMIT + 1)
+    manifest = dataclasses.replace(manifest, files=(huge, *manifest.files[1:]))
+    store = MemoryStore()
+    with pytest.raises(SpecError, match="rclone"):
+        upload_dataset(store, _local_ref(root), manifest=manifest)
+    assert store.objects == {}

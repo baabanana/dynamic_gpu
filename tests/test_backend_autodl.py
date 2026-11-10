@@ -870,6 +870,8 @@ def test_list_returns_only_dgpu_deployments_across_pages(backend, platform):
     assert all(s.ref.label.startswith(layout.LABEL_PREFIX) for s in states)
     assert {s.phase for s in states if s.ref.id.startswith("d")} == {INST_RUNNING}
     assert next(s for s in states if s.ref.id == "e1").phase == INST_EXITED
+    # gc 的年龄判断要用创建时间：部署记录的 created_at（文档样例带 +08:00）
+    assert all(s.created_at == pytest.approx(1794283200.0) for s in states)
     pages = [b["page_index"] for b in platform.bodies("list")]
     assert pages == [1, 2, 3, 4]
     assert platform.count("containers") == 0  # list 只看部署记录

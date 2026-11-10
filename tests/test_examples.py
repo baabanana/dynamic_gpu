@@ -12,6 +12,7 @@ import importlib.util
 import json
 import py_compile
 import re
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -411,6 +412,7 @@ def fake_ultralytics(monkeypatch):
             last = weights / "last.pt"
             for epoch in range(2):
                 last.write_bytes(f"epoch {epoch}".encode())
+                (weights / "best.pt").write_bytes(f"best {epoch}".encode())
                 for func in self.callbacks.get("on_model_save", []):
                     func(SimpleNamespace(last=last, epoch=epoch))
 
@@ -499,6 +501,59 @@ def test_main_training_error_propagates_without_done(train, tmp_path, fake_ultra
     with pytest.raises(RuntimeError):
         train.main(_dgpu_env(tmp_path))
     assert not (tmp_path / "output" / "DONE").exists()
+    assert not (tmp_path / "ckpt" / train.COMPLETE_NAME).exists()
+
+
+def test_main_records_completion_in_ckpt_before_done(train, tmp_path, fake_ultralytics):
+    _make_dataset(tmp_path)
+    assert train.main(_dgpu_env(tmp_path)) == 0
+    ckpt = tmp_path / "ckpt"
+    marker = json.loads((ckpt / train.COMPLETE_NAME).read_text(encoding="utf-8"))
+    assert marker["final_weights"] == ["best.pt", "last.pt"]
+    assert (ckpt / "final" / "best.pt").read_bytes() == b"best 1"
+    assert (ckpt / "final" / "last.pt").read_bytes() == b"epoch 1"
+    assert _no_tmp_files(tmp_path) == []
+
+
+def test_retry_after_dying_between_training_and_done_does_not_retrain(
+    train, tmp_path, fake_ultralytics, monkeypatch
+):
+    """机器在训练完之后、写 DONE 之前宕机：$DGPU_CKPT 恢复了（含完成标记），$DGPU_OUTPUT 没有。
+    重试不能从头训练（精简过的 last.pt 不能续跑），而是把权重放回输出目录再写 DONE。"""
+    _make_dataset(tmp_path)
+    real_write_done = train.write_done
+
+    def machine_dies(output_dir, info):
+        raise SystemExit("host lost")
+
+    monkeypatch.setattr(train, "write_done", machine_dies)
+    with pytest.raises(SystemExit):
+        train.main(_dgpu_env(tmp_path))
+    assert (tmp_path / "ckpt" / train.COMPLETE_NAME).exists()
+
+    # 换机重试：ckpt/ 从存储恢复，output/ 是空的，训练结束后的 last.pt 不能续跑
+    shutil.rmtree(tmp_path / "output")
+    (tmp_path / "output").mkdir()
+    monkeypatch.setattr(train, "write_done", real_write_done)
+    monkeypatch.setattr(train, "load_checkpoint", lambda path: {"epoch": -1})
+    fake_ultralytics.created.clear()
+
+    assert train.main(_dgpu_env(tmp_path, DGPU_RESUME="1", DGPU_ATTEMPT="2")) == 0
+    assert fake_ultralytics.created == []  # 没有重新训练
+    weights = tmp_path / "output" / "run" / "weights"
+    assert (weights / "best.pt").read_bytes() == b"best 1"
+    assert (weights / "last.pt").read_bytes() == b"epoch 1"
+    done = json.loads((tmp_path / "output" / "DONE").read_text(encoding="utf-8"))
+    assert done["recovered"] is True and done["restored"] == ["best.pt", "last.pt"]
+    assert _no_tmp_files(tmp_path) == []
+
+
+def test_unreadable_completion_marker_is_ignored(train, tmp_path, fake_ultralytics):
+    _make_dataset(tmp_path)
+    (tmp_path / "ckpt").mkdir()
+    (tmp_path / "ckpt" / train.COMPLETE_NAME).write_text("{half", encoding="utf-8")
+    assert train.main(_dgpu_env(tmp_path)) == 0
+    assert len(fake_ultralytics.created) == 1  # 照常训练
 
 
 # ---------------------------------------------------------------- 文档：命令和参数
