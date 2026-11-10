@@ -61,8 +61,13 @@ class BundleError(DgpuError):
     """bundle 构建或启动命令生成失败。"""
 
 
+FETCH_USER_AGENT = "dgpu-bundle-fetch"
+
+
 def default_fetch(url: str) -> bytes:
-    with urllib.request.urlopen(url, timeout=300) as response:  # 固定的 https 地址
+    # downloads.rclone.org 对 Python 默认的 User-Agent 返回 403（2026-11-10 实测），所以显式给一个
+    request = urllib.request.Request(url, headers={"User-Agent": FETCH_USER_AGENT})
+    with urllib.request.urlopen(request, timeout=300) as response:  # 固定的 https 地址
         return response.read()
 
 

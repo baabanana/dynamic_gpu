@@ -297,3 +297,29 @@ def test_bootstrap_command_fits_with_the_longest_job_id_and_bucket_name():
         launch_url=presigned(layout.secrets_key(job_id, 99)),
     )
     assert len(command) <= bundle.MAX_BOOTSTRAP_LEN - 200, len(command)
+
+
+def test_default_fetch_sends_an_explicit_user_agent(monkeypatch):
+    """downloads.rclone.org 拒绝 Python 默认的 User-Agent（真实探针里遇到 403）。"""
+    from dgpu import bundle
+
+    seen = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"payload"
+
+    def fake_urlopen(request, timeout):
+        seen["ua"] = request.get_header("User-agent")
+        seen["url"] = request.full_url
+        return _Response()
+
+    monkeypatch.setattr(bundle.urllib.request, "urlopen", fake_urlopen)
+    assert bundle.default_fetch("https://example.invalid/x.zip") == b"payload"
+    assert seen == {"ua": bundle.FETCH_USER_AGENT, "url": "https://example.invalid/x.zip"}
