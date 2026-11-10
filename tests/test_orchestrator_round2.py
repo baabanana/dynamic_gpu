@@ -154,10 +154,15 @@ def test_f1_abort_waits_the_window_and_a_second_ctrl_c_skips_it(tmp_path):
     backend = use_backend(world, LaggyBackend(world, hidden={"o1": 600.0}))
     backend.raise_after_create["o1"] = KeyboardInterrupt()  # create 还没返回就 Ctrl-C
     pressed: list[int] = []
+    during_wait: dict = {}
 
     def second_ctrl_c(w: World) -> None:
         if not pressed and any("再按一次 Ctrl-C" in line for line in w.messages):
             pressed.append(w.sleeps)
+            # 等待期间（比如被 SIGKILL）：启动文档已经删了，标签已经记下了
+            job = only_job_id(w)
+            during_wait["secrets"] = [k for k in w.store.objects if "/secrets-" in k]
+            during_wait["suspects"] = suspects(w, job)
             raise KeyboardInterrupt()
 
     world.on_sleep.append(second_ctrl_c)
@@ -165,6 +170,7 @@ def test_f1_abort_waits_the_window_and_a_second_ctrl_c_skips_it(tmp_path):
         world.orchestrator().submit(make_spec(tmp_path))
     job_id = only_job_id(world)
     late = layout.label(job_id, 1)
+    assert during_wait == {"secrets": [], "suspects": [late]}
     lookups = [c for c in backend.calls if c == ("list", late)]
     assert pressed and len(lookups) < lookups_in(world.config.create_lookup_s)  # 没等满
     assert any("跳过等待" in line for line in world.messages)

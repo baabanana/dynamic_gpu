@@ -1218,7 +1218,6 @@ class Orchestrator:
                 if not (exc.retryable or isinstance(exc, OfferUnavailable)):
                     raise DgpuError(
                         f"平台拒绝创建实例（{ctx.backend_name} offer {offer.id}）：{exc}"
-                        "（没有创建实例）"
                     ) from None
                 detail = f"offer {offer.id} 不可用：{exc}"
                 self.echo(detail + "，换下一台")
@@ -1508,6 +1507,9 @@ class Orchestrator:
             self.echo(message)
             problems.append(message)
 
+        # create 已调用、还没拿到实例：这个标签的结果未知（在销毁 ctx.ref 之前判断，销毁会清空它）
+        current = ctx.label if (ctx.ref is None and ctx.create_unknown and ctx.label) else None
+
         # 1. 销毁已创建的实例
         destroyed: list[str] = []
         why = f"启动被中断（{how}）" if interrupted else "启动异常退出"
@@ -1528,9 +1530,19 @@ class Orchestrator:
             report("销毁实例", cleanup_exc)
 
         # 2. 创建结果未知的标签：这次的 create（查满窗口）和更早的可疑标签（再查一次）
-        current = ctx.label if (ctx.ref is None and ctx.create_unknown and ctx.label) else None
         labels = ([current] if current else []) + [x for x in ctx.suspects if x != current]
         unknown: list[str] = []
+        if current:
+            # 等之前先做两件事，等待中被 SIGKILL 也不留隐患：删掉启动文档（晚到的实例起不了
+            # runner，Vast 上 bootstrap 会自毁），把标签记进 attempt.json（status、wait、gc 看得到）
+            try:
+                self.store.delete(layout.secrets_key(ctx.job_id, launch_attempt))
+            except BaseException as cleanup_exc:
+                report("删除启动文档", cleanup_exc)
+            try:
+                self._add_suspects(ctx, [current])
+            except BaseException as cleanup_exc:
+                report("记录结果未知的标签", cleanup_exc)
         if labels:
             found: dict[str, list[InstanceRef]] = {}
             until = self._lookup_deadline(ctx) if current else self.clock()
@@ -1554,20 +1566,30 @@ class Orchestrator:
                         resolved.append(label)
             except BaseException as cleanup_exc:
                 report("销毁按标签找到的实例", cleanup_exc)
-            unknown = [label for label in labels if label not in resolved]
+            # 查到了但销毁失败的标签已经作为 DestroyFailed 大声报告过，同样留在可疑标签里
+            leftover = [label for label in labels if label not in resolved]
+            unknown = [label for label in leftover if label not in found]
             ctx.suspects = []
-            if resolved:
+            try:
                 self._remove_suspects(ctx.job_id, resolved)
+            except BaseException as cleanup_exc:
+                report("更新可疑标签", cleanup_exc)
+        else:
+            leftover = []
         fenced_by_other = isinstance(exc, AttemptConflict | _CancelRequested)
+        if leftover:
+            try:
+                if current in leftover and not fenced_by_other:
+                    self._fence_unknown_attempt(ctx, current, leftover)
+                else:
+                    self._add_suspects(ctx, leftover)
+            except BaseException as cleanup_exc:
+                report("记录结果未知的标签", cleanup_exc)
         if unknown:
             message = self._suspect_warning(unknown)
             self.echo(message)
             problems.append(message)
             try:
-                if current in unknown and not fenced_by_other:
-                    self._fence_unknown_attempt(ctx, current, unknown)
-                else:
-                    self._add_suspects(ctx, unknown)
                 self._event(
                     ctx.job_id,
                     states.EV_CREATE_FAILED,
@@ -1576,7 +1598,7 @@ class Orchestrator:
                     {"why": "create_outcome_unknown", "suspect_labels": unknown},
                 )
             except BaseException as cleanup_exc:
-                report("记录结果未知的标签", cleanup_exc)
+                report("写事件", cleanup_exc)
         # 3. 写终态（runner 已写或已被别的进程接管时不写）
         if not fenced_by_other:
             if interrupted:
@@ -1696,15 +1718,15 @@ class Orchestrator:
         """这些标签的实例已经找到并销毁（或接管），从 attempt.json 的可疑标签里去掉。"""
         if not labels:
             return
-        got = self._read_doc(layout.attempt_key(job_id), "attempt.json")
-        if got is None or not any(x in (got[0].get(SUSPECT_FIELD) or []) for x in labels):
-            return
 
         def remove(doc: dict[str, Any]) -> dict[str, Any]:
             doc[SUSPECT_FIELD] = [x for x in doc.get(SUSPECT_FIELD) or [] if x not in labels]
             return doc
 
         try:
+            got = self._read_doc(layout.attempt_key(job_id), "attempt.json")
+            if got is None or not any(x in (got[0].get(SUSPECT_FIELD) or []) for x in labels):
+                return
             self._update_attempt(job_id, remove)
         except DgpuError as exc:
             self.echo(f"警告：更新 attempt.json 的可疑标签失败（{exc}），不影响任务。")
@@ -1734,7 +1756,8 @@ class Orchestrator:
                 resolved.append(label)
                 ctx.suspects.remove(label)
         self._remove_suspects(ctx.job_id, resolved)
-        unknown = [label for label in labels if label not in resolved]
+        # 查到了但销毁失败的（_destroy 已经大声报告）留在 attempt.json 的可疑标签里，不算“没找到”
+        unknown = [label for label in labels if label not in found]
         if unknown:
             message = self._suspect_warning(unknown)
             self.echo(message)
