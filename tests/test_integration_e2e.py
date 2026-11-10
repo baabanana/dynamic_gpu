@@ -41,8 +41,11 @@ from dgpu import bundle, layout, packaging, states
 from dgpu.bundle import RunnerBundler
 from dgpu.config import parse_config
 from dgpu.contracts import (
+    INST_GONE,
+    INST_LOADING,
     INST_RUNNING,
     InstanceRef,
+    InstanceState,
     LaunchSpec,
     Offer,
     PreconditionFailed,
@@ -54,7 +57,7 @@ from dgpu.contracts import (
 from dgpu.orchestrator import Deps, Orchestrator
 from dgpu.runner import procs
 from dgpu.spec import load_spec
-from dgpu.testing import FakeBackend, make_offer
+from dgpu.testing import FakeBackend, FakeBundler, make_offer
 from test_runner_harness import FAST_TUNING, TESTS_DIR, WRAPPER, old_python
 
 MAIN_VAST_KEY = "VAST-MAIN-KEY-integration-must-never-leak"
@@ -890,3 +893,200 @@ def test_zombie_old_attempt_is_fenced_by_the_retry(cloud):
     assert cloud.info(job_id, 2)["ckpt"] == {"epoch": 1, "attempt": "1"}
     assert "发现更新的 attempt 2" in (root / "logs" / "attempt-1.log").read_text()
     cloud.assert_clean()
+
+
+# ======================================================= 真实的 dgpu 进程收到 SIGTERM / SIGHUP
+# 评审 A1：submit 启动阶段被系统停止（SIGTERM）或终端关闭（SIGHUP）时，实例必须被销毁。
+# 子进程里跑真实的 cli.main()（信号处理、编排、打包、spec 解析都是真的）；平台记录和存储
+# 都是文件，父进程能看到。“实例”是一个新会话里的 sleep 进程，一直停在 loading。
+
+
+class FileBackend(FakeBackend):
+    """平台记录放在 <root>/<实例 ID>.json；实例是一个独立会话里的 sleep 进程。"""
+
+    def __init__(self, root: Path):
+        super().__init__("vast", [make_offer("o1", price=0.2)])
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.procs: dict[str, subprocess.Popen] = {}
+
+    def _record(self, instance_id: str) -> Path:
+        return self.root / f"{instance_id}.json"
+
+    def create(self, offer: Offer, launch: LaunchSpec) -> InstanceRef:
+        self.calls.append(("create", offer.id))
+        instance_id = str(time.time_ns())
+        proc = subprocess.Popen(
+            ["sleep", "600"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.procs[instance_id] = proc
+        record = {"label": launch.label, "pid": proc.pid}
+        self._record(instance_id).write_text(json.dumps(record))
+        return InstanceRef(backend=self.name, id=instance_id, label=launch.label)
+
+    def _state(self, instance_id: str) -> InstanceState | None:
+        try:
+            record = json.loads(self._record(instance_id).read_text())
+        except FileNotFoundError:
+            return None
+        ref = InstanceRef(backend=self.name, id=instance_id, label=record["label"])
+        return InstanceState(ref=ref, phase=INST_LOADING, raw_status="loading", created_at=0.0)
+
+    def get(self, ref: InstanceRef) -> InstanceState:
+        self.calls.append(("get", ref.id))
+        return self._state(ref.id) or InstanceState(ref=ref, phase=INST_GONE)
+
+    def list(self, label_prefix: str = layout.LABEL_PREFIX) -> list[InstanceState]:
+        if not label_prefix.startswith(layout.LABEL_PREFIX):
+            raise ValueError(label_prefix)
+        found = [self._state(path.stem) for path in sorted(self.root.glob("*.json"))]
+        return [s for s in found if s is not None and s.ref.label.startswith(label_prefix)]
+
+    def destroy(self, ref: InstanceRef) -> None:
+        self.calls.append(("destroy", ref.id))
+        path = self._record(ref.id)
+        try:
+            pid = json.loads(path.read_text())["pid"]
+        except FileNotFoundError:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pid, signal.SIGKILL)
+        proc = self.procs.pop(ref.id, None)
+        if proc is not None:
+            proc.wait(10)
+        path.unlink()
+
+
+def _signal_child_config():
+    return parse_config(
+        {
+            "startup_timeout_min": 1,
+            "runner_timeout_min": 1,
+            "stores": {
+                "r2": {
+                    "endpoint": "https://r2.test.invalid",
+                    "bucket": "test-bucket",
+                    "access_key_id": "store-key-integration",
+                    "secret_access_key": STORE_SECRET,
+                }
+            },
+            "backends": {"vast": {"api_key": MAIN_VAST_KEY}},
+        },
+        env={},
+    )
+
+
+def _signal_child_deps(root: Path, *, echo) -> Deps:
+    config = _signal_child_config()
+    return Deps(
+        config=config,
+        store=DirStore(root / "remote", config.stores["r2"]),
+        backends={"vast": FileBackend(root / "platform")},
+        bundler=FakeBundler(),
+        pack_code=packaging.pack_code,
+        resolve_data=packaging.resolve_data,
+        scan_data=packaging.scan_dataset,
+        clock=time.time,
+        sleep=lambda seconds: time.sleep(min(seconds, 0.05)),
+        echo=echo,
+        load_spec=load_spec,
+    )
+
+
+def _submit_child_main(root: str, job_file: str) -> None:
+    """子进程入口：`dgpu submit <job_file>`，经过真实的 cli.main()。"""
+    from dgpu import cli
+
+    cli.build_deps = lambda config_path: _signal_child_deps(Path(root), echo=cli._progress)
+    sys.argv = ["dgpu", "submit", job_file]
+    cli.main()
+
+
+@pytest.mark.parametrize(("signum", "code"), [(signal.SIGTERM, 143), (signal.SIGHUP, 129)])
+def test_signal_to_a_real_dgpu_submit_destroys_its_instance(tmp_path, signum, code):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "train.py").write_text("print('train')\n")
+    job_file = project / "job.yaml"
+    job_file.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "name": "e2e-signal",
+                "backend": "vast",
+                "image": {"vast": "local/e2e:1"},
+                "run": "python train.py",
+                "gpu": {"names": ["RTX 3090"], "count": 1},
+                "limits": {"max_hours": 0.05, "max_usd_per_hour": 1.0},
+            }
+        )
+    )
+    src = TESTS_DIR.parent / "src"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(TESTS_DIR), str(src), *([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])]
+    )
+    code_line = (
+        "import test_integration_e2e as t; "
+        f"t._submit_child_main({str(tmp_path)!r}, {str(job_file)!r})"
+    )
+    log_path = tmp_path / "child.log"
+    with open(log_path, "wb") as log:
+        child = subprocess.Popen(
+            [sys.executable, "-c", code_line],
+            cwd=tmp_path,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    deps = _signal_child_deps(tmp_path, echo=lambda message: None)
+    store = deps.store
+    try:
+        job_id = None
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:  # 等子进程创建实例、写 STARTING
+            jobs = store.list_dirs(layout.jobs_prefix())
+            got = store.get_json(layout.status_key(jobs[0])) if jobs else None
+            if got is not None and got[0]["phase"] == states.STARTING:
+                job_id = jobs[0]
+                break
+            assert child.poll() is None, log_path.read_text()
+            time.sleep(0.05)
+        assert job_id is not None, log_path.read_text()
+        time.sleep(0.5)  # 让子进程至少查一次平台上的实例状态
+        (record,) = list((tmp_path / "platform").glob("*.json"))
+        instance_pid = json.loads(record.read_text())["pid"]
+        os.kill(instance_pid, 0)  # 实例正在“计费”
+
+        child.send_signal(signum)
+        returncode = child.wait(60)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(10)
+    output = log_path.read_text()
+    assert returncode == code, output
+    name = signal.Signals(signum).name
+    assert f"收到 {name}，已清理并退出" in output
+
+    # 实例被销毁：平台上没有记录，进程也没了
+    assert list((tmp_path / "platform").glob("*.json")) == [], output
+    for _ in range(100):
+        try:
+            os.kill(instance_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError(f"instance process {instance_pid} is still alive\n{output}")
+    status = store.get_json(layout.status_key(job_id))[0]
+    assert status["phase"] == states.CANCELLED and name in status["message"], status
+    assert "已销毁实例" in status["message"]
+    assert not store.exists(layout.secrets_key(job_id, 1))  # 启动文档（含存储凭据）已删
+    report = Orchestrator(deps).gc(dry_run=True)
+    assert report.destroyed == [] and report.unknown == [] and report.failed == []
