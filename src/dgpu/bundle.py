@@ -264,104 +264,154 @@ class RunnerBundler:
 
 
 # ---------------------------------------------------------------- bootstrap 脚本
-# 在实例上以 `python3 -c` 运行（Python ≥ 3.8，只用标准库），参数：bundle URL、sha256、启动文档 URL。
+# 在实例上以 `python3 -c` 运行（只用标准库），参数：bundle URL、sha256、启动文档 URL。
 # 1. 工作目录：$DGPU_WORK_ROOT；否则有 AutoDL 数据盘 /root/autodl-tmp 就用它下面的 dgpu/，
 #    再否则 /workspace/dgpu（states.DEFAULT_WORK_ROOT）。
 # 2. 非阻塞地拿 <root>/boot.lock：被占用（EAGAIN）说明同一个任务的 runner 还活着，什么都不做
-#    （幂等）。文件系统不支持 flock（其他错误）时记一行继续，由 boot 按 pid 文件判断。
-# 3. bundle 不在本地就下载（重试 10 次，指数退避），校验 sha256，解压到 bundle-<sha256>/。
-# 4. 启动文档不在本地就下载到 launch.json（0600）。容器重启时预签名 URL 可能已过期，
-#    所以已有的文件直接复用。
-# 5. 带着锁 exec `python3 -m dgpu.runner.boot`：Vast 上它启动 watchdog 和 runner 后返回，
-#    AutoDL 上它留在前台直到两者都退出（容器只在 cmd 运行期间存在）。
+#    （幂等，退出 0，不自毁）。文件系统不支持 flock（其他错误）时记一行继续，由 boot 按 pid
+#    文件判断。
+# 3. Python 不到 3.8 就放弃（runner 需要 3.8）。
+# 4. bundle 不在本地就下载（重试 10 次，指数退避；HTTP 403/404 试 3 次就放弃），校验 sha256，
+#    解压到 bundle-<sha256>/。
+# 5. 启动文档不在本地就下载到 launch.json（0600）。容器重启时预签名 URL 可能已过期，
+#    所以已有的文件直接复用。启动文档已被 CLI 删除（比如创建结果未知、晚到的实例）时下载
+#    失败，走第 7 步。
+# 6. 导入 bundle 里的 boot、runner、watchdog（Python 版本不兼容等错误在这里暴露），然后在本
+#    进程里带着锁运行 boot：Vast 上它启动 watchdog 和 runner 后返回，AutoDL 上它留在前台直到
+#    两者都退出（容器只在 cmd 运行期间存在）。boot 自己在启动 runner 之前放弃时也会自毁。
+# 7. 第 3–6 步任何一步放弃（runner 没有起来）：Vast 上用容器自己的 CONTAINER_ID 和
+#    CONTAINER_API_KEY（本进程环境或 1 号进程的环境）调 DELETE /api/v0/instances/<id>/ 自毁。
+#    和 runner/destroy.py 同一个接口，但这里 bundle 可能还没下载下来，所以是精简的内联版本：
+#    不需要存储凭据，默认重试 10 次、每次时限 30 秒、间隔 30 秒（DGPU_RUNNER_TUNING 里的
+#    vast_api_base、destroy_attempts、destroy_interval_s 可以覆盖），然后退出 1。没有容器 key
+#    （AutoDL）就直接退出 1，cmd 结束容器即释放（评审 F1）。启动命令因此长了约 700 字符
+#    （test_bundle 用最长的标签和 bucket 名检查不超过 4000）。
 # 诊断信息写进 stderr（平台日志）和 logs/bootstrap.log（0600，runner 启动后随日志上传）：
-# Python 版本、工作目录、每次下载失败的异常类型和说明、放弃时的磁盘余量。日志里的 URL
-# 一律替换成 <url>（预签名 URL 带签名）。
+# Python 版本、工作目录、每次下载失败的异常类型和说明、放弃的原因和磁盘余量、自毁的结果。
+# 日志里的 URL 一律替换成 <url>（预签名 URL 带签名），容器 key 不进日志。
 
 BOOTSTRAP_SOURCE = r"""
-import fcntl, hashlib, os, re, shutil, sys, tarfile, time, urllib.request
+import fcntl, hashlib, json, os, re, shutil, sys, tarfile, time, urllib.request as U
 B, H, L = sys.argv[1:4]
-R = os.environ.get("DGPU_WORK_ROOT") or (
+E = os.environ
+R = E.get("DGPU_WORK_ROOT") or (
     "/root/autodl-tmp/dgpu" if os.path.isdir("/root/autodl-tmp") else "/workspace/dgpu")
-os.makedirs(R + "/logs", 0o700, exist_ok=True)
+try:
+    T = dict(json.loads(E.get("DGPU_RUNNER_TUNING") or "{}"))
+except Exception:
+    T = {}
 
 
-def log(msg):
-    msg = re.sub(r"[A-Za-z][A-Za-z0-9+.-]*://\S+", "<url>", msg)
-    line = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " [bootstrap] " + msg
-    print(line, file=sys.stderr, flush=True)
+def log(m):
+    m = re.sub(r"[A-Za-z][\w+.-]*://\S+", "<url>", m)
+    m = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " [bootstrap] " + m
+    print(m, file=sys.stderr, flush=True)
     try:
         fd = os.open(R + "/logs/bootstrap.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a") as f:
-            f.write(line + "\n")
+            f.write(m + "\n")
     except OSError:
         pass
 
 
-log("python %s, uid %d, work root %s" % (sys.version.split()[0], os.getuid(), R))
-lock = os.open(R + "/boot.lock", os.O_RDWR | os.O_CREAT, 0o600)
-try:
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except BlockingIOError:
-    log("a runner is already active in " + R + "; nothing to do")
-    sys.exit(0)
-except OSError as e:
-    log("flock unsupported here (%s); continuing without the lock" % e)
+def die(why):
+    log("giving up before the runner started: " + why)
+    e = dict(E)
+    try:
+        e.update(x.split("=", 1) for x in open("/proc/1/environ").read().split("\0") if "=" in x)
+    except OSError:
+        pass
+    i, k = e.get("CONTAINER_ID", ""), e.get("CONTAINER_API_KEY", "")
+    if not (re.match(r"^[\w-]{1,64}$", i) and k):
+        log("no Vast container key: exiting, AutoDL releases the container")
+        sys.exit(1)
+    for a in range(1, int(T.get("destroy_attempts", 10)) + 1):
+        try:
+            q = U.Request(T.get("vast_api_base", "https://console.vast.ai") + "/api/v0/instances/"
+                          + i + "/", method="DELETE", headers={"Authorization": "Bearer " + k})
+            o = U.build_opener(U.ProxyHandler(U.getproxies_environment()))
+            with o.open(q, timeout=30) as r:
+                if b"false" not in r.read():
+                    log("self-destroy of instance %s accepted" % i)
+                    sys.exit(1)
+        except Exception as x:
+            x = "%s: %.200s" % (type(x).__name__, str(x).replace(k, "*"))
+            log("self-destroy try %d failed: %s" % (a, x))
+        time.sleep(float(T.get("destroy_interval_s", 30)))
+    sys.exit(1)
 
 
 def get(url, path, sha=None):
-    wait = float(os.environ.get("DGPU_BOOT_BACKOFF_S", "5"))
     for i in range(10):
         try:
-            with urllib.request.urlopen(url, timeout=120) as r, open(path + ".part", "wb") as f:
+            with U.urlopen(url, timeout=120) as r, open(path + ".part", "wb") as f:
                 shutil.copyfileobj(r, f, 1 << 20)
             if sha:
                 h = hashlib.sha256()
                 with open(path + ".part", "rb") as f:
-                    for block in iter(lambda: f.read(1 << 20), b""):
-                        h.update(block)
+                    for b in iter(lambda: f.read(1 << 20), b""):
+                        h.update(b)
                 if h.hexdigest() != sha:
                     raise ValueError("sha256 mismatch")
-            os.replace(path + ".part", path)
-            return
+            return os.replace(path + ".part", path)
         except Exception as e:
-            log("download of %s failed (%s: %s), try %d/10"
-                % (os.path.basename(path), type(e).__name__, str(e)[:300], i + 1))
+            log("download of %s failed (%s: %.300s), try %d/10"
+                % (os.path.basename(path), type(e).__name__, e, i + 1))
+            if getattr(e, "code", 0) in (403, 404) and i > 1:
+                break
             if i < 9:
-                time.sleep(min(60.0, wait * 2 ** i))
+                time.sleep(min(60.0, float(E.get("DGPU_BOOT_BACKOFF_S", 5)) * 2 ** i))
+    raise RuntimeError("giving up on %s; %d MB free" % (
+        os.path.basename(path), shutil.disk_usage(R).free >> 20))
+
+
+def main():
+    os.makedirs(R + "/logs", 0o700, exist_ok=True)
+    log("python %s, uid %d, work root %s" % (sys.version.split()[0], os.getuid(), R))
+    lock = os.open(R + "/boot.lock", os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        free = "%d MB free" % (shutil.disk_usage(R).free >> 20)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("a runner is already active in " + R + "; nothing to do")
+        sys.exit(0)
     except OSError as e:
-        free = "disk usage unknown (%s)" % e
-    log("giving up on %s; %s" % (os.path.basename(path), free))
-    sys.exit(1)
+        log("flock unsupported here (%s); continuing without the lock" % e)
+    if sys.version_info < (3, 8):
+        raise RuntimeError("dgpu needs python 3.8 or newer")
+    D = R + "/bundle-" + H
+    if not os.path.isdir(D):
+        get(B, R + "/bundle.tgz", H)
+        shutil.rmtree(D + ".tmp", ignore_errors=True)
+        with tarfile.open(R + "/bundle.tgz") as t:
+            f = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+            t.extractall(D + ".tmp", **f)
+        os.rename(D + ".tmp", D)
+        os.unlink(R + "/bundle.tgz")
+    F = R + "/launch.json"
+    if not os.path.isfile(F):
+        old = os.umask(0o077)
+        try:
+            get(L, F)
+        finally:
+            os.umask(old)
+    os.chmod(F, 0o600)
+    os.set_inheritable(lock, True)
+    os.chdir(D)
+    sys.path.insert(0, D)
+    from dgpu.runner import boot, main as _r, watchdog as _w  # import errors show up here
+    return boot, lock
 
 
-D = R + "/bundle-" + H
-if not os.path.isdir(D):
-    get(B, R + "/bundle.tgz", H)
-    shutil.rmtree(D + ".tmp", ignore_errors=True)
-    with tarfile.open(R + "/bundle.tgz") as t:
-        if hasattr(tarfile, "data_filter"):
-            t.extractall(D + ".tmp", filter="data")
-        else:
-            t.extractall(D + ".tmp")
-    os.rename(D + ".tmp", D)
-    os.unlink(R + "/bundle.tgz")
-F = R + "/launch.json"
-if not os.path.isfile(F):
-    old = os.umask(0o077)
-    get(L, F)
-    os.umask(old)
-os.chmod(F, 0o600)
-os.set_inheritable(lock, True)
-os.chdir(D)
+try:
+    boot, lock = main()
+except Exception as e:
+    die("%s: %s" % (type(e).__name__, e))
 log("bundle ready; starting dgpu.runner.boot")
-argv = [sys.executable, "-m", "dgpu.runner.boot", "--work-root", R, "--lock-fd", str(lock)]
-os.execv(sys.executable, argv)
+sys.exit(boot.main(["--work-root", R, "--lock-fd", str(lock)]))
 """
 
-_BOOTSTRAP_PAYLOAD = base64.b64encode(zlib.compress(BOOTSTRAP_SOURCE.encode("utf-8"), 9)).decode()
+# base85 比 base64 短约 6%；它的字母表里没有引号和反斜杠，放在 Python 字符串和 shell 单引号里都安全
+_BOOTSTRAP_PAYLOAD = base64.b85encode(zlib.compress(BOOTSTRAP_SOURCE.encode("utf-8"), 9)).decode()
 _BOOTSTRAP_LOADER = (
-    'import base64,zlib;exec(zlib.decompress(base64.b64decode("' + _BOOTSTRAP_PAYLOAD + '")))'
+    'import base64,zlib;exec(zlib.decompress(base64.b85decode("' + _BOOTSTRAP_PAYLOAD + '")))'
 )

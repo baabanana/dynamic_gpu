@@ -2,6 +2,9 @@
 
     python3 -m dgpu.runner.boot --work-root <root> [--lock-fd N] [--mode auto|detach|wait]
 
+- 在启动 runner 之前就放弃（工作目录建不了、runner 和 watchdog 都起不来、意外的异常）时
+  自毁：Vast 上用容器自己的 key 调 API（destroy.py），AutoDL 上退出即可（评审 F1）。“已有
+  runner 在运行”的路径什么都不做，绝不自毁。
 - 幂等：持有 <root>/boot.lock 的 flock 才继续。bootstrap 已经拿到锁时用 --lock-fd 传进来；
   锁被别人持有（同一个启动文档的 runner 还活着）就什么都不做，返回 0。只有 EAGAIN
   （BlockingIOError）表示锁被占用；文件系统不支持 flock 时记一行，改看 run/runner.pid 里的
@@ -28,16 +31,19 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from typing import Any, List, Optional, Tuple
 
 from dgpu import states
 from dgpu.runner import procs
+from dgpu.runner.destroy import SelfDestroyer
 from dgpu.runner.util import (
     WORK_ROOT_ENV,
     Paths,
     boot_hard_deadline_s,
     boot_spec_wait_s,
     diag,
+    exc_text,
     guess_backend,
     load_launch,
     load_tuning,
@@ -138,6 +144,39 @@ def runner_running(paths: Paths) -> bool:
     return line is None or RUNNER_MODULE in line
 
 
+def give_up(why: str, tuning: dict, backend: Optional[str] = None) -> int:
+    """boot 在 runner 启动之前就放弃：没有 runner 和 watchdog 会收尾，自己销毁实例（评审 F1）。
+
+    Vast 上用容器自己的 CONTAINER_ID / CONTAINER_API_KEY 调 API（runner/destroy.py，不需要
+    存储凭据），有界重试；AutoDL 上退出即可，cmd 结束容器就释放。返回 boot 的退出码。
+    """
+    diag(COMPONENT, "giving up before the runner started: %s" % why)
+    destroyer = SelfDestroyer(
+        backend or guess_backend(),
+        attempts=tuning["destroy_attempts"],
+        interval_s=tuning["destroy_interval_s"],
+        api_base=tuning["vast_api_base"],
+        timeout_s=tuning["destroy_http_timeout_s"],
+        component=COMPONENT,
+    )
+    try:
+        result = destroyer.destroy()
+    except Exception as exc:  # 自毁本身出错也只能记下来退出
+        diag(COMPONENT, "self-destroy raised: %s" % exc_text(exc))
+        return states.EXIT_FAILED
+    diag(
+        COMPONENT,
+        "self-destroy %s (%s, %d attempts)%s"
+        % (
+            "accepted" if result.ok else "FAILED",
+            result.method or "-",
+            result.attempts,
+            "" if result.ok else ": %s; run dgpu gc to remove this instance" % result.error,
+        ),
+    )
+    return states.EXIT_FAILED
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="dgpu.runner.boot")
     parser.add_argument(
@@ -147,11 +186,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--lock-fd", type=int, default=None)
     parser.add_argument("--mode", choices=("auto", "detach", "wait"), default="auto")
     args = parser.parse_args(argv)
+    tuning = load_tuning()
+    state = {"runner_started": False, "backend": None}  # type: dict
+    try:
+        return _main(args, tuning, state)
+    except Exception as exc:
+        if state["runner_started"]:
+            raise  # runner 已经在运行：它和 watchdog 负责收尾和自毁
+        return give_up(
+            "boot error: %s\n%s" % (exc_text(exc), traceback.format_exc()),
+            tuning,
+            state["backend"],
+        )
 
+
+def _main(args: argparse.Namespace, tuning: dict, state: dict) -> int:
     paths = Paths(args.work_root)
     paths.ensure()
     launch_path = os.path.abspath(args.launch or paths.launch)
-    tuning = load_tuning()
 
     if args.lock_fd is not None:
         lock_fd = args.lock_fd  # bootstrap 已经锁住（或确认了文件系统不支持 flock）
@@ -168,7 +220,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         attempt = int(launch["attempt"])
     except (ValueError, TypeError, KeyError) as exc:
         backend = guess_backend()
+        # runner 照样启动：它读不到启动文档就按 FAILED(preflight) 收尾并自毁
         diag(COMPONENT, "launch document unusable (%s); assuming backend %s" % (exc, backend))
+    state["backend"] = backend
 
     mode = args.mode
     if mode == "auto":
@@ -207,11 +261,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             python, RUNNER_MODULE, paths, "runner.log", [lock_fd, alive_fd], launch_path
         )
     except OSError as exc:
-        # watchdog 会看到 runner.alive 被释放，按 runner 崩溃处理并自毁
         diag(COMPONENT, "cannot start the runner: %s" % exc)
         os.close(alive_fd)
         os.close(lock_fd)
+        if watchdog is None:
+            # 两个都没起来：没人收尾，自己销毁实例
+            return give_up("cannot start the runner nor the watchdog: %s" % exc, tuning, backend)
+        # watchdog 会看到 runner.alive 被释放，按 runner 崩溃处理并自毁
         return 1
+    state["runner_started"] = True
     _write_pid(paths.runner_pid, runner.pid)
     # runner.alive 只由 runner 持有（boot 自己留着的话 watchdog 永远看不到 runner 退出）
     os.close(alive_fd)

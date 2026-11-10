@@ -268,6 +268,32 @@ def test_bootstrap_loader_decodes_to_the_documented_source():
         bundle_url="https://x.invalid/b", bundle_sha256=SHA, launch_url="https://x.invalid/l"
     )
     loader = shlex.split(command)[3]
-    encoded = re.search(r'b64decode\("([A-Za-z0-9+/=]+)"\)', loader).group(1)
-    assert zlib.decompress(base64.b64decode(encoded)).decode() == bundle.BOOTSTRAP_SOURCE
+    encoded = re.search(r'b85decode\("([^"\\]+)"\)', loader).group(1)
+    assert zlib.decompress(base64.b85decode(encoded)).decode() == bundle.BOOTSTRAP_SOURCE
     compile(bundle.BOOTSTRAP_SOURCE, "<bootstrap>", "exec")
+
+
+def test_bootstrap_command_fits_with_the_longest_job_id_and_bucket_name():
+    """F1 的自毁逻辑让启动命令变长：最长的任务 ID（42 字符）、最长的 bucket 名（63 字符）、
+    两位数的 attempt 下也不超过 4000，并留出余量。"""
+    job_id = layout.new_job_id("x" * 60, now=0)
+    assert len(job_id) == 42
+    bucket = "b" * 63
+
+    def presigned(key: str) -> str:
+        return (
+            "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com/"
+            + bucket
+            + "/"
+            + key
+            + "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=0123456789abcdef0123456789abcdef"
+            "%2F20261110%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261110T101010Z"
+            "&X-Amz-Expires=4500&X-Amz-SignedHeaders=host&X-Amz-Signature=" + "f" * 64
+        )
+
+    command = RunnerBundler().bootstrap_command(
+        bundle_url=presigned(layout.tools_bundle_key(SHA)),
+        bundle_sha256=SHA,
+        launch_url=presigned(layout.secrets_key(job_id, 99)),
+    )
+    assert len(command) <= bundle.MAX_BOOTSTRAP_LEN - 200, len(command)
