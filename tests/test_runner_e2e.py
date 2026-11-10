@@ -135,13 +135,14 @@ def test_setup_failure_skips_run_uploads_log_and_destroys(harness):
     assert len(harness.server.calls) == 1
 
 
-def test_nonzero_exit_on_autodl_returns_failure_code(tmp_path):
-    """Row: training exits non-zero -> FAILED(exit_code), log uploaded; boot (AutoDL cmd)
-    exits non-zero only after everything stopped."""
+def test_nonzero_exit_on_autodl_is_recorded_and_cmd_exits_zero(tmp_path):
+    """Row: training exits non-zero -> FAILED(exit_code), log uploaded. Unreproduced item
+    (AutoDL exit code): boot (AutoDL cmd) exits 0 once the final status is in storage, whatever
+    the outcome, so a Job that restarts failed containers does not rerun a failed job."""
     h = Harness(tmp_path, backend="autodl")
     try:
         h.prepare(run="echo oops >&2; echo partial > $DGPU_OUTPUT/p.txt; exit 7")
-        assert h.start().wait(30) == states.EXIT_FAILED, h.diagnostics()
+        assert h.start().wait(30) == 0, h.diagnostics()
         status = h.status()
         assert (status["phase"], status["reason"], status["exit_code"]) == (
             states.FAILED,
@@ -390,8 +391,11 @@ def test_storage_unreachable_at_start_still_destroys(harness):
     assert len(harness.server.calls) == 1
     final = json.loads((harness.work / "run" / "final.json").read_text())
     assert (final["phase"], final["reason"]) == (states.FAILED, states.REASON_PREFLIGHT)
-    spooled = list((harness.work / "run" / "events-runner").glob("*.json"))
-    assert [json.loads(p.read_text())["name"] for p in spooled] == [states.EV_PREFLIGHT_FAILED]
+    spooled = sorted((harness.work / "run" / "events-runner").glob("*.json"))
+    docs = [json.loads(p.read_text()) for p in spooled]
+    assert docs[0]["name"] == states.EV_PREFLIGHT_FAILED
+    # the diagnostic logs could not be uploaded either; that is recorded too (locally)
+    assert all(d["name"] == states.EV_SYNC_FAILED for d in docs[1:]), docs
 
 
 @pytest.mark.parametrize("problem", ["no-gpu", "disk"])
@@ -415,7 +419,10 @@ def test_preflight_failure(harness, problem):
 
 
 def test_log_truncation_does_not_block_a_chatty_child(harness):
-    """Row: huge log -> keep draining, stop writing, log_truncated once; child never blocks."""
+    """Row: huge log -> keep draining, stop writing, log_truncated once; child never blocks.
+    The file stays bounded: the cap for training output, a reserve for the runner's notes and
+    the kept tail (B9)."""
+    harness.tuning.update(log_tail_kb=64, log_note_reserve_kb=64)
     code = {
         "chatty.py": "import sys\nline = 'x' * 1023 + '\\n'\n"
         "for _ in range(8 * 1024):\n    sys.stdout.write(line)\n"
@@ -427,8 +434,10 @@ def test_log_truncation_does_not_block_a_chatty_child(harness):
     assert harness.status()["phase"] == states.SUCCEEDED, harness.diagnostics()
     assert len(_events(harness, states.EV_LOG_TRUNCATED)) == 1
     local = harness.work / "logs" / "attempt-1.log"
-    assert 1024 * 1024 <= local.stat().st_size <= 1024 * 1024 + 4096
-    assert len(harness.log_text().encode()) <= 1024 * 1024 + 4096
+    bound = 1024 * 1024 + 64 * 1024 + 64 * 1024 + 4096
+    assert 1024 * 1024 <= local.stat().st_size <= bound
+    assert len(harness.log_text().encode()) <= bound
+    assert not list((harness.work / "logs").glob("attempt-1.log.tail.*")), "tail files folded in"
 
 
 def test_child_environment_is_scrubbed(harness):

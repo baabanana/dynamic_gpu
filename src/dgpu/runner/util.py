@@ -48,10 +48,19 @@ DEFAULT_TUNING = {
     # 公式里没算的零碎等待（SIGKILL 后等进程消失、每次存储操作至少 1 秒等）
     "watchdog_margin_s": 300.0,
     "watchdog_spec_wait_s": 1800.0,  # runner 一直没读到 spec 时，watchdog 最多等多久
-    "watchdog_sync_timeout_s": 600.0,  # runner 崩溃后 watchdog 尽力同步一次的时限
+    "watchdog_sync_timeout_s": 600.0,  # runner 崩溃或硬截止后 watchdog 尽力同步一次的时限
     "boot_watchdog_wait_s": 1800.0,  # AutoDL 前台模式：runner 退出后最多等 watchdog 多久
+    "boot_watchdog_respawns": 5,  # AutoDL 前台模式：watchdog 意外退出时 boot 最多重启它几次
     "max_not_uploaded": 1000,  # status.not_uploaded 最多列多少个文件
+    "log_tail_kb": 1024.0,  # 日志超过上限后保留的训练输出尾部
+    "log_note_reserve_kb": 1024.0,  # 日志超过上限后仍留给 runner 进度行的空间
+    "diag_log_tail_kb": 256.0,  # 上传 runner.log、watchdog.log、bootstrap.log 的最后多少 KB
+    "events_flush_interval_s": 30.0,  # 后台上传事件的最长间隔（写事件时立即唤醒）
+    "privsep_probe_timeout_s": 60.0,  # 以无特权用户试运行 python3 的时限（见 privsep.py）
 }
+
+# SIGKILL 之后最多等进程消失多久（进程卡在内核里时放弃等待，见 procs.py）
+KILL_WAIT_S = 5.0
 
 # spec.json 的 runner 段缺字段时的默认值（与 contracts.RunnerSettings 一致；
 # runner 不能 import contracts.py）。这里都按浮点数读，测试可以用小数。
@@ -152,17 +161,24 @@ def destroy_worst_case_s(tuning: Dict[str, Any]) -> float:
     )
 
 
+def short_op_s(tuning: Dict[str, Any]) -> float:
+    """收尾时单个“小”存储操作（UPLOADING 状态、读 attempt.json）的时限。"""
+    return min(30.0, tuning["small_op_timeout_s"])
+
+
 def teardown_worst_case_s(settings: Dict[str, float], tuning: Dict[str, Any]) -> float:
     """runner 从决定停止（如到达 max_hours）到自毁结束最多用多久：各步骤时限之和。
 
-    结束训练进程（term_grace_s）、停后台线程、写 UPLOADING、最终同步（final_sync_timeout）、
-    列出没传上去的文件、写日志事件和最终状态（teardown_budget_s）、自毁。
+    结束训练进程（term_grace_s，SIGKILL 后最多等 KILL_WAIT_S，再最多等 KILL_WAIT_S 回收）、
+    停后台线程（同步、心跳、事件上传）、写 UPLOADING 和最终同步前读 attempt.json、最终同步
+    （final_sync_timeout，output/ 和 ckpt/ 共用）、传日志事件和写最终状态（teardown_budget_s）、
+    自毁。没上传的文件按本地的同步记录计算，不访问存储。
     """
-    small = tuning["small_op_timeout_s"]
     return (
         settings["term_grace_s"]
-        + 2 * tuning["thread_join_s"]
-        + 3 * small  # UPLOADING 状态；output/、ckpt/ 各列一次
+        + 2 * KILL_WAIT_S
+        + 3 * tuning["thread_join_s"]
+        + 2 * short_op_s(tuning)
         + settings["final_sync_timeout_min"] * 60.0
         + tuning["teardown_budget_s"]
         + destroy_worst_case_s(tuning)
@@ -178,11 +194,31 @@ def watchdog_hard_deadline_s(
     )
 
 
+def watchdog_kill_grace_s(settings: Dict[str, float]) -> float:
+    """watchdog 结束训练进程时给的 SIGTERM 宽限。"""
+    return min(settings["term_grace_s"], 10.0)
+
+
+def watchdog_sync_s(settings: Dict[str, float], tuning: Dict[str, Any]) -> float:
+    """watchdog 尽力同步一次 output/、ckpt/ 的总时限（两个目录共用）。"""
+    return max(
+        1.0, min(tuning["watchdog_sync_timeout_s"], settings["final_sync_timeout_min"] * 60.0)
+    )
+
+
 def watchdog_teardown_worst_case_s(settings: Dict[str, float], tuning: Dict[str, Any]) -> float:
-    """watchdog 到达硬截止后最多用多久：结束进程、传日志和事件、写状态、自毁。"""
+    """watchdog 接手后（runner 消失或到达硬截止）最多用多久。
+
+    结束 runner、训练进程和 rclone（宽限 + SIGKILL 后的等待）、读 attempt.json、尽力同步一次、
+    传日志和事件并写状态（teardown_budget_s）、自毁。每一步都有时限。
+    """
     return (
-        min(settings["term_grace_s"], 10.0)
-        + 5 * tuning["small_op_timeout_s"]
+        watchdog_kill_grace_s(settings)
+        + 2 * KILL_WAIT_S
+        + short_op_s(tuning)
+        + watchdog_sync_s(settings, tuning)
+        + 2.0  # 每个目录的复制至少给 1 秒
+        + tuning["teardown_budget_s"]
         + destroy_worst_case_s(tuning)
     )
 
@@ -193,6 +229,24 @@ def instance_lifetime_s(
     """runner 启动之后，实例最晚在多久之内自己消失（watchdog 硬截止 + watchdog 收尾）。"""
     return watchdog_hard_deadline_s(max_hours, settings, tuning) + watchdog_teardown_worst_case_s(
         settings, tuning
+    )
+
+
+def boot_hard_deadline_s(
+    max_hours: float, settings: Dict[str, float], tuning: Dict[str, Any]
+) -> float:
+    """AutoDL 前台的 boot 自己的硬截止（从第一次启动算起）：watchdog 应该已经收尾完的时间
+    再加一个余量。到了就结束一切并退出，容器随之释放（watchdog 也死掉时的最后一层）。"""
+    return instance_lifetime_s(max_hours, settings, tuning) + tuning["watchdog_margin_s"]
+
+
+def boot_spec_wait_s(tuning: Dict[str, Any]) -> float:
+    """runner 一直没写出 run/spec.json 时 boot 最多等多久：watchdog 等 spec 的时间加它的收尾。"""
+    settings = runner_settings({})
+    return (
+        tuning["watchdog_spec_wait_s"]
+        + watchdog_teardown_worst_case_s(settings, tuning)
+        + tuning["watchdog_margin_s"]
     )
 
 
@@ -212,9 +266,14 @@ class Paths:
       data/<name>/           DGPU_DATA
       output/                DGPU_OUTPUT
       ckpt/                  DGPU_CKPT
+      home/                  无特权的训练用户的 HOME（见 privsep.py）
       logs/attempt-<n>.log   训练输出和 runner 的进度行，同步到存储的 logs/attempt-<n>.log
-      logs/{bootstrap,runner,watchdog}.log   各进程的诊断输出（boot 只写 stderr，即平台日志）
+      logs/{bootstrap,runner,watchdog}.log   各进程的诊断输出，尾部随日志上传
+                             （logs/attempt-<n>.<组件>.log；boot 只写 stderr，即平台日志）
       run/                   本次尝试的运行状态，见下面的属性
+
+    run/、logs/、launch.json、bundle-*/ 只有 runner 的用户（root）能读；训练进程降权运行时
+    读不到凭据，也碰不到 runner 和 watchdog 的状态。
     """
 
     def __init__(self, root: str):
@@ -227,6 +286,7 @@ class Paths:
         self.output = join(self.root, "output")
         self.ckpt = join(self.root, "ckpt")
         self.logs = join(self.root, "logs")
+        self.home = join(self.root, "home")
         self.run = join(self.root, "run")
         self.rclone_conf = join(self.run, "rclone.conf")  # 空文件：凭据走环境变量
         self.spec_copy = join(self.run, "spec.json")  # runner 读到的 spec，供 watchdog 使用
@@ -241,6 +301,8 @@ class Paths:
         self.ready = join(self.run, "ready")  # 代码和每份数据下载完成的 .ready 标记
         self.code_archive = join(self.run, "code.tar.gz")
         self.events_tmp = join(self.run, "events.tmp")
+        self.diag_upload = join(self.run, "diag")  # 上传前截取的诊断日志尾部
+        self.privsep = join(self.run, "privsep.json")  # 训练进程以什么身份运行
 
     def attempt_log(self, attempt: int) -> str:
         return os.path.join(self.logs, "attempt-%d.log" % attempt)
@@ -248,12 +310,31 @@ class Paths:
     def event_spool(self, source: str) -> str:
         return os.path.join(self.run, "events-%s" % source)
 
+    def rclone_pids(self, component: str) -> str:
+        """component（runner / watchdog）正在运行的 rclone 的登记目录。"""
+        return os.path.join(self.run, "rclone-%s" % component)
+
+    def diag_log(self, component: str) -> str:
+        return os.path.join(self.logs, "%s.log" % component)
+
     def ready_marker(self, item: str) -> str:
         return os.path.join(self.ready, item + ".ready")
 
     def ensure(self) -> None:
         for path in (self.logs, self.run, self.ready, self.events_tmp):
             os.makedirs(path, exist_ok=True)
+        # 运行状态和诊断日志只给 runner 的用户（root）看
+        for path in (self.run, self.logs):
+            try:
+                os.chmod(path, 0o700)
+            except OSError:
+                pass
+        # 训练的目录提前建好：代码下载失败时最终同步也不会对着不存在的目录重试
+        for path in (self.output, self.ckpt, self.data):
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError:
+                pass
 
 
 def write_json_atomic(path: str, obj: Any, mode: int = 0o644) -> None:

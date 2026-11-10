@@ -67,6 +67,8 @@ EV_INSTANCE_DESTROYED = "instance_destroyed"
 EV_DATASET_UPLOADED = "dataset_uploaded"
 EV_DESTROY_FAILED = "destroy_failed"  # CLI 一侧销毁实例失败或无法确认，实例可能仍在计费
 EV_RELAUNCH = "relaunch"  # CLI 换机或重试：attempt + 1（runner 一侧发现后写 attempt_fenced）
+# 训练进程和 runner 同一用户运行（没有降权）：凭据对训练进程可读。data.reason 说明原因
+EV_RUN_AS_ROOT = "run_as_root"
 
 EVENT_NAMES = (
     EV_OFFER_REJECTED,
@@ -88,6 +90,7 @@ EVENT_NAMES = (
     EV_DATASET_UPLOADED,
     EV_DESTROY_FAILED,
     EV_RELAUNCH,
+    EV_RUN_AS_ROOT,
 )
 
 # 事件来源（写进事件文件名和内容）

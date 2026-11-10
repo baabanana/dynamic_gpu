@@ -2,16 +2,22 @@
 
     python3 -m dgpu.runner.watchdog --work-root <root> [--launch <root>/launch.json]
 
-1. runner 进程消失而没有走完收尾：结束残留的训练进程，尽力同步一次，写
-   FAILED(runner_crashed)（已被更新的 attempt 取代时不写），自毁。
+1. runner 进程消失而没有走完收尾：结束残留的训练进程和 runner 启动的 rclone，按 runner 留下
+   的结论（run/final.json）接着收尾；没有结论就是崩溃，写 FAILED(runner_crashed)。最终同步
+   没做完时尽力同步一次，按同步记录算出没传上去的文件。
 2. 到达硬截止时间（max_hours + runner 最坏的收尾时间 + 余量，见
    util.watchdog_hard_deadline_s；从第一次启动算起，用单调时钟计时）：不管 runner 处于
-   什么状态，结束所有进程并自毁。
+   什么状态，结束所有进程，同样尽力同步一次、算出没传上去的文件，写 TIMED_OUT（或 runner
+   已经得出的结论），自毁。
 
-runner 是否存活看 run/runner.alive 上的 flock：boot 在启动 runner 之前锁住它，只有 runner
-进程持有这个文件描述符，进程一退出（包括被 SIGKILL、变成僵尸）内核就释放锁。watchdog 不
-依赖 runner 的任何线程，也不和 runner 抢同一把锁之外的东西。存储连不上时所有存储操作
-都有时限，失败只记录，照样自毁。
+两条路径上都先确认没有更新的 attempt（本地标记和存储里的 attempt.json），被取代时不写
+状态。runner 是否存活看 run/runner.alive 上的 flock：boot 在启动 runner 之前锁住它，只有
+runner 进程持有这个文件描述符，进程一退出（包括被 SIGKILL、变成僵尸）内核就释放锁；文件
+系统不支持 flock 时退回 pid 文件。
+
+watchdog 的每个存储操作都有时限：尽力同步有总时限（util.watchdog_sync_s），之后的日志、
+事件、状态共用 teardown_budget_s（后一半留给状态）。整个接手过程的上限是
+util.watchdog_teardown_worst_case_s。自毁在 finally 里，接手过程出任何错都会执行。
 """
 
 from __future__ import annotations
@@ -23,13 +29,20 @@ import os
 import signal
 import sys
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dgpu import layout, states
-from dgpu.runner import procs
+from dgpu.runner import logsink, procs
 from dgpu.runner.destroy import SelfDestroyer
 from dgpu.runner.events import Events, flush_spool
-from dgpu.runner.main import Outcome, local_files, write_status_doc
+from dgpu.runner.main import (
+    Outcome,
+    not_uploaded,
+    sync_dir,
+    target_dirs,
+    upload_diag_logs,
+    write_status_doc,
+)
 from dgpu.runner.main import default_rclone_binary as _default_rclone
 from dgpu.runner.rclone import Rclone, RcloneError
 from dgpu.runner.util import (
@@ -43,7 +56,10 @@ from dgpu.runner.util import (
     load_tuning,
     read_json,
     runner_settings,
+    short_op_s,
     watchdog_hard_deadline_s,
+    watchdog_kill_grace_s,
+    watchdog_sync_s,
     write_json_atomic,
 )
 
@@ -79,6 +95,8 @@ class Watchdog:
         self.settings = runner_settings({})
         self.hard_deadline = None  # type: Optional[float]
         self._alive_fd = None  # type: Optional[int]
+        self._flock_broken = False
+        self._budget_end = 0.0
         self.finished = False
 
     # ------------------------------------------------------------ 入口
@@ -111,6 +129,7 @@ class Watchdog:
                 small_timeout=self.tuning["small_op_timeout_s"],
                 poll_s=self.tuning["rclone_poll_s"],
                 clock=self.clock,
+                pid_dir=self.paths.rclone_pids(COMPONENT),
             )
             self.events = Events(
                 self.rclone,
@@ -148,15 +167,19 @@ class Watchdog:
     # ------------------------------------------------------------ 观察
 
     def _runner_gone(self) -> bool:
-        try:
-            fcntl.flock(self._alive_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return False  # 锁还被 runner 持有
-        except OSError as exc:
-            diag(COMPONENT, "flock failed (%s); falling back to the pid file" % exc)
-            pid = _read_pid(self.paths.runner_pid)
-            return pid is not None and not procs.pid_alive(pid)
-        return True  # 拿到了锁：持有它的 runner 已经不在
+        if not self._flock_broken:
+            try:
+                fcntl.flock(self._alive_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False  # 锁还被 runner 持有
+            except OSError as exc:
+                # 文件系统不支持 flock（ENOLCK、EINVAL 等）：只记一次，之后看 pid 文件
+                self._flock_broken = True
+                diag(COMPONENT, "flock failed (%s); falling back to the pid file" % exc)
+            else:
+                return True  # 拿到了锁：持有它的 runner 已经不在
+        pid = _read_pid(self.paths.runner_pid)
+        return pid is not None and not procs.pid_alive(pid)
 
     def _load_spec(self) -> None:
         spec = read_json(self.paths.spec_copy)
@@ -203,52 +226,29 @@ class Watchdog:
         destroyed = self._destroyed()
         if destroyed is not None:
             diag(COMPONENT, "runner finished its self-destroy step (ok=%s)" % destroyed.get("ok"))
-            self._kill_training(grace=min(self.settings["term_grace_s"], 10.0))
+            self._kill_leftovers()
             return
         try:  # 这里出什么错都要自毁
-            self._kill_training(grace=min(self.settings["term_grace_s"], 10.0))
+            self._kill_leftovers()
             final = self._final()
-            if final is not None:
-                # runner 得出结论之后、自毁之前退出（可能还没写最终状态）
-                diag(COMPONENT, "runner exited after reaching its outcome, before self-destroy")
-                if (
-                    self.rclone is not None
-                    and not self._fenced()
-                    and not final.get("status_written")
-                ):
-                    # 和 runner 一样：日志和事件先传，最终状态最后写
-                    self._upload_log()
-                    self._flush_events()
-                    final["status_written"] = self._write_status(Outcome.from_dict(final))
-                    self._save_final(final)
+            if final is None:
+                diag(COMPONENT, "runner exited without reaching an outcome; taking over")
+                self._take_over(
+                    Outcome(
+                        states.FAILED,
+                        states.REASON_RUNNER_CRASHED,
+                        message="runner 进程意外退出，watchdog 已尽力同步一次",
+                    ),
+                    synced=False,
+                )
+            elif final.get("status_written") or final.get("fenced"):
+                diag(COMPONENT, "runner exited after writing its final status, before self-destroy")
             else:
-                diag(COMPONENT, "runner exited without finishing; taking over")
-                self._crash_takeover()
-            self._flush_events()
+                # runner 得出结论之后、写最终状态之前退出：按它的结论接着收尾
+                diag(COMPONENT, "runner exited after reaching its outcome; finishing it up")
+                self._take_over(Outcome.from_dict(final), synced=bool(final.get("synced", True)))
         finally:
             self._self_destroy()
-
-    def _crash_takeover(self) -> None:
-        fenced = self._fenced() or self._check_attempt_fenced()
-        outcome = Outcome(
-            states.FAILED,
-            states.REASON_RUNNER_CRASHED,
-            message="runner 进程意外退出，watchdog 已尽力同步一次",
-            fenced=fenced,
-        )
-        written = False
-        if self.rclone is not None and not fenced:
-            missing = self._best_effort_sync()  # 含日志
-            if missing:
-                outcome.not_uploaded = missing
-                outcome.message = "runner 进程意外退出，watchdog 同步时有 %d 个文件没传上去" % len(
-                    missing
-                )
-            self._flush_events()
-            written = self._write_status(outcome)
-        doc = outcome.to_dict()
-        doc.update({"attempt": self.attempt, "status_written": written, "by": states.SRC_WATCHDOG})
-        self._save_final(doc)
 
     def _on_hard_deadline(self, reason: str) -> None:
         self.finished = True
@@ -263,30 +263,48 @@ class Watchdog:
                     flush=False,
                 )
             final = self._final()
-            if self.rclone is not None and not self._fenced():
-                # 日志和事件先传，最终状态最后写（CLI 看到终态就会销毁实例）
-                self._upload_log()
-                self._flush_events()
-                if final is None:
-                    outcome = Outcome(
+            if final is None:
+                self._take_over(
+                    Outcome(
                         states.TIMED_OUT,
                         message="watchdog 硬截止：%s；runner 没有按时收尾" % reason,
-                    )
-                    written = self._write_status(outcome)
-                    doc = outcome.to_dict()
-                    doc.update(
-                        {
-                            "attempt": self.attempt,
-                            "status_written": written,
-                            "by": states.SRC_WATCHDOG,
-                        }
-                    )
-                    self._save_final(doc)
-                elif not final.get("status_written"):
-                    self._write_status(Outcome.from_dict(final))
-            self._flush_events()
+                    ),
+                    synced=False,
+                )
+            elif final.get("status_written") or final.get("fenced"):
+                self._budget_end = self.clock.monotonic() + self.tuning["teardown_budget_s"]
+                self._flush_events()
+            else:
+                self._take_over(Outcome.from_dict(final), synced=bool(final.get("synced", True)))
         finally:
             self._self_destroy()
+
+    def _take_over(self, outcome: Outcome, synced: bool) -> None:
+        """替 runner 收尾：确认没被取代 → 尽力同步一次 → 日志、事件 → 最终状态。"""
+        fenced = self._fenced() or self._check_attempt_fenced()
+        outcome.fenced = outcome.fenced or fenced
+        written = False
+        if self.rclone is not None and not fenced:
+            if not synced:
+                missing, count = self._best_effort_sync()
+                outcome.apply_not_uploaded(missing, count)
+            half = self.tuning["teardown_budget_s"] / 2.0
+            self._budget_end = self.clock.monotonic() + half
+            # 日志和事件先传，最终状态最后写（CLI 看到终态就会销毁实例）
+            self._upload_logs()
+            self._flush_events()
+            self._budget_end = self.clock.monotonic() + half
+            written = self._write_status(outcome)
+        doc = outcome.to_dict()
+        doc.update(
+            {
+                "attempt": self.attempt,
+                "synced": True,
+                "status_written": written,
+                "by": states.SRC_WATCHDOG,
+            }
+        )
+        self._save_final(doc)
 
     def _kill_training(self, grace: float) -> None:
         child = read_json(self.paths.child)
@@ -301,19 +319,29 @@ class Watchdog:
             result = procs.terminate(pgid, pid, grace, self.clock)
             diag(COMPONENT, "training process group %d: %s" % (pgid, result))
 
+    def _kill_runner_rclones(self) -> None:
+        """runner 被杀后它启动的 rclone 还活着：杀掉，免得它们在 watchdog 写状态之后才落盘。"""
+        killed = procs.kill_registered(self.paths.rclone_pids("runner"))
+        if killed:
+            diag(COMPONENT, "killed rclone processes left by the runner: %s" % killed)
+
+    def _kill_leftovers(self) -> None:
+        self._kill_runner_rclones()
+        self._kill_training(grace=watchdog_kill_grace_s(self.settings))
+
     def _kill_everything(self) -> None:
         pid = _read_pid(self.paths.runner_pid)
         if pid is not None and procs.pid_alive(pid):
             procs.kill_pid(pid, signal.SIGKILL)
             diag(COMPONENT, "killed runner %d" % pid)
-        self._kill_training(grace=min(self.settings["term_grace_s"], 10.0))
+        self._kill_leftovers()
 
     def _check_attempt_fenced(self) -> bool:
         if self.rclone is None:
             return False
         try:
             data = self.rclone.cat(
-                layout.attempt_key(self.job_id), timeout=self.tuning["small_op_timeout_s"]
+                layout.attempt_key(self.job_id), timeout=short_op_s(self.tuning), tag="attempt"
             )
         except RcloneError as exc:
             diag(COMPONENT, "cannot read attempt.json: %s" % exc)
@@ -324,63 +352,84 @@ class Watchdog:
             doc = json.loads(data.decode("utf-8"))
             states.check_version(doc, "attempt.json")
             newer = int(doc.get("attempt")) > self.attempt
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, AttributeError):
             return False
-        if newer and self.events is not None:
-            self.events.emit(
-                states.EV_ATTEMPT_FENCED,
-                "watchdog：已有更新的 attempt %s，不写状态" % doc.get("attempt"),
-                {"newer_attempt": doc.get("attempt")},
-                flush=False,
-            )
+        if newer:
+            try:
+                write_json_atomic(
+                    self.paths.fenced,
+                    {"attempt": self.attempt, "newer_attempt": doc.get("attempt")},
+                )
+            except OSError:
+                pass
+            if self.events is not None:
+                self.events.emit(
+                    states.EV_ATTEMPT_FENCED,
+                    "watchdog：已有更新的 attempt %s，不写状态" % doc.get("attempt"),
+                    {"newer_attempt": doc.get("attempt")},
+                    flush=False,
+                )
         return newer
 
-    def _best_effort_sync(self) -> List[str]:
-        """一次尽力同步；返回没传上去的文件（按目录粗略列出）。"""
-        limit = min(
-            self.tuning["watchdog_sync_timeout_s"], self.settings["final_sync_timeout_min"] * 60.0
-        )
-        end = self.clock.monotonic() + max(1.0, limit)
-        missing = []
-        for name, root, prefix, exclude in (
-            ("output", self.paths.output, layout.output_prefix(self.job_id), ()),
-            ("ckpt", self.paths.ckpt, layout.ckpt_prefix(self.job_id), ("*.tmp",)),
-        ):
-            if not os.path.isdir(root):
-                continue
-            try:
-                self.rclone.copy_up(
-                    root, prefix, exclude=exclude, timeout=max(1.0, end - self.clock.monotonic())
-                )
-            except RcloneError as exc:
-                diag(COMPONENT, "sync of %s failed: %s" % (name, exc))
-                for rel in sorted(local_files(root, bool(exclude))):
-                    missing.append("%s/%s" % (name, rel))
-        self._upload_log()
-        limit_n = int(self.tuning["max_not_uploaded"])
-        if len(missing) > limit_n:
-            missing = missing[:limit_n] + ["...（另有 %d 个文件）" % (len(missing) - limit_n)]
-        return missing
+    def _best_effort_sync(self) -> Tuple[List[str], int]:
+        """一次有总时限的同步；返回按同步记录算出的没传上去的文件和总数。"""
+        end = self.clock.monotonic() + watchdog_sync_s(self.settings, self.tuning)
+        for name, root, prefix, skip_tmp in target_dirs(self.paths, self.job_id):
+            limit = max(1.0, end - self.clock.monotonic())
+            ok, error = sync_dir(
+                self.rclone, self.paths, name, root, prefix, skip_tmp, limit, COMPONENT
+            )
+            if not ok:
+                diag(COMPONENT, "sync of %s failed: %s" % (name, error))
+        return not_uploaded(self.paths, self.job_id, int(self.tuning["max_not_uploaded"]))
 
-    def _upload_log(self) -> None:
+    def _budget_timeout(self) -> float:
+        left = self._budget_end - self.clock.monotonic()
+        return max(1.0, min(self.tuning["small_op_timeout_s"], left))
+
+    def _upload_logs(self) -> None:
         if self.rclone is None:
             return
         path = self.paths.attempt_log(self.attempt)
-        if not os.path.exists(path):
+        if os.path.exists(path):
+            # runner 死前截断的训练输出尾部还在磁盘上：先接到日志末尾
+            logsink.append_tail(path, "\n[dgpu] 训练输出超过上限，下面是最后保留的部分：\n")
+            try:
+                with open(path, "ab") as handle:
+                    handle.write(
+                        ("[dgpu] watchdog 接手收尾（runner 没有走完收尾）\n").encode("utf-8")
+                    )
+            except OSError:
+                pass
+            try:
+                self.rclone.copyto_up(
+                    path,
+                    layout.log_key(self.job_id, self.attempt),
+                    timeout=self._budget_timeout(),
+                    tag=COMPONENT,
+                )
+            except RcloneError as exc:
+                diag(COMPONENT, "log upload failed: %s" % exc)
+        if self._budget_end - self.clock.monotonic() <= 0:
             return
-        try:
-            self.rclone.copyto_up(
-                path,
-                layout.log_key(self.job_id, self.attempt),
-                timeout=self.tuning["small_op_timeout_s"],
-            )
-        except RcloneError as exc:
-            diag(COMPONENT, "log upload failed: %s" % exc)
+        errors = upload_diag_logs(
+            self.rclone,
+            self.paths,
+            self.job_id,
+            self.attempt,
+            int(self.tuning["diag_log_tail_kb"] * 1024),
+            self._budget_timeout,
+            tag=COMPONENT,
+        )
+        for error in errors:
+            diag(COMPONENT, "diagnostic log upload failed: %s" % error)
 
     def _write_status(self, outcome: Outcome) -> bool:
         if self.rclone is None:
             return False
-        for _ in range(2):
+        for index in range(2):
+            if index and self._budget_end - self.clock.monotonic() <= 0:
+                break
             try:
                 write_status_doc(
                     self.rclone,
@@ -388,7 +437,7 @@ class Watchdog:
                     self.attempt,
                     outcome,
                     states.SRC_WATCHDOG,
-                    self.tuning["small_op_timeout_s"],
+                    self._budget_timeout(),
                 )
                 return True
             except RcloneError as exc:
@@ -404,9 +453,16 @@ class Watchdog:
     def _flush_events(self) -> None:
         if self.rclone is None:
             return
-        timeout = self.tuning["small_op_timeout_s"]
         for source in (states.SRC_RUNNER, states.SRC_WATCHDOG):
-            flush_spool(self.rclone, self.job_id, self.paths.event_spool(source), timeout=timeout)
+            if self._budget_end - self.clock.monotonic() <= 0:
+                diag(COMPONENT, "no budget left to upload %s events" % source)
+                return
+            flush_spool(
+                self.rclone,
+                self.job_id,
+                self.paths.event_spool(source),
+                timeout=self._budget_timeout(),
+            )
 
     def _self_destroy(self) -> None:
         destroyer = self._destroyer or SelfDestroyer(
@@ -435,6 +491,7 @@ class Watchdog:
                 {"attempts": result.attempts, "error": (result.error or "")[:500]},
                 flush=False,
             )
+            self._budget_end = self.clock.monotonic() + short_op_s(self.tuning)
             self._flush_events()
 
 

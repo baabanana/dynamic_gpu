@@ -267,37 +267,46 @@ class RunnerBundler:
 # 在实例上以 `python3 -c` 运行（Python ≥ 3.8，只用标准库），参数：bundle URL、sha256、启动文档 URL。
 # 1. 工作目录：$DGPU_WORK_ROOT；否则有 AutoDL 数据盘 /root/autodl-tmp 就用它下面的 dgpu/，
 #    再否则 /workspace/dgpu（states.DEFAULT_WORK_ROOT）。
-# 2. 非阻塞地拿 <root>/boot.lock：拿不到说明同一个任务的 runner 还活着，什么都不做（幂等）。
+# 2. 非阻塞地拿 <root>/boot.lock：被占用（EAGAIN）说明同一个任务的 runner 还活着，什么都不做
+#    （幂等）。文件系统不支持 flock（其他错误）时记一行继续，由 boot 按 pid 文件判断。
 # 3. bundle 不在本地就下载（重试 10 次，指数退避），校验 sha256，解压到 bundle-<sha256>/。
 # 4. 启动文档不在本地就下载到 launch.json（0600）。容器重启时预签名 URL 可能已过期，
 #    所以已有的文件直接复用。
 # 5. 带着锁 exec `python3 -m dgpu.runner.boot`：Vast 上它启动 watchdog 和 runner 后返回，
 #    AutoDL 上它留在前台直到两者都退出（容器只在 cmd 运行期间存在）。
+# 诊断信息写进 stderr（平台日志）和 logs/bootstrap.log（0600，runner 启动后随日志上传）：
+# Python 版本、工作目录、每次下载失败的异常类型和说明、放弃时的磁盘余量。日志里的 URL
+# 一律替换成 <url>（预签名 URL 带签名）。
 
 BOOTSTRAP_SOURCE = r"""
-import fcntl, hashlib, os, shutil, sys, tarfile, time, urllib.request
+import fcntl, hashlib, os, re, shutil, sys, tarfile, time, urllib.request
 B, H, L = sys.argv[1:4]
 R = os.environ.get("DGPU_WORK_ROOT") or (
     "/root/autodl-tmp/dgpu" if os.path.isdir("/root/autodl-tmp") else "/workspace/dgpu")
-os.makedirs(R + "/logs", exist_ok=True)
+os.makedirs(R + "/logs", 0o700, exist_ok=True)
 
 
 def log(msg):
+    msg = re.sub(r"[A-Za-z][A-Za-z0-9+.-]*://\S+", "<url>", msg)
     line = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " [bootstrap] " + msg
     print(line, file=sys.stderr, flush=True)
     try:
-        with open(R + "/logs/bootstrap.log", "a") as f:
+        fd = os.open(R + "/logs/bootstrap.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as f:
             f.write(line + "\n")
     except OSError:
         pass
 
 
+log("python %s, uid %d, work root %s" % (sys.version.split()[0], os.getuid(), R))
 lock = os.open(R + "/boot.lock", os.O_RDWR | os.O_CREAT, 0o600)
 try:
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except OSError:
+except BlockingIOError:
     log("a runner is already active in " + R + "; nothing to do")
     sys.exit(0)
+except OSError as e:
+    log("flock unsupported here (%s); continuing without the lock" % e)
 
 
 def get(url, path, sha=None):
@@ -316,11 +325,15 @@ def get(url, path, sha=None):
             os.replace(path + ".part", path)
             return
         except Exception as e:
-            log("download of %s failed (%s %s), try %d/10"
-                % (os.path.basename(path), type(e).__name__, getattr(e, "code", ""), i + 1))
+            log("download of %s failed (%s: %s), try %d/10"
+                % (os.path.basename(path), type(e).__name__, str(e)[:300], i + 1))
             if i < 9:
                 time.sleep(min(60.0, wait * 2 ** i))
-    log("giving up")
+    try:
+        free = "%d MB free" % (shutil.disk_usage(R).free >> 20)
+    except OSError as e:
+        free = "disk usage unknown (%s)" % e
+    log("giving up on %s; %s" % (os.path.basename(path), free))
     sys.exit(1)
 
 

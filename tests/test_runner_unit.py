@@ -401,9 +401,9 @@ def test_final_sync_total_is_bounded_by_its_setting(fake):
             handle.write(b"x")
     fake.add_rule("copy", "", mode="hang")
     started = time.monotonic()
-    ok, missing, error = runner._final_sync()
+    ok, missing, count, error = runner._final_sync()
     elapsed = time.monotonic() - started
-    assert not ok and sorted(missing) == ["ckpt/f.bin", "output/f.bin"]
+    assert not ok and sorted(missing) == ["ckpt/f.bin", "output/f.bin"] and count == 2
     assert 2.5 < elapsed < 4.0, elapsed  # 不是 2 × 3 秒
 
 
@@ -454,10 +454,14 @@ def test_scrubbed_prefixes():
 
 
 def test_gpu_parse_and_unknown_utilization():
+    """Unreproduced item (stall detection): one GPU reporting [N/A] (e.g. MIG) must not make the
+    utilization unknown for the others; only all-unknown is unknown."""
     gpus = gpu.parse("0, RTX 3090, 37, 24576\n1, RTX 3090, [N/A], 24576\n")
     assert [g["util"] for g in gpus] == [37.0, None]
-    assert gpu.max_utilization(gpus) is None
-    assert gpu.max_utilization(gpus[:1]) == 37.0
+    assert gpu.max_utilization(gpus) == 37.0
+    idle = gpu.parse("0, RTX 3090, 0, 24576\n1, RTX 3090, [N/A], 24576\n")
+    assert gpu.max_utilization(idle) == 0.0, "an idle GPU next to an N/A one still counts as idle"
+    assert gpu.max_utilization(gpus[1:]) is None
     assert gpu.max_utilization([]) is None
     assert gpu.query(binary="/nonexistent/nvidia-smi")[0] is None
 

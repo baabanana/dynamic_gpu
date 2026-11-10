@@ -128,7 +128,8 @@ class JobSpec:
     setup: str | None = None
     data: tuple[DataRef, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
-    # True：setup 和 run 以容器里的 root 运行（默认以无特权用户运行，见 docs/usage.md）
+    # True：runner 是 root 时也不把 setup / run 降权到无特权用户（训练进程能读到存储凭据）。
+    # 默认 False，见设计 4.7 和 runner/privsep.py
     run_as_root: bool = False
 
     def image_for(self, backend: str) -> str:
@@ -155,8 +156,7 @@ class StoreProfile:
 
     def __repr__(self) -> str:  # 不把密钥打进日志
         return (
-            f"StoreProfile(name={self.name!r}, endpoint={self.endpoint!r}, "
-            f"bucket={self.bucket!r})"
+            f"StoreProfile(name={self.name!r}, endpoint={self.endpoint!r}, bucket={self.bucket!r})"
         )
 
 

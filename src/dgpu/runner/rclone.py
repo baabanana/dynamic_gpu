@@ -17,6 +17,7 @@ import subprocess
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from dgpu.runner import procs
 from dgpu.runner.util import Clock
 
 REMOTE = "dgpu"
@@ -107,8 +108,12 @@ class Rclone:
         small_timeout: float = 120.0,
         poll_s: float = 0.2,
         clock: Optional[Clock] = None,
+        pid_dir: Optional[str] = None,
     ):
+        """pid_dir：在这里登记正在运行的 rclone（文件名是 pid）。runner 被 SIGKILL 时它启动的
+        rclone 还活着，watchdog 按登记把它们杀掉，免得它们在 watchdog 写最终状态之后才落盘。"""
         self.binary = binary
+        self.pid_dir = pid_dir
         self.bucket = str(store["bucket"])
         self.small_timeout = small_timeout
         self._poll_s = max(0.01, poll_s)
@@ -163,7 +168,10 @@ class Rclone:
             except OSError as exc:
                 raise RcloneError(op, "cannot start rclone (%s)" % type(exc).__name__) from None
             self._procs[proc] = tag
+            if self.pid_dir is not None:
+                procs.register(self.pid_dir, proc.pid, self.binary)
         timed_out = False
+        out, err = b"", b""
         try:
             deadline = None if timeout is None else self._clock.monotonic() + timeout
             first = True
@@ -184,7 +192,12 @@ class Rclone:
                     if expired or stop or proc in self._aborted:
                         timed_out = expired
                         _kill_group(proc)
-                        out, err = proc.communicate()
+                        # SIGKILL 之后的等待也有上限：进程卡在内核里时放弃它
+                        try:
+                            out, err = proc.communicate(timeout=procs.KILL_WAIT_S)
+                        except subprocess.TimeoutExpired:
+                            procs.abandon(proc)
+                            out, err = b"", b"rclone ignored SIGKILL; abandoned"
                         break
         finally:
             with self._lock:
@@ -192,9 +205,11 @@ class Rclone:
                 aborted = proc in self._aborted
                 self._aborted.discard(proc)
             if proc.poll() is None:
-                _kill_group(proc)
-                proc.wait()
-        return Result(proc.returncode, out or b"", err or b"", timed_out, aborted)
+                procs.finish(proc, kill=_kill_group)
+            if self.pid_dir is not None and proc.poll() is not None:
+                procs.unregister(self.pid_dir, proc.pid)
+        rc = proc.returncode if proc.returncode is not None else -9
+        return Result(rc, out or b"", err or b"", timed_out, aborted)
 
     def abort(self, tag: Optional[str] = None) -> int:
         """杀掉正在进行的调用（tag 为 None 时全部）。返回杀掉的数量。"""

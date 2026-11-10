@@ -156,6 +156,17 @@ def log_key(job_id: str, attempt: int) -> str:
     return "%sattempt-%d.log" % (logs_prefix(job_id), attempt)
 
 
+# 实例上各进程的诊断日志（尾部），和 attempt 日志放在一起，排查 runner 自身的问题用
+DIAG_COMPONENTS = ("runner", "watchdog", "bootstrap")
+
+
+def diag_log_key(job_id: str, attempt: int, component: str) -> str:
+    """logs/attempt-<n>.<组件>.log：runner、watchdog、bootstrap 的诊断输出的最后一段。"""
+    if component not in DIAG_COMPONENTS:
+        raise ValueError("unknown component: %r" % component)
+    return "%sattempt-%d.%s.log" % (logs_prefix(job_id), attempt, component)
+
+
 def output_prefix(job_id: str) -> str:
     return job_prefix(job_id) + "output/"
 

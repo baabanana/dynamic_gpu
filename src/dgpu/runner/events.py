@@ -2,6 +2,10 @@
 
 存储断开期间产生的事件不会丢，恢复后随下一次 flush 补传。runner 和 watchdog 各用
 自己的队列目录，避免两个 rclone move 同时处理同一批文件。
+
+emit 本身从不等存储：启动了后台上传线程（start_flusher）时只唤醒它；没有启动时只做一次
+非阻塞的尝试。所以在主循环停止训练之前、在读日志的线程里（日志截断回调）写事件都不会
+被卡住的存储拖住。
 """
 
 from __future__ import annotations
@@ -35,6 +39,45 @@ class Events:
         os.makedirs(spool_dir, exist_ok=True)
         os.makedirs(tmp_dir, exist_ok=True)
         self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._flusher = None  # type: Optional[threading.Thread]
+
+    # ------------------------------------------------------------ 后台上传
+
+    def start_flusher(self, interval: float = 30.0) -> None:
+        """后台线程：被 emit 唤醒或每 interval 秒上传一次队列。"""
+        if self._flusher is not None:
+            return
+        self._stop.clear()
+
+        def loop() -> None:
+            while not self._stop.is_set():
+                self._wake.wait(max(0.01, interval))
+                self._wake.clear()
+                if self._stop.is_set():
+                    return
+                try:
+                    self.flush(block=False)
+                except Exception as exc:  # 上传失败只记录，事件留在本地
+                    diag(self.source, "event flusher error: %s" % exc)
+
+        self._flusher = threading.Thread(target=loop, name="events", daemon=True)
+        self._flusher.start()
+
+    def stop_flusher(self, join_s: float = 10.0) -> None:
+        """停止后台上传：中止正在进行的上传（事件留在本地队列），最多等 join_s 秒。"""
+        thread = self._flusher
+        if thread is None:
+            return
+        self._stop.set()
+        self._wake.set()
+        if self.rclone is not None:
+            self.rclone.abort("events")
+        thread.join(max(0.0, join_s))
+        if thread.is_alive():
+            diag(self.source, "event flusher did not stop in time")
+        self._flusher = None
 
     def emit(
         self,
@@ -55,7 +98,10 @@ class Events:
             diag(self.source, "cannot spool event %s: %s" % (name, exc))
         diag(self.source, "event %s: %s" % (name, message))
         if flush:
-            self.flush(block=False)
+            if self._flusher is not None:
+                self._wake.set()
+            else:
+                self.flush(block=False)
 
     def pending(self) -> int:
         try:
@@ -64,7 +110,8 @@ class Events:
             return 0
 
     def flush(self, block: bool = False, timeout: Optional[float] = None) -> bool:
-        """上传队列里的事件。block=False 时如果另一个线程正在上传就直接返回。"""
+        """上传队列里的事件。block=False 时如果另一个线程正在上传就直接返回；
+        block=True 时等锁最多 timeout 秒。"""
         return flush_spool(self.rclone, self.job_id, self.spool_dir, self._lock, block, timeout)
 
 
@@ -78,8 +125,13 @@ def flush_spool(
 ) -> bool:
     if rclone is None:
         return False
-    if lock is not None and not lock.acquire(block):
-        return False
+    if lock is not None:
+        if not block:
+            acquired = lock.acquire(False)
+        else:
+            acquired = lock.acquire(True, -1 if timeout is None else max(0.0, timeout))
+        if not acquired:
+            return False
     try:
         try:
             if not os.listdir(spool_dir):

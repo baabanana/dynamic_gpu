@@ -3,12 +3,17 @@
     python3 -m dgpu.runner.main --work-root <root> [--launch <root>/launch.json]
 
 步骤：读启动文档和 spec → 检查 attempt（是否已有更新的 attempt 或已取消）→ 写 RUNNING
-和第一次心跳 → preflight → 下载代码和数据 → 恢复 checkpoint → setup → run → 收尾
-（最终同步、最终状态、日志）→ 自毁。
+和第一次心跳 → preflight → 下载代码和数据 → 恢复 checkpoint → 准备训练用户（降权，见
+privsep.py）→ setup → run → 收尾（最终同步、日志、最终状态）→ 自毁。
 
 收尾和自毁在所有退出路径上执行：正常结束、预期内失败、未处理异常、SIGTERM/SIGINT。
-心跳线程和周期同步线程互相独立，同步卡住不影响心跳。发现更新的 attempt 之后不再写
-output/、ckpt/、status.json、heartbeat.json（事件和本 attempt 的日志照常写）。
+心跳线程、周期同步线程、事件上传线程、GPU 采样线程互相独立，任何一个卡住都不影响主循环
+处理取消和截止时间。发现更新的 attempt 之后不再写 output/、ckpt/、status.json、
+heartbeat.json（事件和本 attempt 的日志照常写）。
+
+结论一确定就写进 run/final.json（synced=false），最终同步完成后改成 synced=true，最终状态
+写进存储后 status_written=true。同一 attempt 的容器重启（Vast 每次启动都执行 onstart）按这个
+文件接着做没做完的步骤，不重跑 setup 和训练。
 """
 
 from __future__ import annotations
@@ -25,13 +30,14 @@ import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from dgpu import layout, states
-from dgpu.runner import archive, gpu, procs
+from dgpu.runner import archive, gpu, privsep, procs, syncstate
 from dgpu.runner.destroy import DestroyResult, SelfDestroyer
 from dgpu.runner.events import Events, flush_spool
 from dgpu.runner.logsink import LogSink, Pump
 from dgpu.runner.rclone import Rclone, RcloneError
 from dgpu.runner.util import (
     INTERNAL_ENV,
+    KILL_WAIT_S,
     RCLONE_ENV,
     WORK_ROOT_ENV,
     Clock,
@@ -45,12 +51,16 @@ from dgpu.runner.util import (
     read_json,
     runner_settings,
     scrubbed,
+    short_op_s,
     write_json_atomic,
 )
 
 COMPONENT = "runner"
 BACKENDS = ("vast", "autodl")
 SAFE_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+# 同步的目录：(名字, 是否跳过 *.tmp)
+SYNC_TARGETS = (("output", False), ("ckpt", True))
+PATH0_ENV = "__DGPU_PATH0"  # 训练命令的登录 shell 执行 profile 之前的 PATH
 
 
 class Outcome:
@@ -92,6 +102,18 @@ class Outcome:
             bool(doc.get("fenced")),
             doc.get("not_uploaded") or [],
         )
+
+    def apply_not_uploaded(self, missing: List[str], count: int) -> None:
+        """最终同步后还有没传上去的文件：成功的训练改成 FAILED(final_sync)，其他结论补一句说明。"""
+        if not missing:
+            return
+        if self.phase == states.SUCCEEDED:
+            self.phase = states.FAILED
+            self.reason = states.REASON_FINAL_SYNC
+            self.message = "训练成功，但最终上传失败，%d 个文件没有传上去" % count
+        else:
+            self.message = "%s；另有 %d 个文件没有传上去" % (self.message or self.phase, count)
+        self.not_uploaded = missing
 
 
 class StepFailed(Exception):
@@ -152,6 +174,152 @@ def local_files(root: str, skip_tmp: bool) -> Dict[str, int]:
     return found
 
 
+def target_dirs(paths: Paths, job_id: str) -> List[Tuple[str, str, str, bool]]:
+    """(名字, 本地目录, 存储前缀, 是否跳过 *.tmp)。"""
+    return [
+        ("output", paths.output, layout.output_prefix(job_id), False),
+        ("ckpt", paths.ckpt, layout.ckpt_prefix(job_id), True),
+    ]
+
+
+def sync_dir(
+    rclone: Rclone,
+    paths: Paths,
+    name: str,
+    root: str,
+    prefix: str,
+    skip_tmp: bool,
+    timeout: float,
+    tag: str,
+    guard: Optional[Callable[[], bool]] = None,
+) -> Tuple[bool, Optional[str]]:
+    """同步一个目录，成功后把同步前的快照记为已上传。返回 (成功, 错误)。
+
+    本地目录不存在时什么都不用传，算成功。被 guard 拦下（已被更新的 attempt 取代、正在停止）
+    时返回 (False, None)。
+    """
+    if not os.path.isdir(root):
+        return True, None
+    try:
+        before = syncstate.snapshot(root, skip_tmp)
+    except syncstate.ListError as exc:
+        return False, "cannot list %s: %s" % (root, exc)
+    try:
+        rclone.copy_up(
+            root,
+            prefix,
+            exclude=["*.tmp"] if skip_tmp else [],
+            timeout=timeout,
+            tag=tag,
+            guard=guard,
+        )
+    except RcloneError as exc:
+        if exc.blocked:
+            return False, None
+        return False, str(exc)
+    try:
+        syncstate.record_success(paths.run, name, before)
+    except OSError as exc:
+        diag("sync", "cannot save the sync record of %s: %s" % (name, exc))
+    return True, None
+
+
+def not_uploaded(paths: Paths, job_id: str, limit: int) -> Tuple[List[str], int]:
+    """按同步记录算出没有按当前内容上传的文件：(最多 limit 项的列表, 总数)。"""
+    missing = []  # type: List[str]
+    for name, root, _prefix, skip_tmp in target_dirs(paths, job_id):
+        missing += syncstate.pending(root, skip_tmp, paths.run, name)
+    return syncstate.limit_list(missing, max(1, limit)), len(missing)
+
+
+def upload_diag_logs(
+    rclone: Rclone,
+    paths: Paths,
+    job_id: str,
+    attempt: int,
+    tail_bytes: int,
+    timeout: Callable[[], float],
+    tag: str = "diag",
+) -> List[str]:
+    """上传 runner.log、watchdog.log、bootstrap.log 的最后 tail_bytes 字节。返回失败的说明。"""
+    errors = []
+    try:
+        os.makedirs(paths.diag_upload, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        return ["cannot create %s: %s" % (paths.diag_upload, exc)]
+    for component in layout.DIAG_COMPONENTS:
+        source = paths.diag_log(component)
+        if not os.path.isfile(source):
+            continue
+        copy = os.path.join(paths.diag_upload, component + ".log")
+        try:
+            size = os.path.getsize(source)
+            with open(source, "rb") as handle:
+                if size > tail_bytes:
+                    handle.seek(size - tail_bytes)
+                data = handle.read(tail_bytes)
+            with open(copy, "wb") as out:
+                if size > tail_bytes:
+                    out.write(
+                        (
+                            "[dgpu] %s.log 共 %d 字节，这里只有最后 %d 字节\n"
+                            % (component, size, len(data))
+                        ).encode("utf-8")
+                    )
+                out.write(data)
+        except OSError as exc:
+            errors.append("%s: %s" % (component, exc))
+            continue
+        try:
+            rclone.copyto_up(
+                copy, layout.diag_log_key(job_id, attempt, component), timeout=timeout(), tag=tag
+            )
+        except RcloneError as exc:
+            errors.append("%s: %s" % (component, exc))
+    return errors
+
+
+def shell_script(code_dir: str, command: str, dgpu_env: Dict[str, str]) -> str:
+    """训练命令外面包的 bash 脚本（用 `bash -lc` 运行）。
+
+    登录 shell 会先执行镜像的 profile（/etc/profile 等，conda 镜像可能靠它设置环境）。profile
+    执行完之后：再次移除凭据类变量（profile 可能从别处重新导出），把 profile 删掉的 PATH
+    条目补回末尾（profile 可以加入或调整顺序，但不能让镜像的 PATH 丢东西），重新导出 dgpu 的
+    变量，最后进入代码目录执行命令。
+    """
+    patterns = "|".join(_case_insensitive(prefix) + "*" for prefix in states.SCRUBBED_ENV_PREFIXES)
+    exports = " ".join(
+        "%s=%s" % (key, shlex.quote(value)) for key, value in sorted(dgpu_env.items())
+    )
+    lines = [
+        "__dgpu_names=$(compgen -e 2>/dev/null) || __dgpu_names=$(env | sed 's/=.*//')",
+        "for __dgpu_v in $__dgpu_names; do",
+        '  case "$__dgpu_v" in %s) unset "$__dgpu_v" 2>/dev/null;; esac' % patterns,
+        "done",
+        "__dgpu_ifs=$IFS; IFS=:; set -f",
+        "for __dgpu_d in ${%s-}; do" % PATH0_ENV,
+        '  case ":$PATH:" in *":$__dgpu_d:"*) ;; *) PATH="${PATH:+$PATH:}$__dgpu_d";; esac',
+        "done",
+        "set +f; IFS=$__dgpu_ifs",
+        "export PATH",
+        "unset __dgpu_names __dgpu_v __dgpu_d __dgpu_ifs %s" % PATH0_ENV,
+        "export %s" % exports,
+        "cd %s && %s" % (shlex.quote(code_dir), command),
+    ]
+    return "\n".join(lines)
+
+
+def _case_insensitive(prefix: str) -> str:
+    """bash case 模式：字母两种大小写都匹配（兼容没有 ${v^^} 的 bash 3）。"""
+    out = []
+    for char in prefix:
+        if char.isalpha():
+            out.append("[%s%s]" % (char.upper(), char.lower()))
+        else:
+            out.append(char)
+    return "".join(out)
+
+
 class Runner:
     def __init__(
         self,
@@ -163,6 +331,7 @@ class Runner:
         rclone_binary: Optional[str] = None,
         destroyer: Optional[SelfDestroyer] = None,
         gpu_query: Optional[gpu.QueryFn] = None,
+        privsep_system: Optional[privsep.System] = None,
     ):
         self.paths = paths
         self.launch_path = launch_path or paths.launch
@@ -172,6 +341,7 @@ class Runner:
         self.rclone_binary = rclone_binary or default_rclone_binary(self.environ)
         self._destroyer = destroyer
         self._gpu_query = gpu_query or (lambda timeout: gpu.query(timeout))
+        self._privsep_system = privsep_system
         self.t_start = self.clock.monotonic()
 
         self.launch = None  # type: Optional[Dict[str, Any]]
@@ -185,6 +355,7 @@ class Runner:
         self.deadline = None  # type: Optional[float]
         self.max_hours = 0.0
         self.sink = None  # type: Optional[LogSink]
+        self.identity = privsep.inactive(privsep.REASON_NOT_ROOT, "尚未决定")
 
         self.outcome = None  # type: Optional[Outcome]
         self.previous_final = None  # type: Optional[Dict[str, Any]]
@@ -199,12 +370,10 @@ class Runner:
         self.wake = threading.Event()
         self._flag_lock = threading.Lock()
         self._stop_events_sent = set()  # type: set
+        self._attempt_checked_at = None  # type: Optional[float]
 
         self.gpu_util = None  # type: Optional[float]
-        self._gpu_last_util = None  # type: Optional[float]
-        self._gpu_sampled = False
-        self._last_gpu_busy = None  # type: Optional[float]
-        self._next_gpu_sample = 0.0
+        self.sampler = None  # type: Optional[gpu.Sampler]
         self.phase_start = None  # type: Optional[float]
         self.child = None
         self.synced_bytes = 0
@@ -228,6 +397,10 @@ class Runner:
                 self.outcome = exc.outcome
         except BaseException as exc:  # 任何异常都要走收尾和自毁
             diag(COMPONENT, "unhandled error: %s\n%s" % (exc_text(exc), traceback.format_exc()))
+            self._note(
+                "runner 内部错误：%s（traceback 见 logs/attempt-%d.runner.log）"
+                % (exc_text(exc), self.attempt)
+            )
             if self.outcome is None:
                 stop = self._stop_reason()
                 if stop is not None:
@@ -252,12 +425,19 @@ class Runner:
         self._load_launch()
         self.previous_final = self._read_final_marker()
         if self.previous_final is not None:
-            # 同一 attempt 已经得出结论（Vast 容器重启后 onstart 又执行了一次）：不重跑训练
+            # 同一 attempt 已经得出结论（Vast 容器重启后 onstart 又执行了一次）：不重跑训练，
+            # 只接着做没做完的收尾（最终同步、日志、最终状态）
             self.outcome = Outcome.from_dict(self.previous_final)
-            diag(
-                COMPONENT,
-                "attempt already finished with %s; only finishing up" % self.outcome.phase,
+            self._load_local_spec()
+            pending = not self.previous_final.get("synced", True)
+            self._note(
+                "本 attempt 已经得出结论 %s%s，只做剩下的收尾"
+                % (self.outcome.phase, "（最终同步没有做完）" if pending else "")
             )
+            if pending and not os.path.exists(self.paths.fenced):
+                self.phase = states.UPLOADING
+                self.step = "final_sync"
+                self._start_heartbeat_thread()
             return
         self._load_spec()
         self._fence_check_at_start()
@@ -270,6 +450,8 @@ class Runner:
         self._fetch_code_and_data()
         self._checkpoint()
         self._restore_ckpt()
+        self._checkpoint()
+        self._prepare_identity()
         self._checkpoint()
         self._start_sync_thread()
         setup = self.spec.get("setup") if self.spec else None
@@ -312,6 +494,7 @@ class Runner:
             small_timeout=self.tuning["small_op_timeout_s"],
             poll_s=self.tuning["rclone_poll_s"],
             clock=self.clock,
+            pid_dir=self.paths.rclone_pids(COMPONENT),
         )
         self.events = Events(
             self.rclone,
@@ -321,6 +504,7 @@ class Runner:
             self.paths.event_spool(states.SRC_RUNNER),
             self.paths.events_tmp,
         )
+        self.events.start_flusher(self.tuning["events_flush_interval_s"])
         if self.backend not in BACKENDS:
             raise StepFailed(
                 Outcome(
@@ -342,33 +526,53 @@ class Runner:
             if data is None:
                 raise ValueError("spec.json does not exist")
             spec = json.loads(data.decode("utf-8"))
-            if not isinstance(spec, dict):
-                raise ValueError("spec.json is not an object")
-            states.check_version(spec, "spec.json")
-            if spec.get("job_id") != self.job_id:
-                raise ValueError("spec.json belongs to another job")
-            if not isinstance(spec.get("run"), str) or not spec["run"].strip():
-                raise ValueError("spec.json has no run command")
-            if not isinstance(spec.get("data") or [], list):
-                raise ValueError("spec.json data is not a list")
-            if not isinstance(spec.get("env") or {}, dict):
-                raise ValueError("spec.json env is not an object")
-            self.max_hours = float(spec["max_hours"])
+            self._accept_spec(spec)
         except (KeyError, TypeError, ValueError) as exc:
             raise StepFailed(
                 Outcome(states.FAILED, states.REASON_PREFLIGHT, message="spec.json 无效：%s" % exc)
             ) from None
-        self.spec = spec
-        self.settings = runner_settings(spec)
         write_json_atomic(self.paths.spec_copy, spec)
         self.deadline = self.t_start + self._remaining_budget_s()
+        self._open_sink()
+        self.sink.note("runner 启动：任务 %s，第 %d 次尝试" % (self.job_id, self.attempt))
+
+    def _accept_spec(self, spec: Any) -> None:
+        if not isinstance(spec, dict):
+            raise ValueError("spec.json is not an object")
+        states.check_version(spec, "spec.json")
+        if spec.get("job_id") != self.job_id:
+            raise ValueError("spec.json belongs to another job")
+        if not isinstance(spec.get("run"), str) or not spec["run"].strip():
+            raise ValueError("spec.json has no run command")
+        if not isinstance(spec.get("data") or [], list):
+            raise ValueError("spec.json data is not a list")
+        if not isinstance(spec.get("env") or {}, dict):
+            raise ValueError("spec.json env is not an object")
+        self.max_hours = float(spec["max_hours"])
+        self.spec = spec
+        self.settings = runner_settings(spec)
+
+    def _load_local_spec(self) -> None:
+        """重启后只做收尾：用上次运行留在本地的 spec 副本（不依赖存储），读不到就用默认参数。"""
+        doc = read_json(self.paths.spec_copy)
+        if doc is not None:
+            try:
+                self._accept_spec(doc)
+            except (KeyError, TypeError, ValueError) as exc:
+                diag(COMPONENT, "local spec copy unusable: %s" % exc)
+        self._open_sink()
+
+    def _open_sink(self) -> None:
+        if self.sink is not None:
+            return
         self.sink = LogSink(
             self.paths.attempt_log(self.attempt),
             int(self.settings["max_log_mb"] * 1024 * 1024),
             self.clock,
             on_truncate=self._on_log_truncated,
+            tail_bytes=int(self.tuning["log_tail_kb"] * 1024),
+            note_reserve=int(self.tuning["log_note_reserve_kb"] * 1024),
         )
-        self.sink.note("runner 启动：任务 %s，第 %d 次尝试" % (self.job_id, self.attempt))
 
     def _remaining_budget_s(self) -> float:
         """max_hours 从第一次启动算起（容器重启不重新计时）。"""
@@ -399,8 +603,10 @@ class Runner:
 
     # ---------------------------------------------------------------- attempt 与停止
 
-    def _read_attempt(self, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
-        data = self.rclone.cat(layout.attempt_key(self.job_id), timeout=timeout, tag="attempt")
+    def _read_attempt(
+        self, timeout: Optional[float] = None, tag: str = "attempt"
+    ) -> Optional[Dict[str, Any]]:
+        data = self.rclone.cat(layout.attempt_key(self.job_id), timeout=timeout, tag=tag)
         if data is None:
             return None
         doc = json.loads(data.decode("utf-8"))
@@ -408,6 +614,25 @@ class Runner:
             raise ValueError("attempt.json is not an object")
         states.check_version(doc, "attempt.json")
         return doc
+
+    def _check_attempt(self, timeout: Optional[float] = None, tag: str = "attempt") -> bool:
+        """读一次 attempt.json 并处理（更新的 attempt、取消）。返回是否读成功。"""
+        try:
+            doc = self._read_attempt(timeout=timeout, tag=tag)
+        except (RcloneError, ValueError) as exc:
+            diag(COMPONENT, "cannot read attempt.json: %s" % exc)
+            return False
+        self._attempt_checked_at = self.clock.monotonic()
+        if doc is not None:
+            self._apply_attempt(doc)
+        return True
+
+    def _attempt_fresh(self) -> bool:
+        """最近一次成功读 attempt.json 是否足够新（周期同步写入之前用）。"""
+        if self._attempt_checked_at is None:
+            return False
+        limit = max(1.0, 3.0 * self.settings["heartbeat_interval_s"])
+        return self.clock.monotonic() - self._attempt_checked_at <= limit
 
     def _apply_attempt(self, doc: Dict[str, Any]) -> None:
         try:
@@ -495,7 +720,7 @@ class Runner:
         )
 
     def _record_stop(self, reason: str) -> None:
-        """停止原因第一次出现时写事件（deadline_hit、stalled）。"""
+        """停止原因第一次出现时写事件（deadline_hit、stalled）。事件只进本地队列，不等存储。"""
         if reason in self._stop_events_sent or self.events is None:
             return
         self._stop_events_sent.add(reason)
@@ -540,6 +765,7 @@ class Runner:
                     states.FAILED, states.REASON_PREFLIGHT, message="attempt.json 无效：%s" % exc
                 )
             ) from None
+        self._attempt_checked_at = self.clock.monotonic()
         if doc is None:
             diag(COMPONENT, "attempt.json does not exist; skipping the start-up attempt check")
             return
@@ -599,6 +825,9 @@ class Runner:
             if exc.blocked:
                 raise StepFailed(self._outcome_for_stop("fenced")) from None
             raise self._storage_failure("写不进存储：%s" % exc) from None
+        self._start_heartbeat_thread()
+
+    def _start_heartbeat_thread(self) -> None:
         self._hb_thread = threading.Thread(
             target=self._heartbeat_loop, name="heartbeat", daemon=True
         )
@@ -613,12 +842,7 @@ class Runner:
                 diag(COMPONENT, "heartbeat error: %s" % exc_text(exc))
 
     def _beat(self) -> None:
-        try:
-            doc = self._read_attempt()
-            if doc is not None:
-                self._apply_attempt(doc)
-        except (RcloneError, ValueError) as exc:
-            diag(COMPONENT, "cannot read attempt.json: %s" % exc)
+        self._check_attempt()
         if self.fenced.is_set() or self._hb_stop.is_set():
             return
         try:
@@ -626,13 +850,13 @@ class Runner:
         except RcloneError as exc:
             if not exc.blocked:
                 self._note_sync_failure("heartbeat", str(exc))
-        self.events.flush(block=False)
 
     # ---------------------------------------------------------------- preflight
 
     def _preflight(self) -> None:
         self.step = "preflight"
         problems = []
+        # nvidia-smi 卡住时查询有上限（超时 + SIGKILL 后的等待），算作 GPU 故障，CLI 会换机
         gpus, error = self._gpu_query(self.tuning["nvidia_smi_timeout_s"])
         if not gpus:
             problems.append("GPU 不可用：%s" % error)
@@ -707,7 +931,7 @@ class Runner:
 
     def _sources(self) -> List[Dict[str, Any]]:
         sources = []
-        for item in self.spec.get("data") or []:
+        for item in (self.spec or {}).get("data") or []:
             if isinstance(item, dict):
                 sources.append(item)
         return sources
@@ -811,6 +1035,7 @@ class Runner:
         )
         remote = [item for item in listing if not str(item.get("Path", "")).endswith(".tmp")]
         if remote:
+            before = self._snapshot_or_empty(self.paths.ckpt, True)
             self._data_retry(
                 "ckpt",
                 lambda: self.rclone.copy_down(
@@ -822,6 +1047,12 @@ class Runner:
                     interrupt=self._stop_requested,
                 ),
             )
+            # 下载下来的文件就是存储里的版本：记为已上传，最终同步失败时不会被误报
+            after = self._snapshot_or_empty(self.paths.ckpt, True)
+            try:
+                syncstate.record_downloaded(self.paths.run, "ckpt", before, after)
+            except OSError as exc:
+                diag(COMPONENT, "cannot save the ckpt sync record: %s" % exc)
             total = sum(int(item.get("Size") or 0) for item in remote)
             self._note("从存储恢复了 %d 个 checkpoint 文件" % len(remote))
             self.events.emit(
@@ -833,12 +1064,35 @@ class Runner:
         if self.resume:
             self._note("DGPU_RESUME=1")
 
+    @staticmethod
+    def _snapshot_or_empty(root: str, skip_tmp: bool) -> syncstate.Snapshot:
+        try:
+            return syncstate.snapshot(root, skip_tmp)
+        except syncstate.ListError:
+            return {}
+
     # ---------------------------------------------------------------- 训练进程
 
-    def _child_env(self) -> Dict[str, str]:
+    def _base_child_env(self) -> Dict[str, str]:
         env = {key: value for key, value in self.environ.items() if not scrubbed(key)}
         for key in INTERNAL_ENV:
             env.pop(key, None)
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        env.update(self._dgpu_env())
+        return env
+
+    def _dgpu_env(self) -> Dict[str, str]:
+        return {
+            states.ENV_JOB_ID: self.job_id,
+            states.ENV_ATTEMPT: str(self.attempt),
+            states.ENV_DATA: self.paths.data,
+            states.ENV_OUTPUT: self.paths.output,
+            states.ENV_CKPT: self.paths.ckpt,
+            states.ENV_RESUME: "1" if self.resume else "0",
+        }
+
+    def _child_env(self) -> Dict[str, str]:
+        env = self._base_child_env()
         dropped = []
         for key, value in (self.spec.get("env") or {}).items():
             if scrubbed(str(key)):
@@ -850,29 +1104,48 @@ class Runner:
                 "job.yaml 的 env 里这些变量匹配凭据前缀，没有传给训练进程：%s"
                 % ", ".join(sorted(dropped))
             )
-        env.setdefault("PYTHONUNBUFFERED", "1")
-        env[states.ENV_JOB_ID] = self.job_id
-        env[states.ENV_ATTEMPT] = str(self.attempt)
-        env[states.ENV_DATA] = self.paths.data
-        env[states.ENV_OUTPUT] = self.paths.output
-        env[states.ENV_CKPT] = self.paths.ckpt
-        env[states.ENV_RESUME] = "1" if self.resume else "0"
+        env.update(self.identity.env)
+        env.update(self._dgpu_env())
+        env[PATH0_ENV] = env.get("PATH", "")
         return env
+
+    def _prepare_identity(self) -> None:
+        """决定训练进程以什么用户运行，准备目录（见 privsep.py）。"""
+        self.step = "prepare"
+        self.identity = privsep.prepare(
+            self.paths,
+            run_as_root=bool((self.spec or {}).get("run_as_root")),
+            base_env=self._base_child_env(),
+            system=self._privsep_system,
+            probe_timeout=self.tuning["privsep_probe_timeout_s"],
+            note=self._note,
+        )
+        try:
+            write_json_atomic(self.paths.privsep, self.identity.to_dict())
+        except OSError as exc:
+            diag(COMPONENT, "cannot write privsep marker: %s" % exc)
+        self._note(self.identity.describe())
+        if not self.identity.active:
+            self.events.emit(
+                states.EV_RUN_AS_ROOT,
+                "训练进程没有降权：%s" % self.identity.detail,
+                {"reason": self.identity.reason, "detail": self.identity.detail[:500]},
+            )
 
     def _run_command(self, step: str, command: str) -> int:
         self._checkpoint()
         self.step = step
         self.phase_start = self.clock.monotonic()
-        self._gpu_sampled = False
-        self._gpu_last_util = None
-        self._last_gpu_busy = None
-        self._next_gpu_sample = 0.0
         self._note(
             "开始 %s：%s" % (step, command if len(command) <= 300 else command[:300] + "...")
         )
-        # 登录 shell 会执行镜像的 profile（conda 等）；有的 profile 会切换目录，所以再 cd 一次
-        script = "cd %s && %s" % (shlex.quote(self.paths.code), command)
-        proc = procs.start_session(["bash", "-lc", script], self.paths.code, self._child_env())
+        script = shell_script(self.paths.code, command, self._dgpu_env())
+        proc = procs.start_session(
+            ["bash", "-lc", script],
+            self.paths.code,
+            self._child_env(),
+            preexec_fn=self.identity.preexec(),
+        )
         self.child = proc
         try:
             write_json_atomic(self.paths.child, {"pid": proc.pid, "pgid": proc.pid, "step": step})
@@ -880,11 +1153,21 @@ class Runner:
             diag(COMPONENT, "cannot write child marker: %s" % exc)
         pump = Pump(proc.stdout, self.sink)
         pump.start()
+        self.sampler = gpu.Sampler(
+            self._gpu_query,
+            self.tuning["nvidia_smi_timeout_s"],
+            min(self.tuning["gpu_sample_max_s"], max(0.01, self.settings["heartbeat_interval_s"])),
+            self.clock,
+            note=self._note,
+        )
+        self.sampler.start()
         stop = None
+        rc = None  # type: Optional[int]
         try:
             while proc.poll() is None:
-                self._sample_gpu_if_due()
-                stop = self._stop_reason(include_stall=True)
+                self.gpu_util = self.sampler.snapshot()[0]
+                # 卡死检测只用于 run：setup 里安静的下载、解压不算卡死
+                stop = self._stop_reason(include_stall=(step == "run"))
                 if stop is not None:
                     break
                 self._wait(self.tuning["tick_s"])
@@ -899,58 +1182,48 @@ class Runner:
                     proc.pid, proc.pid, self.tuning["lingering_grace_s"], self.clock, reap=proc.poll
                 )
                 self._note("%s 结束后清理了残留的子进程（%s）" % (step, result))
-            rc = proc.wait()
+            rc = procs.wait_bounded(proc, KILL_WAIT_S, close_pipes=False)
         finally:
             if proc.poll() is None:
                 procs.terminate(
                     proc.pid, proc.pid, self.settings["term_grace_s"], self.clock, reap=proc.poll
                 )
-                proc.wait()
+                rc = procs.wait_bounded(proc, KILL_WAIT_S, close_pipes=False)
+            self.sampler.stop()
             pump.join(self.tuning["thread_join_s"])
             if pump.is_alive():
                 diag(COMPONENT, "log pump of %s still running after the process exited" % step)
             self.child = None
             _unlink(self.paths.child)
+        if rc is None:
+            self._note("%s 的进程在 SIGKILL 之后仍未退出，放弃等待" % step)
+            rc = -int(signal.SIGKILL)
         self._note("%s 结束，退出码 %d" % (step, rc))
         if stop is not None:
             raise StepFailed(self._outcome_for_stop(stop))
         return rc
 
-    def _sample_gpu_if_due(self) -> None:
-        now = self.clock.monotonic()
-        if now < self._next_gpu_sample:
-            return
-        interval = min(
-            self.tuning["gpu_sample_max_s"], max(0.01, self.settings["heartbeat_interval_s"])
-        )
-        gpus, _error = self._gpu_query(self.tuning["nvidia_smi_timeout_s"])
-        util = gpu.max_utilization(gpus)
-        now = self.clock.monotonic()
-        self._next_gpu_sample = now + interval
-        self.gpu_util = util
-        self._gpu_last_util = util
-        self._gpu_sampled = True
-        if util is not None and util > 0:
-            self._last_gpu_busy = now
-
     def _stalled(self) -> bool:
         limit = self.settings["stall_timeout_min"] * 60.0
-        if limit <= 0 or not self._gpu_sampled or self.phase_start is None:
+        if limit <= 0 or self.step != "run" or self.phase_start is None or self.sampler is None:
             return False
-        if self._gpu_last_util is None or self._gpu_last_util > 0:
+        util, last_busy, sampled = self.sampler.snapshot()
+        if not sampled or util is None or util > 0:
             return False  # 利用率未知或不为 0：不判卡死
-        marks = [self.phase_start, self._last_gpu_busy]
+        marks = [self.phase_start, last_busy]
         if self.sink is not None:
             marks.append(self.sink.last_output_mono)
         latest = max(mark for mark in marks if mark is not None)
         return self.clock.monotonic() - latest >= limit
 
     def _on_log_truncated(self, max_bytes: int) -> None:
+        # 在读日志的线程里调用：只写本地事件队列，由后台线程上传，不能卡住读取
         if self.events is not None:
             self.events.emit(
                 states.EV_LOG_TRUNCATED,
-                "日志超过 %d MB，之后的输出不再记录" % (max_bytes // (1024 * 1024)),
-                {"max_bytes": max_bytes},
+                "日志超过 %d MB，之后的训练输出只保留最后一段，附在日志末尾"
+                % (max_bytes // (1024 * 1024)),
+                {"max_bytes": max_bytes, "tail_bytes": int(self.tuning["log_tail_kb"] * 1024)},
             )
 
     # ---------------------------------------------------------------- 同步
@@ -959,13 +1232,26 @@ class Runner:
         self._sync_thread = threading.Thread(target=self._sync_loop, name="sync", daemon=True)
         self._sync_thread.start()
 
+    def _periodic_guard(self) -> bool:
+        return self._may_write() and not self._sync_stop.is_set()
+
     def _sync_loop(self) -> None:
         interval = max(0.01, self.settings["sync_interval_s"])
         while not self._sync_stop.wait(interval):
             if self.fenced.is_set():
                 return
+            # 写 output/、ckpt/ 之前确认本 attempt 仍是当前的：心跳线程卡住时这里自己读一次
+            if not self._attempt_fresh():
+                ok = self._check_attempt(tag="sync")
+                if self.fenced.is_set() or self._sync_stop.is_set():
+                    return
+                if not ok:
+                    self._note_sync_failure("attempt", "读不到 attempt.json，这一轮不写入")
+                    continue
             try:
-                errors = self._sync_targets(self.tuning["periodic_sync_timeout_s"], "sync")
+                errors = self._sync_targets(
+                    self.tuning["periodic_sync_timeout_s"], "sync", stop=self._sync_stop
+                )
             except Exception as exc:
                 errors = {"sync": exc_text(exc)}
             if self._sync_stop.is_set():
@@ -979,65 +1265,60 @@ class Runner:
                 self._sync_fail_last_event = None
 
     def _sync_targets(
-        self, timeout: float, tag: str, include_log: bool = True, end: Optional[float] = None
+        self,
+        timeout: float,
+        tag: str,
+        include_log: bool = True,
+        end: Optional[float] = None,
+        stop: Optional[threading.Event] = None,
     ) -> Dict[str, str]:
         """同步 output/、ckpt/（不含 *.tmp）和日志。返回 {目标: 错误}。
 
         end（单调时钟）：给了就只把剩下的时间给每一步，时间用完的步骤不再开始（记为失败），
         整轮不超过 end。最终同步用它，所以总时长受 final_sync_timeout_min 约束。
+        stop：周期同步的停止标志，每个目标开始前检查，并作为写入的 guard（收尾时周期同步
+        不会再开始新的上传，和最终同步抢带宽）。
         """
         errors = {}
-        steps = [
-            (
-                "output",
-                lambda limit: self.rclone.copy_up(
-                    self.paths.output,
-                    layout.output_prefix(self.job_id),
-                    timeout=limit,
-                    tag=tag,
-                    guard=self._may_write,
-                ),
-            ),
-            (
-                "ckpt",
-                lambda limit: self.rclone.copy_up(
-                    self.paths.ckpt,
-                    layout.ckpt_prefix(self.job_id),
-                    exclude=["*.tmp"],
-                    timeout=limit,
-                    tag=tag,
-                    guard=self._may_write,
-                ),
-            ),
-        ]
-        if include_log and self.sink is not None:
-            steps.append(("log", lambda limit: self._upload_log(limit, tag)))
-        for what, fn in steps:
-            if what != "log" and self.fenced.is_set():
+        guard = self._periodic_guard if stop is not None else self._may_write
+        for name, root, prefix, skip_tmp in target_dirs(self.paths, self.job_id):
+            if stop is not None and stop.is_set():
+                return errors
+            if self.fenced.is_set():
                 continue
             limit = timeout
             if end is not None:
                 limit = end - self.clock.monotonic()
                 if limit <= 0:
-                    errors[what] = "final sync time limit reached before this step"
+                    errors[name] = "final sync time limit reached before this step"
                     continue
+            ok, error = sync_dir(
+                self.rclone, self.paths, name, root, prefix, skip_tmp, limit, tag, guard
+            )
+            if error is not None:
+                errors[name] = error
+        if include_log and self.sink is not None and not (stop is not None and stop.is_set()):
             try:
-                fn(limit)
+                self._upload_log(timeout, tag, guard=(lambda: not stop.is_set()) if stop else None)
             except RcloneError as exc:
                 if not exc.blocked:
-                    errors[what] = str(exc)
+                    errors["log"] = str(exc)
+        self.synced_bytes = syncstate.total_bytes(self.paths.run, ("output", "ckpt"))
         if not errors.get("output") and not errors.get("ckpt") and not self.fenced.is_set():
-            sizes = list(local_files(self.paths.output, False).values())
-            sizes += list(local_files(self.paths.ckpt, True).values())
-            self.synced_bytes = sum(sizes)
             self.last_sync_at = self.clock.time()
         return errors
 
-    def _upload_log(self, timeout: float, tag: str) -> None:
+    def _upload_log(
+        self, timeout: float, tag: str, guard: Optional[Callable[[], bool]] = None
+    ) -> None:
         path = self.paths.attempt_log(self.attempt)
         if os.path.exists(path):
             self.rclone.copyto_up(
-                path, layout.log_key(self.job_id, self.attempt), timeout=timeout, tag=tag
+                path,
+                layout.log_key(self.job_id, self.attempt),
+                timeout=timeout,
+                tag=tag,
+                guard=guard,
             )
 
     def _note_sync_failure(self, what: str, error: str) -> None:
@@ -1073,7 +1354,11 @@ class Runner:
                 self.rclone.abort("attempt")
             self._hb_thread.join(self.tuning["thread_join_s"])
 
-    def _final_sync(self) -> Tuple[bool, List[str], str]:
+    def _final_sync(self) -> Tuple[bool, List[str], int, str]:
+        """最终同步：output/ 和 ckpt/ 共用 final_sync_timeout_min，失败就重试到时限。
+
+        返回 (成功, 没传上去的文件, 没传上去的总数, 最后一次的错误)。
+        """
         limit = max(0.0, self.settings["final_sync_timeout_min"] * 60.0)
         end = self.clock.monotonic() + limit
         tries = 0
@@ -1083,42 +1368,38 @@ class Runner:
             remaining = end - self.clock.monotonic()
             errors = self._sync_targets(remaining, "final", include_log=False, end=end)
             failed = {key: value for key, value in errors.items() if key in ("output", "ckpt")}
-            if not failed:
+            if not failed and not self.fenced.is_set():
                 if tries > 1:
                     self._note("最终同步在第 %d 次尝试成功" % tries)
-                return True, [], ""
+                missing, count = self._not_uploaded()
+                return not missing, missing, count, "files changed during the final sync"
             last = "; ".join("%s: %s" % item for item in sorted(failed.items()))
             diag(COMPONENT, "final sync attempt %d failed: %s" % (tries, last))
             remaining = end - self.clock.monotonic()
             if remaining <= 0 or self.fenced.is_set():
                 break
             self.clock.sleep(min(remaining, self.tuning["final_sync_backoff_s"]))
-        return False, self._not_uploaded(), last
+        missing, count = self._not_uploaded()
+        return False, missing, count, last
 
-    def _not_uploaded(self) -> List[str]:
-        missing = []
-        for name, root, prefix, skip_tmp in (
-            ("output", self.paths.output, layout.output_prefix(self.job_id), False),
-            ("ckpt", self.paths.ckpt, layout.ckpt_prefix(self.job_id), True),
-        ):
-            local = local_files(root, skip_tmp)
-            if not local:
-                continue
+    def _not_uploaded(self) -> Tuple[List[str], int]:
+        return not_uploaded(self.paths, self.job_id, int(self.tuning["max_not_uploaded"]))
+
+    def _local_results_exist(self) -> bool:
+        for _name, root, _prefix, skip_tmp in target_dirs(self.paths, self.job_id):
             try:
-                remote = {
-                    str(item.get("Path")): int(item.get("Size") or 0)
-                    for item in self.rclone.lsjson(prefix, tag="final")
-                }
-            except (RcloneError, ValueError):
-                remote = {}
-            for rel, size in sorted(local.items()):
-                if remote.get(rel) != size:
-                    missing.append("%s/%s" % (name, rel))
-        limit = int(self.tuning["max_not_uploaded"])
-        if len(missing) > limit:
-            extra = len(missing) - limit
-            missing = missing[:limit] + ["...（另有 %d 个文件）" % extra]
-        return missing
+                if syncstate.snapshot(root, skip_tmp):
+                    return True
+            except syncstate.ListError:
+                return True
+        return False
+
+    def _needs_final_sync(self) -> bool:
+        """训练开始过、上次运行的结论还没同步完，或者本地有结果文件（容器重启后已经超时或
+        被取消时，内存里的标志都没了，看磁盘）。"""
+        return (
+            self.training_started or self.previous_final is not None or self._local_results_exist()
+        )
 
     # ================================================================ 收尾
 
@@ -1136,78 +1417,72 @@ class Runner:
             return states.EXIT_SUCCEEDED
         return states.EXIT_CODE_BY_PHASE.get(outcome.phase, states.EXIT_FAILED)
 
+    def _stop_child(self) -> None:
+        child = self.child
+        if child is not None and child.poll() is None:
+            procs.terminate(
+                child.pid, child.pid, self.settings["term_grace_s"], self.clock, reap=child.poll
+            )
+            procs.wait_bounded(child, KILL_WAIT_S, close_pipes=False)
+        if self.sampler is not None:
+            self.sampler.stop()
+
     def _teardown_storage(self) -> None:
         if self.outcome is None:
             self.outcome = Outcome(
                 states.FAILED, states.REASON_RUNNER_CRASHED, message="runner 没有得出结论就结束了"
             )
         self.step = "final_sync"
-        child = self.child
-        if child is not None and child.poll() is None:
-            procs.terminate(
-                child.pid, child.pid, self.settings["term_grace_s"], self.clock, reap=child.poll
-            )
+        self._stop_child()
         self._stop_sync_thread()
         if self.rclone is None:
             # 启动文档无效：没有存储可写，只能自毁
-            self._write_final_marker(status_written=False)
+            self._write_final_marker(synced=True, status_written=False)
             return
-        if self.previous_final is not None:
-            self._finish_previous()
-            return
+        prev = self.previous_final
+        if prev is not None:
+            if os.path.exists(self.paths.fenced):
+                self.fenced.set()
+            if prev.get("status_written") or self.fenced.is_set():
+                diag(COMPONENT, "status already written (or fenced); only self-destroy is left")
+                self._stop_heartbeat_thread()
+                self.events.stop_flusher(self.tuning["thread_join_s"])
+                return
+        else:
+            # 结论一确定就落盘：之后容器重启只接着收尾，不重跑 setup 和训练
+            self._write_final_marker(synced=False, status_written=False)
+        if self.sink is not None:
+            self.sink.flush_tail()
         outcome = self.outcome
-        if self.training_started and not self.fenced.is_set():
+        synced = prev is not None and prev.get("synced", True)
+        if not synced and not self.fenced.is_set() and self._needs_final_sync():
+            # 最终同步之前确认本 attempt 仍是当前的（心跳线程最后一次读取可能已经过去一会儿）
+            self._check_attempt(timeout=short_op_s(self.tuning), tag="final-attempt")
+        if not synced and not self.fenced.is_set() and self._needs_final_sync():
             self.phase = states.UPLOADING
             try:
                 self._put_status(
                     Outcome(states.UPLOADING, message="正在上传结果"),
-                    timeout=min(30.0, self.tuning["small_op_timeout_s"]),
+                    timeout=short_op_s(self.tuning),
                 )
             except RcloneError as exc:
                 diag(COMPONENT, "cannot write UPLOADING status: %s" % exc)
             self._note("最终同步 output/ 和 ckpt/")
-            ok, not_uploaded, error = self._final_sync()
+            ok, missing, count, error = self._final_sync()
             if not ok and not self.fenced.is_set():
-                self._note("最终同步失败，%d 个文件没有传上去：%s" % (len(not_uploaded), error))
+                self._note("最终同步失败，%d 个文件没有传上去：%s" % (count, error))
                 self.events.emit(
                     states.EV_FINAL_SYNC_FAILED,
                     "最终同步在 %g 分钟内没有成功，%d 个文件没有传上去"
-                    % (self.settings["final_sync_timeout_min"], len(not_uploaded)),
-                    {
-                        "not_uploaded": not_uploaded[:100],
-                        "count": len(not_uploaded),
-                        "error": error[:500],
-                    },
+                    % (self.settings["final_sync_timeout_min"], count),
+                    {"not_uploaded": missing[:100], "count": count, "error": error[:500]},
                 )
-                if outcome.phase == states.SUCCEEDED:
-                    outcome = Outcome(
-                        states.FAILED,
-                        states.REASON_FINAL_SYNC,
-                        exit_code=outcome.exit_code,
-                        message="训练成功，但最终上传失败，%d 个文件没有传上去" % len(not_uploaded),
-                    )
-                else:
-                    outcome.message = "%s；另有 %d 个文件没有传上去" % (
-                        outcome.message or outcome.phase,
-                        len(not_uploaded),
-                    )
-                outcome.not_uploaded = not_uploaded
-        self._stop_heartbeat_thread()
-        # 收尾预算分两半：前一半给日志和事件，后一半留给最终状态，日志卡住也不会挤掉状态
-        half = self.tuning["teardown_budget_s"] / 2.0
-        self._budget_end = self.clock.monotonic() + half
-        if not self.fenced.is_set():
-            try:
-                doc = self._read_attempt(timeout=self._budget_timeout())
-                if doc is not None:
-                    self._apply_attempt(doc)
-            except (RcloneError, ValueError) as exc:
-                diag(COMPONENT, "final attempt check failed: %s" % exc)
+                outcome.apply_not_uploaded(missing, count)
         if self.fenced.is_set() and not outcome.fenced:
             outcome.fenced = True
         self.outcome = outcome
         # 本地先记下结论：之后 runner 死掉，watchdog 照这个结论补写状态
-        self._write_final_marker(status_written=False)
+        self._write_final_marker(synced=True, status_written=False)
         fenced = self.fenced.is_set()
         if fenced:
             self._note("本 attempt 已被更新的 attempt 取代，不写最终状态")
@@ -1216,15 +1491,29 @@ class Runner:
                 "最终状态 %s%s"
                 % (outcome.phase, "（%s）" % outcome.reason if outcome.reason else "")
             )
-        # 最终状态是自毁前最后一次写存储：CLI 看到终态就会销毁实例，日志和事件必须在它之前传完
-        self._upload_final_log()
+        # 收尾预算分两半：前一半给日志和事件，后一半留给最终状态，日志卡住也不会挤掉状态。
+        # 最终状态是自毁前最后一次写存储：CLI 看到终态就会销毁实例，日志和事件必须在它之前传完；
+        # 心跳线程一直运行到这里（继续读 attempt.json），写最终状态之前才停。
+        half = self.tuning["teardown_budget_s"] / 2.0
+        self._budget_end = self.clock.monotonic() + half
+        self._upload_final_logs()
+        self.events.stop_flusher(self.tuning["thread_join_s"])
         self.events.flush(block=True, timeout=self._budget_timeout())
-        if not fenced:
-            self._budget_end = self.clock.monotonic() + half
-            written = self._write_final_status(outcome)
-            self._write_final_marker(status_written=written)
-            if not written:
-                diag(COMPONENT, "final status %s was not written" % outcome.phase)
+        self._stop_heartbeat_thread()
+        if fenced:
+            return
+        self._budget_end = self.clock.monotonic() + half
+        if not self._attempt_fresh():
+            self._check_attempt(timeout=self._budget_timeout(), tag="final-attempt")
+        if self.fenced.is_set():
+            outcome.fenced = True
+            self._note("写最终状态前发现更新的 attempt，不写最终状态")
+            self._write_final_marker(synced=True, status_written=False)
+            return
+        written = self._write_final_status(outcome)
+        self._write_final_marker(synced=True, status_written=written)
+        if not written:
+            diag(COMPONENT, "final status %s was not written" % outcome.phase)
 
     def _budget_left(self) -> float:
         return self._budget_end - self.clock.monotonic()
@@ -1232,18 +1521,6 @@ class Runner:
     def _budget_timeout(self) -> float:
         """收尾阶段单次存储操作的时限：不超过剩余预算，至少 1 秒。"""
         return max(1.0, min(self.tuning["small_op_timeout_s"], self._budget_left()))
-
-    def _finish_previous(self) -> None:
-        """同一 attempt 重启：结论已有，只补写没写成的状态，然后自毁。"""
-        self._budget_end = self.clock.monotonic() + self.tuning["teardown_budget_s"]
-        done = self.previous_final or {}
-        fenced = os.path.exists(self.paths.fenced)
-        if fenced:
-            self.fenced.set()
-        if not done.get("status_written") and not fenced:
-            written = self._write_final_status(self.outcome)
-            self._write_final_marker(status_written=written)
-        self.events.flush(block=True, timeout=self._budget_timeout())
 
     def _write_final_status(self, outcome: Outcome) -> bool:
         attempts = max(1, int(self.tuning["status_attempts"]))
@@ -1263,31 +1540,52 @@ class Runner:
             self.clock.sleep(wait)
         return False
 
-    def _upload_final_log(self) -> None:
-        if self.sink is None:
+    def _upload_final_logs(self) -> None:
+        """传 attempt 日志（重试几次）和诊断日志的尾部，都在前一半预算之内。"""
+        if self.sink is not None:
+            attempts = 3
+            last = None
+            for index in range(attempts):
+                try:
+                    self._upload_log(self._budget_timeout(), "final")
+                    last = None
+                    break
+                except RcloneError as exc:
+                    last = exc
+                wait = min(self._backoff(index), self._budget_left())
+                if index + 1 >= attempts or wait <= 0:
+                    break
+                self.clock.sleep(wait)
+            if last is not None:
+                self.events.emit(
+                    states.EV_SYNC_FAILED,
+                    "最终日志没有传上去",
+                    {"what": "log", "error": str(last)[:500], "final": True},
+                    flush=False,
+                )
+        if self._budget_left() <= 0:
+            diag(COMPONENT, "no budget left for the diagnostic logs")
             return
-        attempts = 3
-        last = None
-        for index in range(attempts):
-            try:
-                self._upload_log(self._budget_timeout(), "final")
-                return
-            except RcloneError as exc:
-                last = exc
-            wait = min(self._backoff(index), self._budget_left())
-            if index + 1 >= attempts or wait <= 0:
-                break
-            self.clock.sleep(wait)
-        if last is not None:
+        errors = upload_diag_logs(
+            self.rclone,
+            self.paths,
+            self.job_id,
+            self.attempt,
+            int(self.tuning["diag_log_tail_kb"] * 1024),
+            self._budget_timeout,
+            tag="final",
+        )
+        if errors:
             self.events.emit(
                 states.EV_SYNC_FAILED,
-                "最终日志没有传上去",
-                {"what": "log", "error": str(last)[:500], "final": True},
+                "诊断日志没有全部传上去",
+                {"what": "diag_logs", "error": "; ".join(errors)[:500], "final": True},
+                flush=False,
             )
 
-    def _write_final_marker(self, status_written: bool) -> None:
+    def _write_final_marker(self, synced: bool, status_written: bool) -> None:
         doc = self.outcome.to_dict() if self.outcome is not None else {}
-        doc.update({"attempt": self.attempt, "status_written": status_written})
+        doc.update({"attempt": self.attempt, "synced": synced, "status_written": status_written})
         try:
             write_json_atomic(self.paths.final, doc)
         except OSError as exc:
@@ -1313,6 +1611,8 @@ class Runner:
 
     def _self_destroy(self) -> None:
         self.step = "destroy"
+        if self.events is not None:
+            self.events.stop_flusher(self.tuning["thread_join_s"])
         if self.sink is not None:
             self.sink.close()
         try:
