@@ -429,14 +429,11 @@ class Runner:
             self.outcome = Outcome.from_dict(self.previous_final)
             self._load_local_spec()
             pending = not self.previous_final.get("synced", True)
+            self.step = "final_sync"
             self._note(
                 "本 attempt 已经得出结论 %s%s，只做剩下的收尾"
                 % (self.outcome.phase, "（最终同步没有做完）" if pending else "")
             )
-            if pending and not os.path.exists(self.paths.fenced):
-                self.phase = states.UPLOADING
-                self.step = "final_sync"
-                self._start_heartbeat_thread()
             return
         self._load_spec()
         self._fence_check_at_start()
@@ -1481,6 +1478,10 @@ class Runner:
             self._check_attempt(timeout=short_op_s(self.tuning), tag="final-attempt")
         if not synced and not self.fenced.is_set() and self._needs_final_sync():
             self.phase = states.UPLOADING
+            if self._hb_thread is None:
+                # 重启后直接收尾（已超时、已取消）时心跳线程还没启动：最终同步期间也要有心跳，
+                # 并继续读 attempt.json
+                self._start_heartbeat_thread()
             try:
                 self._put_status(
                     Outcome(states.UPLOADING, message="正在上传结果"),

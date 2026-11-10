@@ -386,7 +386,15 @@ def test_b8_restart_during_final_sync_does_not_rerun_setup_or_training(harness):
     assert (final["phase"], final["synced"]) == (states.SUCCEEDED, False)
     harness.kill_all()
     harness.clear_rules()
-    harness.run_to_end()
+    harness.add_rule("copy", "/output", mode="delay", delay=1.0)
+    restarted = time.time()
+    harness.start()
+    beat = harness.wait_for(
+        lambda: (hb := harness.heartbeat()) and hb["ts"] > restarted and hb,
+        what="a heartbeat during the resumed final sync",
+    )
+    assert (beat["phase"], beat["step"]) == (states.UPLOADING, "final_sync")
+    harness.wait_done()
     status = harness.status()
     assert status["phase"] == states.SUCCEEDED, harness.diagnostics()
     assert (harness.work / "output" / "setups").read_text().split() == ["s"]
