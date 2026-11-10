@@ -70,7 +70,7 @@ class Store(Protocol):
 | G Skill 与示例 | `SKILL.md`、YOLO 示例、使用文档 | `skills/dgpu/`、`examples/yolo/`、`docs/usage.md` | Sonnet | 文档里的命令与 CLI 一致；示例可选在本机 CPU 上冒烟 |
 
 - **依赖**：A–G 都只依赖阶段 0 的契约，彼此不 import 对方未完成的实现。F 用 `FakeBackend` 和 `MemoryStore` 开发，阶段 2 再接真实实现。G 按设计 4.5 的命令表写，阶段 2 再核对。
-- **模型**：按你的规则，涉及并发、信号和数据完整性的 E、F 用 Opus，其余用 Sonnet。
+- **模型**：全部工作包和评审都用 Opus（用户 2026-11-10 的决定），上表“模型”列里的 Sonnet 不再适用。
 
 ## 5. 并行开发规则（写进 `AGENTS.md`）
 
