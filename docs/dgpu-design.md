@@ -49,7 +49,7 @@
 
 1. **不泄漏计费**：只要实例上的 runner 启动过，任务结束时实例就必须被销毁；未启动的情况由 `submit` 和 `gc` 兜底（见 4.8）。
 2. **主 API key（Vast、AutoDL）永不进入实例。** Vast 容器内只用 `CONTAINER_API_KEY`，AutoDL 容器内不需要任何平台 key。
-3. **`gc` 只碰带 dgpu 标签的实例**（Vast 标签 `dgpu:`，AutoDL 部署名前缀 `dgpu-`），不影响用户的其他实例。
+3. **`gc` 只碰带 dgpu 标签的实例**（标签 `dgpu-<job_id>-a<attempt>`，Vast 写在 label 字段，AutoDL 用作部署名），不影响用户的其他实例。
 4. **不静默丢数据**：上传失败、日志截断、重试、换机都写事件。
 5. **单写者**：同一任务同时只有一个 attempt 向存储写入。
 6. **存储是任务状态的唯一事实来源**，CLI 不依赖本地状态，换一台电脑也能查询。
@@ -84,6 +84,7 @@ setup: pip install ultralytics==8.4.208
 run: python train.py
 data:
   - r2://my-datasets/coco8       # 拷到 $DGPU_DATA/coco8
+  - ./datasets/my-small-set      # 本地目录：submit 时先传到存储，再由实例拉取，见 4.5
 gpu:
   names: [RTX 3090, RTX 4090]
   count: 1
@@ -128,6 +129,7 @@ model.train(data=f"{os.environ['DGPU_DATA']}/coco8/data.yaml", epochs=100, exist
 
 ```
 <bucket>/dgpu/tools/bundle-<sha256>.tar.gz     # runner + 固定版本的 rclone（linux/amd64），只传一次
+<bucket>/dgpu/datasets/<内容哈希>/              # 从本地路径上传的数据，.complete 标记最后写
 <bucket>/dgpu/jobs/<job_id>/
   spec.json   code.tar.gz
   attempt.json      # 当前 attempt、实例 ID、cancel 标志；If-Match 条件写
@@ -159,6 +161,8 @@ model.train(data=f"{os.environ['DGPU_DATA']}/coco8/data.yaml", epochs=100, exist
 
 代码打包：git 仓库用 `git ls-files -co --exclude-standard`，否则按 `.dgpuignore`。始终排除 `.git`、`.env*`、`*.pem`、`*.key`。超过 200 MB 报错，提示把数据放存储。
 
+本地数据路径（用户 2026-11-10 确认）：`data:` 里的本地目录在 `submit` 时上传到 `dgpu/datasets/<内容哈希>/`，实例再从那里拉取，拷到 `$DGPU_DATA/<目录名>`。内容哈希由相对路径、大小和文件 sha256 算出，已存在 `.complete` 标记时不重传。超过 5 GB 时先打印上传量并要求确认（`--yes` 跳过）。不做电脑到实例的 SSH 直传。
+
 `submit` 前打印费用上限：`每小时价格上限 × max_hours + 流量估算`，并检查余额够覆盖上限。
 
 ### 4.6 Vast 后端（`src/dgpu/backends/vast.py`）
@@ -173,7 +177,7 @@ class Backend(Protocol):
 ```
 
 - 搜索：`POST /api/v0/bundles/`，默认 `verified`、`rentable`、`reliability ≥ 0.98`、`inet_down ≥ 500`、`disk_space ≥ 所需`、`duration ≥ max_hours`、流量单价 ≤ $0.01/GB。按“算力 + 磁盘 + 流量”的预估总价排序。
-- 创建：`PUT /api/v0/asks/{id}/`，`runtype=ssh`、`cancel_unavail=true`、`label=dgpu:<job_id>:<attempt>`。实例 ID 取响应的 `new_contract`。
+- 创建：`PUT /api/v0/asks/{id}/`，`runtype=ssh`、`cancel_unavail=true`、`label=dgpu-<job_id>-a<attempt>`。实例 ID 取响应的 `new_contract`。
 - 轮询 `actual_status`：`loading` 超 15 分钟，或进入 `exited`/`unknown`/`offline` 时销毁并换机。
 - 已知怪点集中在这个文件里处理：`gpu_ram` 在 REST 中单位是 MB；`onstart` 上限 4048 字符。
 
@@ -215,15 +219,19 @@ Vast 上第 1、2 层的“销毁”是用 `CONTAINER_API_KEY` 调 API 销毁自
 
 ### 4.10 配置
 
-凭据放在 `~/.config/dgpu/config.toml`（权限 600）或环境变量：`VAST_API_KEY`、`AUTODL_TOKEN`、存储 profile 的 endpoint 与 key。存储 token 只授权所需的 bucket。
+凭据放在配置文件里，不写进 `job.yaml`。配置文件位置按优先级：`--config <路径>`、环境变量 `DGPU_CONFIG`、默认 `~/.config/dgpu/config.toml`。文件权限不是 600 时拒绝读取并提示。单个密钥也可以用环境变量覆盖：`VAST_API_KEY`、`AUTODL_TOKEN`、`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`。存储 token 只授权所需的 bucket。
 
 ```toml
 [stores.r2]
 endpoint = "https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
 bucket = "<bucket>"
+access_key_id = "..."
+secret_access_key = "..."
 [backends.vast]
+api_key = "..."
 store = "r2"
 [backends.autodl]
+token = "..."
 store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 ```
 
@@ -254,7 +262,7 @@ store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 用弹性部署 API 的 `Job` 类型（需企业认证，用户已有），Base URL `https://api.autodl.com`，开发者 token 放 `Authorization` 头：
 
 - **搜索**：`POST /api/v1/dev/machine/region/gpu_stock` 查各地区空闲卡数，按 `gpu.names` 和 `autodl.dc_list` 过滤。文档提醒多卡任务即使显示有库存也可能调度不上。
-- **创建**：`POST /api/v1/dev/deployment`，`deployment_type=Job`。`container_template` 填 `dc_list`、`gpu_name_set`、`gpu_num`、`cuda_v_from`、`price_from`/`price_to`（单位“元×1000”）、`image_uuid`、`cmd`（bootstrap）。部署名为 `dgpu-<job_id>-<attempt>`，作为标签使用。
+- **创建**：`POST /api/v1/dev/deployment`，`deployment_type=Job`。`container_template` 填 `dc_list`、`gpu_name_set`、`gpu_num`、`cuda_v_from`、`price_from`/`price_to`（单位“元×1000”）、`image_uuid`、`cmd`（bootstrap）。部署名为 `dgpu-<job_id>-a<attempt>`，作为标签使用。
 - **状态**：`POST /api/v1/dev/deployment/container/list` 和容器事件列表，映射到统一的 `InstanceState`。
 - **销毁**：`DELETE /api/v1/dev/deployment`（运行中会先停后删），幂等。
 - **余额**：`POST /api/v1/dev/wallet/balance`（数值除以 1000 为元），供 `doctor` 和提交前检查。
@@ -332,7 +340,7 @@ store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 ## 8. 实现状态与验证记录
 
 - [x] 设计确认（2026-11-10；4.12、4.13 随实施方案确认）
-- [ ] 阶段 0：骨架与契约
+- [x] 阶段 0：骨架与契约（2026-11-10，`make check`：19 个测试通过；`layout.py`、`states.py` 在 Python 3.9 下可导入）
 - [ ] 探针 P1–P4、A1–A5
 - [ ] 工作包 A–G
 - [ ] 集成与评审
