@@ -41,6 +41,7 @@ TOP_LEVEL_KEYS = (
     "gpu",
     "limits",
     "env",
+    "run_as_root",
 )
 GPU_KEYS = ("names", "count")
 LIMIT_KEYS = ("max_hours", "max_usd_per_hour", "max_cny_per_hour")
@@ -120,6 +121,7 @@ def parse_spec(doc: Any, *, base_dir: Path, backend_override: str | None = None)
     gpu = _parse_gpu(doc.get("gpu"))
     limits = _parse_limits(doc.get("limits"), backend)
     env = _parse_env(doc.get("env"))
+    run_as_root = _parse_run_as_root(doc.get("run_as_root", False))
 
     return JobSpec(
         version=SPEC_VERSION,
@@ -133,6 +135,7 @@ def parse_spec(doc: Any, *, base_dir: Path, backend_override: str | None = None)
         setup=setup,
         data=data,
         env=env,
+        run_as_root=run_as_root,
     )
 
 
@@ -527,6 +530,20 @@ def _parse_env(raw: Any) -> dict[str, str]:
             )
         env[key] = value
     return env
+
+
+def _parse_run_as_root(raw: Any) -> bool:
+    """可选：true 时 setup 和 run 以容器里的 root 运行（默认以无特权用户运行）。"""
+    if raw is None:
+        return False
+    if not isinstance(raw, bool):
+        raise _err(
+            "run_as_root",
+            f"应该是 true 或 false，现在是{_kind(raw)}",
+            "不写就是 false（训练以无特权用户运行）；确实需要 root（如 setup 里 apt install）"
+            "才写 run_as_root: true，代价见 docs/usage.md",
+        )
+    return raw
 
 
 # ---------------------------------------------------------------- 工具

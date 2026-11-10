@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 import yaml
 
-from dgpu.contracts import DataRef, SpecError
+from dgpu.contracts import DataRef, RunnerSettings, SpecError, build_remote_spec
 from dgpu.spec import load_spec
 
 DIGEST = "sha256:" + "a" * 64
@@ -106,6 +106,22 @@ def test_optional_fields_default(tmp_path):
     assert spec.data == ()
     assert spec.env == {}
     assert spec.gpu.count == 1
+    assert spec.run_as_root is False  # 默认以无特权用户运行训练
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_run_as_root_reaches_the_remote_spec(tmp_path, value):
+    spec = load_spec(_write(tmp_path, dict(BASE, run_as_root=value)))
+    assert spec.run_as_root is value
+    remote = build_remote_spec(
+        spec, job_id="j-1", backend="vast", data=[], runner=RunnerSettings()
+    )
+    assert remote["run_as_root"] is value
+
+
+@pytest.mark.parametrize("value", ["yes", 1, "true", [True]])
+def test_run_as_root_must_be_a_real_boolean(tmp_path, value):
+    _error(_write(tmp_path, dict(BASE, run_as_root=value)), "run_as_root", "true 或 false")
 
 
 def test_relative_paths_resolve_against_yaml_dir_not_cwd(tmp_path, monkeypatch):
