@@ -1,0 +1,35 @@
+# dgpu 的 YOLO 示例任务：在一张 3090 / 4090 上用 YOLO26n 训练 coco8（8 张图），
+# 结果传回 R2，机器自动销毁。用法见同目录的 README.md。尚未在真实平台验证。
+version: 1
+name: yolo-coco8
+backend: vast                      # vast 或 autodl；提交时也可以用 --backend 指定
+
+image:
+  # Vast：公开的 Docker 镜像，必须写固定 tag（不能用 latest）。镜像里要有 python3 和 bash。
+  vast: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+  # AutoDL：只能用 AutoDL 平台上的镜像，填镜像 UUID。
+  # >>> 用 AutoDL 时必须把下面这行换成你自己选的镜像 UUID <<<
+  autodl: "<AutoDL 镜像 UUID>"
+
+code: .                            # 打包这个目录（train.py 所在的目录）
+setup: python -m pip install ultralytics==8.4.208   # 固定版本：续跑时必须是同一个版本
+run: python train.py
+
+data:
+  - ./datasets/coco8               # 本地目录：提交时先传到 R2，机器上是 $DGPU_DATA/coco8
+  # - r2://<你的 bucket>/datasets/coco8   # 数据已经在 R2 上时改用这一行
+
+gpu:
+  names: [RTX 3090, RTX 4090]      # 任一即可
+  count: 1
+
+limits:                            # 必填。最坏花费约为 每小时上限 × max_hours
+  max_hours: 1
+  max_usd_per_hour: 0.40           # Vast，美元
+  max_cny_per_hour: 2.50           # AutoDL，人民币
+
+env:                               # 传给 train.py 的参数；不要在这里放密钥
+  DATASET: coco8
+  MODEL: yolo26n.pt
+  EPOCHS: "30"
+  IMGSZ: "640"
