@@ -70,7 +70,8 @@ env:                            # 可选，传给训练代码；值写成字符�
 1. 从 `$DGPU_DATA/<名字>` 读数据，结果写进 `$DGPU_OUTPUT`。
 2. checkpoint 写进 `$DGPU_CKPT`，**先写 `xxx.tmp`，再 rename 成正式文件名**。上传时跳过 `*.tmp`，存储里只会有完整的文件。
 3. `DGPU_RESUME=1` 时从 `$DGPU_CKPT` 加载并接着训练；加载失败时从头开始，并打印原因。
-4. 成功退出码 0，失败非 0。训练进程拿不到存储密钥，也不需要。
+4. 成功退出码 0，失败非 0。训练进程不需要存储密钥。
+5. 训练通常以普通用户 `dgpu` 运行（读不到 R2 密钥）：`pip install` 照常可用（自动装到 `$HOME/.local`），`apt-get`、`conda install` 会失败——改用 pip 能装的包，或请用户决定在 `job.yaml` 里加 `run_as_root: true`（训练代码因此能读到 R2 密钥）。
 
 ```python
 ckpt = Path(os.environ["DGPU_CKPT"]) / "last.pt"
@@ -180,6 +181,8 @@ FAILED 的原因：
 | 代码包超过 200 MB | 把数据、权重、输出移出代码目录，或写进 `.gitignore` / `.dgpuignore` |
 | 提交时说某个文件超过 5 GiB | 请用户用 rclone 把数据传到 bucket，`data` 里改写成 `r2://<bucket>/<目录>` |
 | 连续两次 `runner_timeout` | 镜像缺 `python3` 或 `bash`，换镜像 |
-| 日志里有 `libGL.so.1` | OpenCV 缺系统库：`setup` 里装 `libgl1`，或改装 `opencv-python-headless` |
+| 日志里有 `libGL.so.1` | OpenCV 缺系统库：改装 `opencv-python-headless`；要在 `setup` 里 `apt-get install libgl1` 就得请用户同意加 `run_as_root: true` |
+| `setup` 里 `apt-get` / `conda install` 报 Permission denied | 训练以普通用户运行，见第 3 节第 5 条 |
+| dgpu 自己出错（日志里有“runner 内部错误”） | 看 R2 上 `logs/attempt-<n>.runner.log`（诊断日志的最后 256 KB） |
 | 续跑后又从第 0 轮开始 | 训练代码没处理 `DGPU_RESUME`，或 checkpoint 没写进 `DGPU_CKPT` |
 | AutoDL 上下载很慢或失败 | 跨境网络问题，告诉用户；可能要改用国内对象存储 |

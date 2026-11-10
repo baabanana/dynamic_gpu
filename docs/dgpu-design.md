@@ -110,7 +110,11 @@ env:
 
 - 退出码 0 为成功，其他为失败。
 - **放进 `DGPU_CKPT` 的文件必须已经写完整**：先写 `*.tmp`，再 rename。runner 同步时排除 `*.tmp`。
-- 存储凭据和 `CONTAINER_API_KEY` 从训练进程的环境中移除，训练代码不需要它们。
+- 存储凭据和 `CONTAINER_API_KEY` 从训练进程的环境中移除，训练代码不需要它们。训练命令用 `bash -lc` 运行（有的镜像靠 profile 配置 conda 等环境）；profile 执行之后 dgpu 再清除一次凭据类变量，把 profile 删掉的 PATH 条目补回末尾，重新导出 `DGPU_*`。
+- **降权**（评审 B4，2026-11-10 用户确认）：容器里 runner 是 root 时（Vast、AutoDL 默认如此），`setup` 和 `run` 默认以无特权用户 `dgpu` 运行，`HOME` 是 `<工作目录>/home`。用户已存在就沿用，否则用 `useradd` 创建，没有 `useradd` 时取一个空闲的固定高位 uid/gid（不需要 passwd 条目）。这时训练进程读不到存储凭据（`launch.json`、`run/` 只有 root 能读；root 进程的 `/proc/<pid>/environ` 也读不到），也不能向 runner、watchdog、rclone 发信号；它能写的只有 `DGPU_OUTPUT`、`DGPU_CKPT`、`DGPU_DATA`、代码目录、`HOME` 和 `/tmp`。
+  - `pip install x` 照常可用：site-packages 不可写（root 拥有的 conda 或系统 Python）时设 `PIP_USER=1`、`PYTHONUSERBASE=$HOME/.local`，包装到用户目录，`run` 里直接能 import。`conda install`、`apt-get` 需要 root。
+  - **下列情况不降权，训练进程和 runner 同一用户，能读到凭据**：runner 本身不是 root；spec 的 `run_as_root` 为 true（`job.yaml` 的同名字段，CLI 一侧的解析待实现，`contracts.JobSpec.run_as_root` 和 spec.json 已支持）；建不了用户、GPU 设备文件对其他用户不可读写、改不了目录属主或权限、换身份失败、这个用户跑不了 `python3`、Python 在 root 拥有且禁用用户 site 的 venv 里（pip 没有可写的安装位置）。每种情况在日志里记一行，并写 `run_as_root` 事件（`data.reason` 说明原因）。
+  - 换身份本身（setuid 之后真的读不到凭据、发不了信号，GPU 可用，`useradd` 和 `pip --user` 在镜像里可用）只在本地用注入的系统调用测试过，要在真实实例上确认（第 9 节）。
 
 YOLO 配方（示例，未运行，随实现放入 `examples/yolo/`）：
 
@@ -139,6 +143,7 @@ model.train(data=f"{os.environ['DGPU_DATA']}/coco8/data.yaml", epochs=100, exist
   heartbeat.json    # 时间、attempt、阶段、GPU 利用率、最近日志时间、已同步字节
   events/<ts>-<source>-<rand>.json
   logs/attempt-<n>.log
+  logs/attempt-<n>.{runner,watchdog,bootstrap}.log   # 实例上各进程诊断日志的最后 256 KB
   output/  ckpt/
 ```
 
@@ -148,7 +153,7 @@ model.train(data=f"{os.environ['DGPU_DATA']}/coco8/data.yaml", epochs=100, exist
 
 失败原因：`no_offer`、`startup`、`runner_timeout`、`preflight`、`data_sync`、`setup`、`exit_code`、`stalled`、`runner_crashed`（runner 进程消失，watchdog 收尾）、`signalled`（runner 收到 SIGTERM/SIGINT，自己提前收尾）、`final_sync`、`fenced`。
 
-事件名固定：`offer_rejected`、`create_failed`、`startup_timeout`、`runner_timeout`、`preflight_failed`、`data_sync_retry`、`ckpt_restored`、`sync_failed`、`log_truncated`、`stalled`、`deadline_hit`、`final_sync_failed`、`self_destroy_failed`、`attempt_fenced`、`gc_destroyed`、`instance_destroyed`、`dataset_uploaded`、`destroy_failed`、`relaunch`。其中 `relaunch` 由 CLI 在换机或重试把 attempt 加 1 时写，`attempt_fenced` 由 runner / watchdog 在发现更新的 attempt 时写；`destroy_failed` 是 CLI 或 `gc` 销毁实例失败、或销毁后没能确认实例消失（实例可能仍在计费）。
+事件名固定：`offer_rejected`、`create_failed`、`startup_timeout`、`runner_timeout`、`preflight_failed`、`data_sync_retry`、`ckpt_restored`、`sync_failed`、`log_truncated`、`stalled`、`deadline_hit`、`final_sync_failed`、`self_destroy_failed`、`attempt_fenced`、`gc_destroyed`、`instance_destroyed`、`dataset_uploaded`、`destroy_failed`、`relaunch`、`run_as_root`。其中 `relaunch` 由 CLI 在换机或重试把 attempt 加 1 时写，`attempt_fenced` 由 runner / watchdog 在发现更新的 attempt 时写；`destroy_failed` 是 CLI 或 `gc` 销毁实例失败、或销毁后没能确认实例消失（实例可能仍在计费）；`run_as_root` 是 runner 记下的“训练进程没有降权”（4.3）。
 
 ### 4.5 CLI（`src/dgpu/cli.py`）
 
@@ -209,19 +214,23 @@ class Backend(Protocol):
 
 启动命令（Vast 的 `onstart`、AutoDL 的 `cmd`）只放 bootstrap：用 `python3` 通过预签名 URL 下载 bundle 和本次尝试的 `secrets-<n>.json`，校验 sha256，解压，启动 watchdog 和 runner。Vast 的 `onstart` 在每次容器启动时都会运行，所以 bootstrap 和 runner 必须幂等（`.ready` 标记）。
 
-实例上的工作目录：环境变量 `DGPU_WORK_ROOT`；没有时，存在 AutoDL 的数据盘 `/root/autodl-tmp` 就用 `/root/autodl-tmp/dgpu`，否则 `/workspace/dgpu`。下面是 `code/`、`data/`、`output/`、`ckpt/`、`logs/`、`run/`（运行状态）。
+实例上的工作目录：环境变量 `DGPU_WORK_ROOT`；没有时，存在 AutoDL 的数据盘 `/root/autodl-tmp` 就用 `/root/autodl-tmp/dgpu`，否则 `/workspace/dgpu`。下面是 `code/`、`data/`、`output/`、`ckpt/`、`home/`（训练用户的 HOME）、`logs/`、`run/`（运行状态）。`run/`、`logs/`、`launch.json`、`bundle-*/` 只有 root 能读；降权时 `code/`、`data/`、`output/`、`ckpt/`、`home/` 归训练用户。bootstrap 只把 `flock` 的 EAGAIN 当作“已有 runner 在运行”，文件系统不支持 flock 时记一行继续，boot 和 watchdog 改看 `run/runner.pid`。
 
 runner 的步骤：
 
 1. **Preflight**：先写 `RUNNING` 和第一次心跳（`step=preflight`），再检查 `nvidia-smi`、磁盘余量、能否读回刚写的心跳。失败则写 `FAILED(preflight)` 并自毁，`submit` 换机；通过后立刻再写一次心跳（`step` 离开 `preflight`）。`submit` 看到心跳的 `step` 离开 `preflight` 才认为启动成功并返回。
-2. **拷代码和数据**：`rclone copy`，失败重试 3 次，完成后写 `.ready`。
-3. **恢复** `ckpt/`，设置 `DGPU_RESUME`。
-4. **`setup`，然后 `run`**：在独立进程组运行，输出由线程持续读取并写入日志（上限 200 MB，超出后继续读取但不再落盘，并写 `log_truncated`）。
-5. **后台**：每 60 秒写心跳并读 `attempt.json`（发现 attempt 变大或 `cancel` 就停止）；每 120 秒同步 `output/`、`ckpt/`、日志。心跳和同步在不同线程，互不阻塞。
-6. **卡死检测**：GPU 利用率为 0 且日志 60 分钟没有新内容，写 `stalled` 并终止。可配置，0 表示关闭。
-7. **收尾**：结束训练进程（SIGTERM，宽限 `term_grace_s` 后 SIGKILL），写 `UPLOADING`，最终同步（失败则重试；`output/` 和 `ckpt/` 共用 `final_sync_timeout_min`，默认 20 分钟），本地记下结论，上传日志和事件，**最后**写最终状态，自毁。最终状态是自毁前最后一次写存储，CLI 看到终态就可以销毁实例而不会丢日志。收到 SIGTERM/SIGINT 时同样收尾，原因为 `signalled`。
+2. **拷代码和数据**：`rclone copy`，失败重试 3 次，完成后写 `.ready`。`output/`、`ckpt/` 在启动时就建好。
+3. **恢复** `ckpt/`，设置 `DGPU_RESUME`。下载下来的文件记为“已上传”（见第 7 步的同步记录）。
+4. **准备训练用户**（4.3 的降权），然后 **`setup`，再 `run`**：在独立进程组运行，输出由线程持续读取并写入日志。日志上限 200 MB 只限制训练输出：超出后继续读取，只保留最后 1 MB（磁盘上两个轮换的尾部文件），收尾时附在日志末尾并写明丢弃了多少字节；runner 的说明（失败原因、退出码、最终状态）另有 1 MB 空间；写 `log_truncated`。日志始终只追加。
+5. **后台**：每 60 秒写心跳并读 `attempt.json`（发现 attempt 变大或 `cancel` 就停止）；每 120 秒同步 `output/`、`ckpt/`、日志。周期同步写入之前，如果最近一次成功读 `attempt.json` 已超过 3 个心跳间隔（心跳线程卡住），先自己读一次，读不到这一轮就不写。心跳、同步、事件上传、GPU 利用率采样各在自己的线程，互不阻塞；写事件只进本地队列并唤醒上传线程，不等存储。
+6. **卡死检测**（只用于 `run`）：GPU 利用率为 0 且日志 60 分钟没有新内容，写 `stalled` 并终止。利用率取读得出来的卡里最高的，某张卡报 N/A 不影响其他卡。可配置，0 表示关闭。
+7. **收尾**：结论一确定就写进本地的 `run/final.json`（`synced=false`）。结束训练进程（SIGTERM，宽限 `term_grace_s` 后 SIGKILL）。训练开始过、或本地 `output/`、`ckpt/` 里有文件时（容器重启后已经超时或被取消，内存里的标志都没了），先读一次 `attempt.json`，写 `UPLOADING`，做最终同步（失败则重试；`output/` 和 `ckpt/` 共用 `final_sync_timeout_min`，默认 20 分钟；本地不存在的目录跳过）。没传上去的文件按同步记录计算：每次成功同步一个目录，记下同步开始前的快照（路径、大小、mtime_ns），之后改过的文件（包括等大小改写）都算没上传；记录损坏时本地所有文件都算，目录列不出来时写“无法确定”，不会报 0。然后 `final.json` 改成 `synced=true`，上传日志（含 runner、watchdog、bootstrap 诊断日志的最后 256 KB）和事件，停心跳线程（它一直在读 `attempt.json`），必要时再确认一次 attempt，**最后**写最终状态，自毁。最终状态是自毁前最后一次写存储，CLI 看到终态就可以销毁实例而不会丢日志。收到 SIGTERM/SIGINT 时同样收尾，原因为 `signalled`。
 
-runner 以 `RCLONE_CONFIG_*` 环境变量把存储凭据交给 rclone，不传给训练进程。
+同一 attempt 的容器重启（Vast 每次启动都执行 onstart）按 `run/final.json` 接着做：没有结论就重新运行（代码和数据按 `.ready` 不重下，从 ckpt 恢复）；结论已定但最终同步没做完，只做最终同步和后面的收尾，不重跑 `setup` 和训练；状态已写，只自毁。
+
+子进程的等待都有上限：SIGKILL 之后最多等 `kill_wait_s`（默认 5 秒），进程仍不退出（如卡在驱动里的 `nvidia-smi`，D 状态）就放弃它。preflight 时 `nvidia-smi` 卡住算 GPU 故障（`FAILED(preflight)`，CLI 换机）；训练期间卡住则暂停 GPU 采样（利用率记为未知，不判卡死），取消和截止照常处理。
+
+runner 以 `RCLONE_CONFIG_*` 环境变量把存储凭据交给 rclone，不传给训练进程。每个正在运行的 rclone 登记在 `run/rclone-<组件>/<pid>`，runner 被杀后 watchdog 按登记（核对命令行，防止 pid 复用）杀掉它们，免得它们在 watchdog 写状态之后才落盘。
 
 ### 4.8 销毁的多层保证
 
@@ -229,15 +238,18 @@ runner 以 `RCLONE_CONFIG_*` 环境变量把存储凭据交给 rclone，不传�
 |---|---|---|---|
 | 1 | runner | 所有退出路径 | 正常结束、失败、超时、取消 |
 | 2 | watchdog（独立进程，用单调时钟） | runner 进程消失；或到达硬截止 = `max_hours` + runner 最坏收尾时间 + 余量（默认 5 分钟） | runner 崩溃、收尾卡住 |
+| 2' | AutoDL 前台的 boot | watchdog 意外退出（重启它，最多 5 次）；或到达 boot 自己的硬截止 = watchdog 应该收尾完的时间 + 余量 | watchdog 也失效、runner 又卡住 |
 | 3 | `submit` / `retry` / `wait --retries` 前台 | 启动超时、心跳未出现、preflight 失败、标签被改写、价格高于上限、Ctrl-C / SIGTERM / SIGHUP | 镜像坏、runner 没跑起来、机器有问题、终端关闭、进程被系统停止 |
 | 4 | `dgpu gc` | 任务已结束、更旧的 attempt、超过截止时间、心跳过期 30 分钟且平台显示实例已退出或状态未知（或心跳停满 runner 最坏收尾时间）、启动卡住；销毁后用详情和列表确认实例消失 | 电脑中途关机、submit 被 SIGKILL、自毁 API 失败 |
 | 5 | 账户设置 | 余额耗尽时实例被停止 | 以上全失效时的最终上限 |
 
 `gc` 只处理标签能解析、且任务 ID 是 `layout.new_job_id` 生成的形状（`<名字>-<12 位时间>-<4 位十六进制>`，`layout.is_generated_job_id`）的实例；手工起名的 `dgpu-x-a1` 不碰。存储里查不到对应任务的实例（可能属于另一份配置的 bucket，或共用平台账户的同事）只报告为“未知任务”（附年龄和标签），`gc --include-unknown` 确认后（`--yes` 跳过确认）才销毁。心跳过期按存储的时钟算（见 4.5）；平台显示实例仍在运行时报告“失联（实例仍在运行）”并保留。
 
-runner 最坏收尾时间是各步骤时限之和：`term_grace_s` + 停后台线程 + `UPLOADING` 和列出未上传文件的存储操作 + `final_sync_timeout_min` + 写日志、事件和最终状态的预算 + 自毁的全部重试（`runner/util.py` 的 `teardown_worst_case_s`）。watchdog 的硬截止总比它多出一个余量，所以 watchdog 不会杀掉还在时限内收尾的 runner。`attempt.json` 的 `deadline_at`（gc 用）= 创建时间 + 启动窗口（`startup_timeout_min + runner_timeout_min`）+ watchdog 硬截止 + watchdog 自己收尾的时间 + 30 分钟，和 watchdog 用同一个公式。watchdog 的每个存储操作都有时限，自毁放在 `finally` 里。
+runner 最坏收尾时间是各步骤时限之和：`term_grace_s` + 两次 `kill_wait_s`（SIGKILL 后等进程消失、回收）+ 停三个后台线程（同步、心跳、事件上传）+ `UPLOADING` 和最终同步前读 `attempt.json` + `final_sync_timeout_min` + 写日志、事件和最终状态的预算（`teardown_budget_s`，后一半留给最终状态）+ 自毁的全部重试（`runner/util.py` 的 `teardown_worst_case_s`；没上传的文件按本地同步记录计算，不访问存储）。watchdog 的硬截止总比它多出一个余量，所以 watchdog 不会杀掉还在时限内收尾的 runner。
 
-Vast 上第 1、2 层的“销毁”是用 `CONTAINER_API_KEY` 调 API 销毁自身。AutoDL 上容器只在 `cmd` 运行期间存在，第 1、2 层的“销毁”就是结束 runner 进程树，CLI 在任务终态后再删除部署记录。
+watchdog 接手时（runner 消失，或到达硬截止时先 SIGKILL runner）：杀掉 runner 留下的 rclone 和训练进程，确认没有更新的 attempt（本地标记和存储里的 `attempt.json`），最终同步没做完时尽力同步一次（总时限 `watchdog_sync_timeout_s` 和 `final_sync_timeout_min` 取小），按同步记录算出没上传的文件，然后传日志和事件，最后写状态：runner 已经得出结论就用它的结论，否则崩溃写 `FAILED(runner_crashed)`、硬截止写 `TIMED_OUT`。每个存储操作都有时限，日志、事件、状态共用 `teardown_budget_s`，整个接手过程的上限是 `watchdog_teardown_worst_case_s`；自毁放在 `finally` 里。`attempt.json` 的 `deadline_at`（gc 用）= 创建时间 + 启动窗口（`startup_timeout_min + runner_timeout_min`）+ watchdog 硬截止 + watchdog 接手的上限 + 30 分钟，和 watchdog 用同一个公式（`instance_lifetime_s`）。
+
+Vast 上第 1、2 层的“销毁”是用 `CONTAINER_API_KEY` 调 API 销毁自身。AutoDL 上容器只在 `cmd` 运行期间存在，第 1、2 层的“销毁”就是结束 runner 进程树，CLI 在任务终态后再删除部署记录。AutoDL 的 `cmd`（boot 留在前台）在最终状态已写进存储（或本 attempt 已被取代）时退出 0，不管任务结果如何，结果以 `status.json` 为准；一个状态都没记录时才非 0（探针 A1 确认 Job 会不会重启非 0 退出的容器之前，避免失败的任务被反复重启）。Vast 上 boot 启动后立即退出 0，不变。
 
 建议：用 launchd 每 10 分钟跑一次 `dgpu gc`（可选，电脑休眠时不运行）；两个平台都只充少量余额，不绑定自动扣款的卡。
 
@@ -333,10 +345,17 @@ store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 | `setup` 失败、训练非 0 退出 | `FAILED`，上传日志，销毁，不自动重试（多半是代码问题） | `status.json` |
 | 训练卡死 | 终止，`FAILED(stalled)`，销毁 | `stalled` |
 | 超过 `max_hours` | SIGTERM，宽限 60 秒后 SIGKILL，收尾，`TIMED_OUT`，销毁 | `deadline_hit` |
-| runner 崩溃 | watchdog 尽力同步一次，写 `FAILED(runner_crashed)`，销毁 | `status.json` |
+| runner 崩溃 | watchdog 杀掉 runner 留下的 rclone，尽力同步一次，按同步记录列出没传上去的文件，写 `FAILED(runner_crashed)`（runner 已有结论时写它的结论），销毁 | `status.json` |
+| runner 活着但超过硬截止还没收尾完 | watchdog 结束所有进程，同样尽力同步一次并列出没传上去的文件，写 `TIMED_OUT`（runner 已有结论时写它的结论），销毁 | `deadline_hit` |
+| AutoDL 上 watchdog 意外退出 | boot 重启它（最多 5 次）；watchdog 也失效、runner 又卡住时，boot 到自己的硬截止结束一切，容器释放 | boot 的平台日志 |
+| 同一 attempt 的容器重启（Vast） | 训练没结束：重新运行，代码和数据不重下，从 ckpt 恢复；结论已定但最终同步没做完：只做最终同步和收尾；重启时已超过 `max_hours` 或已取消：不重跑，上传本地结果后写 `TIMED_OUT` / `CANCELLED` | `status.json` |
+| `nvidia-smi` 卡死 | preflight 时算 GPU 故障，销毁换机；训练期间暂停 GPU 采样（不判卡死），取消和截止照常处理 | `preflight_failed` / 日志 |
+| 训练进程不能降权（runner 不是 root、`run_as_root`、建不了用户等） | 和 runner 同一用户运行，日志一行说明 | `run_as_root` |
+| 文件系统不支持 flock | 记一行，改用 `run/runner.pid` 判断 runner 是否在运行 | runner / watchdog 日志 |
 | runner 收到 SIGTERM/SIGINT（容器被停止） | 停止训练、最终同步，写 `FAILED(signalled)`，销毁 | `status.json` |
 | 运行中存储断连 | 继续训练，恢复后补传；CLI 看到心跳过期、平台显示实例仍在运行时只报告“失联（实例仍在运行）”，不销毁、不重试 | `sync_failed` |
-| 最终上传失败 | 重试到时限；仍失败则写明未上传的文件，`FAILED(final_sync)`，销毁，本地数据随之丢失 | `final_sync_failed` |
+| 最终上传失败 | 重试到时限；仍失败则写明未上传的文件（按同步记录，等大小改写也算；拿不准时写“无法确定”而不是 0），`FAILED(final_sync)`，销毁，本地数据随之丢失 | `final_sync_failed` |
+| 代码或数据下载失败后收尾 | 本地没有结果，最终同步立即结束，不写 `final_sync_failed` | `data_sync_retry` |
 | 宿主机宕机 | 心跳过期（按存储的时钟）显示 `LOST`；平台也显示实例已退出、消失或状态未知（或心跳停满 runner 最坏收尾时间）后，`wait --retries` 才换机续跑，`gc` 才销毁；`retry` 随时可以手动换机 | `relaunch`、`gc_destroyed` |
 | 电脑或实例的时钟不准 | 不影响：心跳过期用存储对象的 `LastModified` 和存储响应的 `Date` 计算 | — |
 | 取消之后 runner 已经不在（取消没人执行） | `wait --retries` 不自动重试，`retry` 拒绝，提示 `cancel --force`；任务已结束后显式 `retry` 会清除取消标志 | CLI 输出 |
@@ -354,7 +373,7 @@ store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 | 存储里查不到任务的 dgpu 实例（另一份配置的 bucket、同事的任务、手工起名） | `gc` 只报告“未知任务”（附年龄和标签），`--include-unknown` 确认后才销毁；任务 ID 不是 `new_job_id` 形状的标签不碰 | `gc` 输出 |
 | 账户余额耗尽 | 实例被平台停止，心跳过期显示 `LOST`；提交前已检查余额 | `status` 显示 |
 | Vast key 没有读取账户信息的权限（需要两步验证） | `doctor` 报警告并用列出实例验证 key；`submit` 提示“未检查余额”后继续；key 无效仍报错 | CLI 输出 |
-| 日志过大 | 继续读取防止阻塞，不再落盘 | `log_truncated` |
+| 日志过大 | 继续读取防止阻塞；训练输出只保留最后 1 MB，结束时附在日志末尾；失败原因、退出码、最终状态照常写进日志 | `log_truncated` |
 | 重复 `submit` | 生成两个独立任务，属于预期行为 | 不同 job ID |
 
 ## 6. 验收标准
@@ -397,6 +416,9 @@ store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 ## 9. 后续风险
 
 - **凭据暴露给房东**：凭据和训练数据都会落到租用机器的磁盘上，社区机器的房东可以读到。v1 用只授权相关 bucket 的专用 token，敏感数据打开 `datacenter_only`。Cloudflare 可能提供带 TTL 的临时凭据，尚未核实，后续可替换。
+- **训练进程读到凭据**：降权（4.3）只在 runner 是 root 且条件满足时生效；不降权时（有 `run_as_root` 事件）训练代码能读到存储凭据和 Vast 的容器 key。降权本身只在本地用注入的系统调用测试过，要在真实实例上确认：setuid 之后读不到 `launch.json` 和 root 进程的 `/proc/<pid>/environ`、不能向 runner 发信号；`/dev/nvidia*` 对新用户可用（标准 NVIDIA 容器里是 0666）；镜像里有 `useradd`；`pip --user` 在镜像的 Python 里可用。另外，镜像或平台如果把 `CONTAINER_API_KEY` 写进全局可读的 `/etc/environment`，降权也挡不住（这个 key 只能操作本实例）。Python 装在 root 拥有的 venv 里（禁用用户 site）时目前不降权，以后可以给训练用户叠一层可写的 venv。
+- **被放弃的进程**：SIGKILL 无效的进程（卡在驱动里的 `nvidia-smi`、卡在内核里的 rclone）会被放弃而不是等待，它们一直留到实例销毁。
+- **AutoDL 的 `cmd` 退出码**：最终状态已记录时一律退出 0，依据是“Job 可能重启非 0 退出的容器”的推测，探针 A1 之后再定。
 - **遗留实例的残余风险**：实例启动了但 runner 没起来，同时电脑关机（或 `submit` 被 SIGKILL）且一直没跑 `gc`，会一直计费到余额耗尽。需确认 Vast 是否有服务端定时销毁，有的话加一层。
 - **失联判断偏保守**：心跳过期而平台显示实例仍在运行时，`wait --retries` 和 `gc` 最多多等 runner 最坏收尾时间（默认约 42 分钟）才动手，这段时间可能在为一台卡死的机器付费；换来的是不会销毁正在最终上传或暂时连不上存储的实例。平台状态字符串（Vast 的 `offline`、AutoDL 的部署状态）和真实宕机的对应关系要靠探针确认。
 - **存储时钟**：过期判断依赖存储响应的 `Date` 头（R2 和 S3 都有）；不给 `Date` 的存储每次读取多一次探针写入和删除。

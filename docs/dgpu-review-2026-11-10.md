@@ -42,28 +42,28 @@
 
 | 编号 | 级别 | 问题 | 位置 | 核实 | 修复方向 | 状态 |
 |---|---|---|---|---|---|---|
-| B1 | 严重 | `not_uploaded` 只比较文件大小：checkpoint 被等大小改写后，最终上传失败时报告“0 个文件没有传上去”，存储里是旧文件 | `runner/main.py` | 复现 | 每次成功同步记录（路径、大小、mtime_ns），之后变化的都算未上传；拿不准时报“未知”而不是 0 | 待修 |
-| B2 | 高 | 最终同步对 output 和 ckpt 各用了整个时限，总时长可达设定的 2 倍；watchdog 硬截止只留“时限 + 10 分钟”，会杀掉正在上传的 runner，把成功的训练记成 TIMED_OUT，且不上传结果 | `runner/main.py`、`runner/watchdog.py`、`runner/util.py` | 复现 | 每个目标只用剩余时间；watchdog 余量由 runner 各收尾阶段的上限之和推出；硬截止时做一次有界的同步并计算 `not_uploaded` | 集成分支处理中（第 9 项） |
-| B3 | 高 | watchdog 上传日志没有超时，存储卡住时自毁被阻塞；处理函数里抛异常会跳过自毁 | `runner/watchdog.py` | 复现 | watchdog 的每个存储调用都带超时，有总预算；自毁放进 `finally` | 集成分支处理中 |
-| B4 | 高 | 训练和 `setup` 与 runner、watchdog 同一用户：能读到 `launch.json`、`/proc/*/environ` 里的凭据；`pkill -9 python` 会同时杀掉 runner 和 watchdog，实例无人销毁 | `runner/main.py`、`runner/boot.py` | 复现 | 容器内是 root 时，训练进程降权到无特权用户运行（`preexec_fn` 里 setgid/setuid），`run/` 和 `launch.json` 仅 root 可读；不是 root 时退回现状并记日志。文档不再声称凭据对训练进程不可见 | 待修（设计变更，需写进设计文档） |
-| B5 | 高 | Vast 实例重启后已超过 `max_hours`（或停机期间被取消）时，本地结果不上传：是否做最终同步取决于只存在内存里的标志 | `runner/main.py` | 复现 | 按磁盘上的状态（output/ckpt 非空或持久化标记）决定 | 待修 |
-| B6 | 高 | `nvidia-smi` 卡死（D 状态，SIGKILL 无效）时 `subprocess.run(timeout=)` 的 `wait` 永不返回，runner 主线程卡住而心跳照常，直到 watchdog 硬截止 | `runner/gpu.py`、`runner/main.py` | 读代码（macOS 无法复现） | 用 Popen 加截止时间轮询，超时后放弃该进程不再等待，按 GPU 故障处理；SIGKILL 之后的 wait 都要有上限 | 待修 |
-| B7 | 中 | 代码下载失败时，最终同步对不存在的目录重试满 20 分钟才销毁，并写出多余的 `final_sync_failed` | `runner/main.py` | 复现 | 提前创建目录；跳过本地不存在的目标 | 待修 |
-| B8 | 中 | 最终同步期间实例重启会重跑 `setup` 和整个训练 | `runner/main.py` | 复现 | 结果一确定就落盘（带“待最终同步”标记），重启后从最终同步继续 | 待修 |
-| B9 | 中 | 日志超过上限后，失败原因、退出码、最终状态也被丢弃；runner 自身异常的 traceback 只在不上传的 `runner.log` 里 | `runner/logsink.py`、`runner/main.py` | 复现 | 保留训练输出尾部的环形缓冲；给 runner 的说明留空间；上传 `runner.log`、`watchdog.log`、`bootstrap.log` 的尾部 | 待修 |
-| B10 | 中 | AutoDL 前台的 boot 自己没有截止时间：watchdog 死掉且 runner 卡住时，`cmd` 永不返回 | `runner/boot.py` | 复现 | boot 自己按 `spec.json` 和 `started.json` 执行硬截止，并重启死掉的 watchdog | 待修 |
-| B11 | 低 | 周期同步线程没有真正停止，收尾时与最终同步抢带宽 | `runner/main.py` | 复现 | 目标之间检查停止标志 | 待修 |
-| B12 | 低 | runner 被杀后，它启动的 rclone 进程还活着，可能在 watchdog 写状态之后落盘 | `runner/rclone.py` | 复现 | 记录 rclone 的进程组，watchdog 一并杀掉 | 待修 |
+| B1 | 严重 | `not_uploaded` 只比较文件大小：checkpoint 被等大小改写后，最终上传失败时报告“0 个文件没有传上去”，存储里是旧文件 | `runner/main.py` | 复现 | 每次成功同步记录（路径、大小、mtime_ns），之后变化的都算未上传；拿不准时报“未知”而不是 0 | 已修复：`tests/test_runner_review.py::test_b1_same_size_rewrite_after_upload_is_reported_not_uploaded`、`test_b1_sync_record_rules`（同步记录 `runner/syncstate.py`） |
+| B2 | 高 | 最终同步对 output 和 ckpt 各用了整个时限，总时长可达设定的 2 倍；watchdog 硬截止只留“时限 + 10 分钟”，会杀掉正在上传的 runner，把成功的训练记成 TIMED_OUT，且不上传结果 | `runner/main.py`、`runner/watchdog.py`、`runner/util.py` | 复现 | 每个目标只用剩余时间；watchdog 余量由 runner 各收尾阶段的上限之和推出；硬截止时做一次有界的同步并计算 `not_uploaded` | 已修复：集成分支的公式和按剩余时间分配之外，watchdog 硬截止时也做一次有界同步并按同步记录算出 `not_uploaded`。`tests/test_runner_review.py::test_b2_b3_b12_watchdog_hard_deadline_with_live_slow_runner_and_hung_storage`、`test_b2_watchdog_hard_deadline_uploads_results_when_storage_works`、`test_b2_runner_slow_in_teardown_within_its_limits_is_not_killed`；`test_runner_unit.py::test_final_sync_total_is_bounded_by_its_setting` |
+| B3 | 高 | watchdog 上传日志没有超时，存储卡住时自毁被阻塞；处理函数里抛异常会跳过自毁 | `runner/watchdog.py` | 复现 | watchdog 的每个存储调用都带超时，有总预算；自毁放进 `finally` | 已修复：watchdog 的同步有总时限，日志、事件、状态共用 `teardown_budget_s`，上限计入 `util.watchdog_teardown_worst_case_s`（之前少算了同步和多次事件上传）。`test_b2_b3_b12_watchdog_hard_deadline_with_live_slow_runner_and_hung_storage`；`test_runner_unit.py::test_watchdog_self_destroys_even_if_*` |
+| B4 | 高 | 训练和 `setup` 与 runner、watchdog 同一用户：能读到 `launch.json`、`/proc/*/environ` 里的凭据；`pkill -9 python` 会同时杀掉 runner 和 watchdog，实例无人销毁 | `runner/main.py`、`runner/boot.py` | 复现 | 容器内是 root 时，训练进程降权到无特权用户运行（`preexec_fn` 里 setgid/setuid），`run/` 和 `launch.json` 仅 root 可读；不是 root 时退回现状并记日志。文档不再声称凭据对训练进程不可见 | 已修复（换身份本身要在真实实例上验证）：`runner/privsep.py`，spec 的 `run_as_root` 可关闭；不降权时记一行和 `run_as_root` 事件。`tests/test_runner_privsep.py`、`tests/test_runner_review.py::test_b4_not_root_falls_back_with_one_line_and_an_event`；设计 4.3、4.7 已改 |
+| B5 | 高 | Vast 实例重启后已超过 `max_hours`（或停机期间被取消）时，本地结果不上传：是否做最终同步取决于只存在内存里的标志 | `runner/main.py` | 复现 | 按磁盘上的状态（output/ckpt 非空或持久化标记）决定 | 已修复：是否最终同步看磁盘上的结果。`tests/test_runner_review.py::test_b5_restart_after_the_deadline_uploads_local_results`、`test_b5_restart_after_cancel_uploads_local_results` |
+| B6 | 高 | `nvidia-smi` 卡死（D 状态，SIGKILL 无效）时 `subprocess.run(timeout=)` 的 `wait` 永不返回，runner 主线程卡住而心跳照常，直到 watchdog 硬截止 | `runner/gpu.py`、`runner/main.py` | 读代码（macOS 无法复现） | 用 Popen 加截止时间轮询，超时后放弃该进程不再等待，按 GPU 故障处理；SIGKILL 之后的 wait 都要有上限 | 已修复：SIGKILL 之后的等待都有上限（`procs.run_bounded` / `wait_bounded`，等不到就放弃进程）；GPU 采样在后台线程。`tests/test_runner_review.py::test_b6_bounded_wait_gives_up_on_a_process_that_survives_sigkill`、`test_b6_gpu_query_times_out_and_marks_stuck_processes`、`test_b6_sampler_pauses_while_a_query_is_stuck_and_never_blocks_the_caller`、`test_b6_hung_nvidia_smi_at_preflight_fails_preflight`、`test_b6_hung_nvidia_smi_during_training_does_not_delay_cancel`（D 状态只能用“SIGKILL 无效”的注入模拟） |
+| B7 | 中 | 代码下载失败时，最终同步对不存在的目录重试满 20 分钟才销毁，并写出多余的 `final_sync_failed` | `runner/main.py` | 复现 | 提前创建目录；跳过本地不存在的目标 | 已修复：`tests/test_runner_review.py::test_b7_code_download_failure_finishes_fast_without_final_sync_failed` |
+| B8 | 中 | 最终同步期间实例重启会重跑 `setup` 和整个训练 | `runner/main.py` | 复现 | 结果一确定就落盘（带“待最终同步”标记），重启后从最终同步继续 | 已修复：`run/final.json` 带 `synced` 标记。`tests/test_runner_review.py::test_b8_restart_during_final_sync_does_not_rerun_setup_or_training` |
+| B9 | 中 | 日志超过上限后，失败原因、退出码、最终状态也被丢弃；runner 自身异常的 traceback 只在不上传的 `runner.log` 里 | `runner/logsink.py`、`runner/main.py` | 复现 | 保留训练输出尾部的环形缓冲；给 runner 的说明留空间；上传 `runner.log`、`watchdog.log`、`bootstrap.log` 的尾部 | 已修复：`tests/test_runner_review.py::test_b9_failure_reason_and_output_tail_survive_log_truncation`、`test_b9_diagnostic_logs_are_uploaded_next_to_the_attempt_log`、`test_b9_runner_traceback_reaches_storage`、`test_b9_log_tail_survives_a_runner_crash`（新 key `layout.diag_log_key`） |
+| B10 | 中 | AutoDL 前台的 boot 自己没有截止时间：watchdog 死掉且 runner 卡住时，`cmd` 永不返回 | `runner/boot.py` | 复现 | boot 自己按 `spec.json` 和 `started.json` 执行硬截止，并重启死掉的 watchdog | 已修复：`tests/test_runner_review.py::test_b10_autodl_boot_restarts_a_dead_watchdog`、`test_b10_boot_kills_everything_at_its_own_deadline` |
+| B11 | 低 | 周期同步线程没有真正停止，收尾时与最终同步抢带宽 | `runner/main.py` | 复现 | 目标之间检查停止标志 | 已修复：`tests/test_runner_review.py::test_b11_periodic_sync_stops_between_targets` |
+| B12 | 低 | runner 被杀后，它启动的 rclone 进程还活着，可能在 watchdog 写状态之后落盘 | `runner/rclone.py` | 复现 | 记录 rclone 的进程组，watchdog 一并杀掉 | 已修复：rclone 登记在 `run/rclone-<组件>/`，watchdog 和 boot 按命令行核对后杀掉。`tests/test_runner_review.py::test_b12_watchdog_kills_rclone_left_running_by_a_killed_runner`、`test_b2_b3_b12_watchdog_hard_deadline_with_live_slow_runner_and_hung_storage` |
 
-只有推理、未复现的问题：
+只有推理、未复现的问题（修复时逐条确认，结论在每条末尾）：
 
-- **AutoDL 退出码**（取决于探针 A1）：boot 把 runner 的退出码作为 `cmd` 的退出码。如果 Job 会重启非 0 退出的容器，失败的任务会反复重启。探针确认前，AutoDL 前台模式统一退出 0，结果以 `status.json` 为准。
-- **flock 错误被当成“已有 runner 在运行”**：不支持 flock 的文件系统上什么都不会启动。只有 EAGAIN 才表示被占用。
-- **fencing 窗口**：同步线程不重读 `attempt.json`；最后一次读取之后状态写入还能重试 300 秒；watchdog 硬截止路径只看本地标记。
-- **卡死检测**：也作用于 `setup`（安静的下载或解压会误判）；单个 GPU 报 N/A 会让所有 GPU 的检测失效。
-- **事件同步刷新**：停止训练前和日志截断回调里各有最长 120 秒的同步等待。
-- **`bash -lc`**：会执行镜像的登录配置，可能重置 PATH，或重新导出已清除的变量。
-- **bootstrap 诊断信息太少**：只记录异常类型，日志也不上传。
+- **AutoDL 退出码**（取决于探针 A1）：boot 把 runner 的退出码作为 `cmd` 的退出码。如果 Job 会重启非 0 退出的容器，失败的任务会反复重启。探针确认前，AutoDL 前台模式统一退出 0，结果以 `status.json` 为准。——**已修复**：AutoDL 前台模式下最终状态已写进存储（或本 attempt 已被取代）时退出 0，一个状态都没记录时才非 0；Vast 不变。`tests/test_runner_e2e.py::test_nonzero_exit_on_autodl_is_recorded_and_cmd_exits_zero`、`test_b10_*`
+- **flock 错误被当成“已有 runner 在运行”**：不支持 flock 的文件系统上什么都不会启动。只有 EAGAIN 才表示被占用。——**确有其事，已修复**：bootstrap、boot 只把 `BlockingIOError` 当作被占用，其他错误记一行后继续，改看 `run/runner.pid`；watchdog 同样退回 pid 文件（只记一次）。`test_flock_errors_other_than_eagain_do_not_mean_busy`、`test_flock_unsupported_job_still_runs_and_second_boot_does_nothing`、`test_bootstrap_flock_unsupported_continues`
+- **fencing 窗口**：同步线程不重读 `attempt.json`；最后一次读取之后状态写入还能重试 300 秒；watchdog 硬截止路径只看本地标记。——**确有其事，已修复**：周期同步在最近一次成功读取超过 3 个心跳间隔时自己读一次，读不到就这一轮不写；最终同步前读一次；心跳线程一直运行到写最终状态之前，写之前最近一次读取不够新就再读一次；watchdog 两条接手路径都读 `attempt.json`。剩余窗口是最后一次读取到状态写成之间（不超过 `teardown_budget_s` 的一半），CLI 要心跳过期 `lost_after_min` 才会换机，覆盖得住。`test_fencing_periodic_sync_rechecks_a_stale_attempt_before_writing`、`test_fencing_watchdog_hard_deadline_checks_attempt_json`
+- **卡死检测**：也作用于 `setup`（安静的下载或解压会误判）；单个 GPU 报 N/A 会让所有 GPU 的检测失效。——**两点都确有其事，已修复**：只用于 `run`；N/A 的卡不参与，其余卡照常判断。`test_stall_detection_ignores_a_quiet_setup`、`test_stall_detection_with_one_gpu_reporting_na`、`test_runner_unit.py::test_gpu_parse_and_unknown_utilization`
+- **事件同步刷新**：停止训练前和日志截断回调里各有最长 120 秒的同步等待。——**确有其事，已修复**：事件只写本地队列并唤醒后台上传线程，写事件的线程不等存储。`test_stopping_is_not_delayed_by_a_hung_event_upload`、`test_events_emit_never_waits_for_storage`
+- **`bash -lc`**：会执行镜像的登录配置，可能重置 PATH，或重新导出已清除的变量。——**确有其事，已修复**：仍用登录 shell（有的镜像靠 profile 配环境），profile 执行之后再清除凭据类变量、把 profile 删掉的 PATH 条目补回末尾、重新导出 `DGPU_*`。`test_login_profile_cannot_reexport_secrets_or_drop_path`
+- **bootstrap 诊断信息太少**：只记录异常类型，日志也不上传。——**确有其事，已修复**：记录 Python 版本、uid、工作目录、每次失败的异常说明（URL 一律替换成 `<url>`）、放弃时的磁盘余量；`bootstrap.log`（0600）由 runner 随日志上传到 `logs/attempt-<n>.bootstrap.log`。bootstrap 在 runner 启动前就放弃时还没有凭据，只能看平台日志。`test_bootstrap_https_failure_is_explained_and_redacted`、`test_bootstrap_flock_unsupported_continues`
 
 ## C. 评审指出的测试缺口
 
@@ -73,6 +73,8 @@
 - watchdog 截止测试用 SIGSTOP 冻结了 runner，没有覆盖“runner 活着但收尾慢”的真实情况。
 - `procs.py` 的 `/proc` 分支在 macOS 上从未执行。
 - 凭据测试只断言环境变量被清除，没有验证训练进程实际读不到。
+
+B 组相关的缺口已补（`tests/test_runner_review.py`、`tests/test_runner_privsep.py`）：代码下载失败（B7）、等大小的旧文件（B1）、最终同步总时长（B2）、存储卡住时的 watchdog 硬截止（B2/B3）、截止后 / 取消后 / 最终同步中的重启（B5、B8）、`nvidia-smi` 超时（B6）、截断后保留失败原因（B9）、flock 失败、bootstrap 的 HTTPS 失败、runner 活着但收尾慢时的 watchdog 截止（B2）、`/proc` 解析（`test_procs_parses_a_linux_proc_tree`，用伪造的进程表）。仍未覆盖：降权后训练进程实际读不到凭据、发不了信号——测试环境不是 root，要在真实实例上验证。
 
 ## D. 评审认为没有问题的部分
 

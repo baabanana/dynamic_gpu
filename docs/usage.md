@@ -203,7 +203,13 @@ dgpu 在机器上设置这些环境变量：
 3. `DGPU_RESUME=1` 时从 `$DGPU_CKPT` 加载，接着训练。
 4. 成功时退出码 0。
 
-训练进程拿不到 R2 的密钥，也不需要：上传下载都由 dgpu 完成。完整的例子见 [`examples/yolo/train.py`](../examples/yolo/train.py)。
+上传下载都由 dgpu 完成，训练代码不需要 R2 的密钥。完整的例子见 [`examples/yolo/train.py`](../examples/yolo/train.py)。
+
+**训练以普通用户运行。** 机器上 dgpu 是 root 时（通常如此），`setup` 和 `run` 以普通用户 `dgpu` 运行，读不到 R2 的密钥，也停不掉 dgpu 自己的进程。它能写的是 `DGPU_OUTPUT`、`DGPU_CKPT`、`DGPU_DATA`、代码目录、`$HOME`（在 dgpu 的工作目录里）和 `/tmp`。
+
+- `pip install` 照常写：Python 的安装目录不可写时，dgpu 让 pip 装到 `$HOME/.local`，`run` 里可以直接 import。
+- `apt-get install`、`conda install` 这类需要 root 的命令在 `setup` 里会失败。要么换成 pip 能装的包（例如 `opencv-python-headless` 代替系统的 `libgl1`），要么在 `job.yaml` 里写 `run_as_root: true`，让训练和 dgpu 一样以 root 运行（这时训练代码能读到 R2 密钥）。
+- 有时 dgpu 没法切换用户（例如镜像里 dgpu 本身不是 root，或 Python 装在 root 专属、不允许用户目录的虚拟环境里），训练就以 dgpu 的用户运行，日志开头会有一行“训练进程和 runner 同一用户运行”说明原因。
 
 提交前，最好先在本机用很小的数据跑一遍：把 `DGPU_DATA`、`DGPU_OUTPUT`、`DGPU_CKPT` 设成本地目录再运行训练脚本。代码错误在本机发现不花钱。
 
@@ -356,7 +362,7 @@ Vast 上，机器用平台为这台机器单独发的 key 销毁自己。AutoDL 
 `latest` 会悄悄变化，重试时可能换成另一个环境，checkpoint 就可能加载不了。写固定 tag 可以保证每次都一样。
 
 **日志在哪？**
-`dgpu logs <任务ID>`。R2 上的位置是 `dgpu/jobs/<任务ID>/logs/`。
+`dgpu logs <任务ID>`。R2 上的位置是 `dgpu/jobs/<任务ID>/logs/`：`attempt-<n>.log` 是训练输出和 dgpu 的进度说明；`attempt-<n>.runner.log`、`.watchdog.log`、`.bootstrap.log` 是机器上 dgpu 自己的诊断日志（最后 256 KB），dgpu 出问题时看它们。日志超过 200 MB 后，训练输出只保留最后 1 MB，附在日志末尾；失败原因、退出码、最终状态总会写进去。
 
 **能多卡、多机吗？**
 单机多卡可以，设置 `gpu.count`。多机分布式不支持。
