@@ -466,7 +466,8 @@ def build_launch_doc(*, job_id: str, attempt: int, backend: str, store: StorePro
     """secrets-<n>.json：本次尝试的启动文档，含存储凭据。
 
     存放在 layout.secrets_key(job_id, attempt)，只通过短期预签名 URL 下发，
-    CLI 在第一次心跳后删除。runner 用它配置 rclone，然后读取 spec.json 和 code.tar.gz。
+    CLI 在 runner 通过 preflight 后（或这次尝试结束时）删除；bootstrap 已把它下载到实例本地。
+    runner 用它配置 rclone，然后读取 spec.json 和 code.tar.gz。
     """
     return {
         "version": states.SCHEMA_VERSION,

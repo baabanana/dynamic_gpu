@@ -47,18 +47,22 @@ DESIGN_COMMANDS = {
     "gc",
 }
 ALLOWED_COMMANDS = DESIGN_COMMANDS | {"init"}
-# 文档里用到的参数：设计 4.5（--backend、--retries、-f、--force、--dry-run）、
-# 4.5 的本地数据确认（--yes）、4.10 的配置文件位置（--config），以及 --help
-ALLOWED_FLAGS = {
-    "--backend",
-    "--retries",
-    "-f",
-    "--force",
-    "--dry-run",
-    "--yes",
-    "--config",
-    "--help",
-}
+# 所有命令都接受的全局参数（写在命令名前面）
+GLOBAL_FLAGS = {"--config", "--help", "-h", "--version"}
+
+
+def _cli_flags(command: str) -> set[str]:
+    """真实 CLI（dgpu.cli）里这个命令接受的参数，加上全局参数。"""
+    import click
+
+    from dgpu.cli import cli
+
+    flags = set(GLOBAL_FLAGS)
+    for param in cli.commands[command].params:
+        if isinstance(param, click.Option):
+            flags.update(param.opts)
+            flags.update(param.secondary_opts)
+    return flags
 
 REQUIRED_SPEC_KEYS = {"version", "name", "backend", "image", "code", "run", "gpu", "limits"}
 SPEC_KEYS = REQUIRED_SPEC_KEYS | {"setup", "data", "env"}
@@ -597,14 +601,21 @@ def test_invocation_parser_finds_commands_and_flags():
     ]
 
 
+def test_cli_has_exactly_the_design_commands():
+    from dgpu.cli import cli
+
+    assert set(cli.commands) == ALLOWED_COMMANDS
+
+
 @pytest.mark.parametrize("doc", DOCS, ids=lambda path: path.name)
-def test_docs_only_use_commands_and_flags_from_the_design(doc):
+def test_docs_only_use_real_commands_and_their_real_flags(doc):
+    """文档里每个 `dgpu <命令> [参数]` 都要是真实 CLI 里有的命令和这个命令真有的参数。"""
     invocations = _invocations(doc.read_text(encoding="utf-8"))
     assert invocations, f"{doc} 里没有找到 dgpu 命令"
     for command, flags in invocations:
-        assert command in ALLOWED_COMMANDS, f"{doc.name}: 设计里没有 dgpu {command}"
+        assert command in ALLOWED_COMMANDS, f"{doc.name}: 没有 dgpu {command}"
         for flag in flags:
-            assert flag in ALLOWED_FLAGS, f"{doc.name}: dgpu {command} 没有参数 {flag}"
+            assert flag in _cli_flags(command), f"{doc.name}: dgpu {command} 没有参数 {flag}"
 
 
 def test_skill_covers_the_whole_flow():

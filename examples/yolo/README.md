@@ -25,7 +25,7 @@
 
    `data.yaml` 里的 `path` 不用改：`train.py` 运行时会把它换成机器上的实际路径，并去掉 `download`，免得数据没拷过来时 Ultralytics 自己上网下载、掩盖问题。
 
-   coco8 只有 1 MB 左右，放在代码目录里会被一起打包，没关系，但不要把 `datasets/` 提交到 git。你自己的数据集不要放在代码目录里（见第 6 节）。
+   `job.yaml` 的 `data` 引用了 `./datasets/coco8`：提交时它作为数据集单独上传到 R2（内容没变就不重传），不会再打进代码包。不要把 `datasets/` 提交到 git。
 
 ## 2. 运行
 
@@ -34,7 +34,7 @@ cd examples/yolo
 dgpu offers job.yaml                  # 看有哪些机器、每小时多少钱，不花钱
 dgpu submit job.yaml                  # 租机器、启动训练，输出任务 ID，如 yolo-coco8-261110083000-a1b2
 dgpu wait <任务ID>                    # 等到结束；退出码 0 表示成功
-dgpu pull <任务ID> ./result           # 下载输出
+dgpu pull <任务ID> ./result           # 下载输出到 ./result/output/
 dgpu gc --dry-run                     # 确认没有遗留的机器在计费
 ```
 
@@ -43,7 +43,7 @@ dgpu gc --dry-run                     # 确认没有遗留的机器在计费
 拿到的结果：
 
 ```
-result/
+result/output/
   DONE                     训练完成标记（JSON：轮数、是否续跑、Ultralytics 版本）
   run/weights/best.pt      最好的权重
   run/weights/last.pt      最后一轮的权重
@@ -82,7 +82,8 @@ AutoDL 到 R2 是跨境网络，速度尚未实测。
 - Ultralytics 每轮结束保存 `last.pt` 后，`on_model_save` 回调把它复制到 `$DGPU_CKPT/last.pt`：先写 `last.pt.tmp`，再 rename。Ultralytics 自己写 `last.pt` 不是原子操作，直接上传可能传上去半个文件。
 - 换机重跑时（`dgpu retry <任务ID>`），dgpu 把 checkpoint 拷回 `$DGPU_CKPT` 并设置 `DGPU_RESUME=1`。`train.py` 先读这个文件，确认它能续跑（`epoch >= 0`，并且还有没训练的轮次），再用 `resume=True` 接着训练。
 - 读不出来，或者是训练结束后精简过的权重（Ultralytics 会把它的 `epoch` 改成 -1），就从头训练，并在日志里写明原因。
-- 训练完成后写 `$DGPU_OUTPUT/DONE`。同一台机器上再次运行时，看到 `DONE` 就直接退出。
+- 训练完成后，先把最终的 `best.pt`、`last.pt` 复制到 `$DGPU_CKPT/final/`，再写完成标记 `$DGPU_CKPT/COMPLETE.json`（都是先写 `.tmp` 再 rename），最后写 `$DGPU_OUTPUT/DONE`。同一台机器上再次运行时，看到 `DONE` 就直接退出。
+- 机器在训练完之后、`DONE` 和输出传完之前宕机：重试时 `$DGPU_CKPT` 会恢复（`$DGPU_OUTPUT` 不恢复），`train.py` 看到完成标记就不再训练，把 `final/` 里的权重放回 `$DGPU_OUTPUT/run/weights/` 再写 `DONE`（记 `recovered: true`），由 dgpu 重新上传。完成标记要等下一次同步（约 2 分钟）才到 R2，宕机发生在这之前时，重试还是会从头训练。代价是 checkpoint 里多存一份最终权重。
 
 续跑必须用同一个 Ultralytics 版本，所以 `setup` 里固定了 `ultralytics==8.4.208`。
 
@@ -109,7 +110,7 @@ AutoDL 到 R2 是跨境网络，速度尚未实测。
      DATASET: my-set
    ```
 
-   也可以写本地路径（如 `/data/my-set`），dgpu 提交时会帮你传到 R2，内容没变就不重传。
+   也可以写本地路径（如 `/data/my-set`），dgpu 提交时会帮你传到 R2，内容没变就不重传。单个文件超过 5 GiB 时只能用上面 rclone 的办法。目录名（`my-set`）只能用字母、数字、点、下划线和连字符。
 3. 按数据量调大 `max_hours`，先用 `dgpu offers` 看报价。
 
 ## 7. 本机试跑

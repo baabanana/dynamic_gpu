@@ -87,7 +87,32 @@ store = "r2"
 2. 环境变量 `DGPU_CONFIG=<路径>`；
 3. 默认 `~/.config/dgpu/config.toml`。
 
-文件权限不是 600 时 dgpu 拒绝读取，用 `chmod 600 <路径>` 修好。单个密钥也可以用环境变量覆盖：`VAST_API_KEY`、`AUTODL_TOKEN`、`R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`。
+文件权限不是 600 时 dgpu 拒绝读取，用 `chmod 600 <路径>` 修好。单个密钥也可以用环境变量覆盖：`VAST_API_KEY`、`AUTODL_TOKEN`，以及 `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`（只作用于名为 `r2` 的存储，即 `[stores.r2]`）。不认识的配置项一律报错，拼错不会被静默忽略。
+
+其余配置项都有默认值，需要时再加（`dgpu init` 生成的模板里有全部配置项，注释掉的就是默认值）：
+
+```toml
+startup_timeout_min = 15       # 顶层配置项，必须写在第一个 [表] 之前
+lost_after_min = 10
+
+[backends.vast.filters]        # Vast 的筛选条件；也可以直接写在 [backends.vast] 里，二选一
+reliability = 0.98
+min_inet_down_mbps = 500
+max_bandwidth_usd_per_gb = 0.01
+datacenter_only = false        # 数据敏感时打开，只用数据中心机器
+
+[backends.autodl]
+dc_list = ["westDC2"]          # 地区，默认不限
+cuda_v_from = 118              # 118 即 CUDA 11.8
+
+[runner]                       # 下发给机器上 dgpu 的参数；时间类可以写小数
+sync_interval_s = 120
+heartbeat_interval_s = 60
+stall_timeout_min = 60         # 0 关闭卡死检测
+final_sync_timeout_min = 20
+```
+
+目前所有命令共用一个存储：两个后端的 `store` 要指向同一个 `[stores.*]`，否则 `submit` 会报错。
 
 密钥只放在配置文件或环境变量里：不提交到 git，不写进 `job.yaml`，也不要贴到和 Claude 的对话里。平台的主 key 永远不会被传到租来的机器上。
 
@@ -100,7 +125,7 @@ cd examples/yolo
 dgpu offers job.yaml
 dgpu submit job.yaml
 dgpu wait <任务ID>
-dgpu pull <任务ID> ./result
+dgpu pull <任务ID> ./result   # 输出下载到 ./result/output/
 dgpu gc --dry-run
 ```
 
@@ -136,23 +161,25 @@ env:
 |---|---|---|
 | `version` | 是 | 写 `1`。不认识的版本会被拒绝 |
 | `name` | 是 | 任务名，任务 ID 会以它开头，例如 `my-train-261110083000-a1b2` |
-| `backend` | 是 | `vast` 或 `autodl`，提交时可以用 `--backend` 覆盖 |
-| `image.vast` | 用 Vast 时 | 公开的 Docker 镜像，必须写固定 tag，不能用 `latest` |
+| `backend` | 是 | `vast` 或 `autodl`。不写时提交必须带 `--backend`；写了也可以用 `--backend` 覆盖 |
+| `image.vast` | 用 Vast 时 | 公开的 Docker 镜像，必须写固定 tag（或 `@sha256:` 摘要），不能用 `latest` 或不写 tag |
 | `image.autodl` | 用 AutoDL 时 | AutoDL 平台上的镜像 UUID。公共镜像比较旧，需要新环境就在 AutoDL 网站上保存私有镜像 |
-| `code` | 是 | 要打包上传的代码目录，相对 `job.yaml` |
+| `code` | 否 | 要打包上传的代码目录，相对 `job.yaml`，默认 `.`（`job.yaml` 所在目录） |
 | `setup` | 否 | 训练前执行一次，例如装依赖 |
 | `run` | 是 | 训练命令。退出码 0 表示成功 |
 | `data` | 否 | 数据列表，见第 7 节 |
 | `gpu.names` | 是 | 可以接受的 GPU 型号，任一即可 |
 | `gpu.count` | 否 | 每台机器几张卡，默认 1 |
-| `limits.max_hours` | 是 | 最长运行时间，到时间强制结束 |
-| `limits.max_usd_per_hour` | 用 Vast 时 | 每小时价格上限，美元 |
-| `limits.max_cny_per_hour` | 用 AutoDL 时 | 每小时价格上限，人民币 |
-| `env` | 否 | 传给训练代码的环境变量，值写成字符串。不要放密钥 |
+| `limits.max_hours` | 是 | 最长运行时间（可以是小数），到时间强制结束 |
+| `limits.max_usd_per_hour` | 用 Vast 时 | 整台机器每小时的价格上限（全部卡加磁盘，不含流量费），美元 |
+| `limits.max_cny_per_hour` | 用 AutoDL 时 | 整个容器每小时的价格上限（不是每卡），人民币 |
+| `env` | 否 | 传给训练代码的环境变量，值写成字符串（`"100"`）。不要放密钥；以 `DGPU_`、`AWS_`、`R2_`、`RCLONE_CONFIG_`、`CONTAINER_API_KEY` 开头的名字会被拒绝 |
+
+只用一个后端时，`image` 也可以直接写成一个字符串。不认识的字段、同一个字段写两次都会报错。
 
 镜像里必须有 `python3`（3.8 或更新）和 `bash`。
 
-代码怎么打包：代码目录在 git 仓库里时，打包 git 跟踪的和没被 `.gitignore` 忽略的文件；不在 git 仓库里时，按代码目录下的 `.dgpuignore` 排除。`.git`、`.env*`、`*.pem`、`*.key` 总是排除。打包后超过 200 MB 会报错：数据请放到 `data`，权重和输出不要放在代码目录里。
+代码怎么打包：代码目录在 git 仓库里时，打包 git 跟踪的和没被 `.gitignore` 忽略的文件；不在 git 仓库里时，按代码目录下的 `.dgpuignore` 排除。`.git`、`.env*`、`*.pem`、`*.key`、`__pycache__`、`.venv` 总是排除；`data` 里的本地目录如果在代码目录里，也不会再打进代码包（它们单独上传）。要打包的文件合计超过 200 MB（按未压缩大小）会报错：数据请放到 `data`，权重和输出不要放在代码目录里。
 
 ### 4.2 训练代码
 
@@ -183,31 +210,32 @@ dgpu 在机器上设置这些环境变量：
 dgpu offers job.yaml          # 1. 看报价：有哪些机器、每小时多少钱。不花钱
 dgpu submit job.yaml          # 2. 提交：打印费用上限，租机器，等机器跑起来后输出任务 ID
 dgpu wait <任务ID>            # 3. 等结果：前台等到结束，退出码表示结果
-dgpu pull <任务ID> ./result   # 4. 取结果
+dgpu pull <任务ID> ./result   # 4. 取结果：下载到 ./result/output/
 dgpu gc --dry-run             # 5. 确认没有遗留的机器在计费
 ```
 
-- `submit` 要等机器启动、拉完镜像，可能要十几分钟。中途按 Ctrl-C 会销毁已经创建的机器。
+- `submit` 要等机器启动、拉完镜像、机器上的 dgpu 检查过 GPU、磁盘和存储（preflight）之后才返回，可能要十几分钟。检查不通过就自动销毁这台、换下一台。中途按 Ctrl-C 会销毁已经创建的机器。
+- `submit --wait` 提交后直接接着等，等同于再运行 `dgpu wait`。
 - `wait` 只是在等，按 Ctrl-C 退出不影响任务。之后随时可以再 `wait`，或用 `status`、`logs` 查看。
 
 ## 6. 命令一览
 
 | 命令 | 作用 | 例子 |
 |---|---|---|
-| `init` | 生成配置文件模板（权限 600） | `dgpu init` |
-| `doctor` | 检查配置、R2 读写、平台 API、余额 | `dgpu doctor` |
-| `offers` | 列出候选机器和预估费用，不花钱 | `dgpu offers job.yaml --backend autodl` |
-| `submit` | 打包代码、创建机器，等第一次心跳后返回任务 ID | `dgpu submit job.yaml --backend vast` |
+| `init` | 生成配置文件模板（权限 600），已存在时不覆盖 | `dgpu init` |
+| `doctor` | 检查配置、R2 读写、平台 API、余额；有一项不通过时退出码 1 | `dgpu doctor` |
+| `offers` | 列出候选机器和预估费用，不花钱；`--limit` 显示几个（默认 10），`--json` 输出 JSON | `dgpu offers job.yaml --backend autodl` |
+| `submit` | 打包代码、创建机器，preflight 通过后返回任务 ID；`--wait`（可配 `--retries`）接着等到结束 | `dgpu submit job.yaml --backend vast` |
 | `wait` | 等任务结束；失联时可以自动重试 N 次 | `dgpu wait <任务ID> --retries 1` |
-| `status` | 查看任务状态和失败原因 | `dgpu status <任务ID>` |
-| `logs` | 查看训练日志，`-f` 持续跟随 | `dgpu logs <任务ID> -f` |
-| `list` | 列出所有任务 | `dgpu list` |
+| `status` | 查看任务状态和失败原因；`--json` 输出 JSON | `dgpu status <任务ID>` |
+| `logs` | 查看训练日志，`-f` 持续跟随；`--attempt N` 看第 N 次尝试 | `dgpu logs <任务ID> -f` |
+| `list` | 列出所有任务，最新的在前；`--limit`（默认 30）、`--json` | `dgpu list` |
 | `retry` | 换一台机器，从 checkpoint 接着跑 | `dgpu retry <任务ID>` |
 | `cancel` | 取消任务：先上传已有结果再销毁；`--force` 直接销毁 | `dgpu cancel <任务ID> --force` |
-| `pull` | 下载任务的输出（`$DGPU_OUTPUT` 的内容） | `dgpu pull <任务ID> ./result` |
-| `gc` | 清理遗留的机器；`--dry-run` 只列出不销毁 | `dgpu gc --dry-run` |
+| `pull` | 下载任务的输出（`$DGPU_OUTPUT` 的内容）到 `<目录>/output/`，不写目录时是 `./<任务ID>/output/`；`--ckpt` 同时下载 checkpoint 到 `<目录>/ckpt/` | `dgpu pull <任务ID> ./result --ckpt` |
+| `gc` | 清理遗留的机器；`--dry-run` 只列出不销毁，`--json` 输出 JSON；有销毁失败的机器时退出码 1 | `dgpu gc --dry-run` |
 
-所有命令都可以加 `--config <路径>` 指定配置文件，写在命令名前面：`dgpu --config <路径> list`。本地数据超过 5 GB 时 `submit` 会先问是否上传，加 `--yes` 跳过确认。
+所有命令都可以加 `--config <路径>` 指定配置文件，写在命令名前面：`dgpu --config <路径> list`。本地数据合计超过 5 GB（`local_data_confirm_gb`）时 `submit` 会先问是否上传，加 `--yes`（`-y`）跳过确认。用法错误、配置错误等可预期的错误打印一句话说明，退出码 2。
 
 任务状态：
 
@@ -246,14 +274,18 @@ dgpu gc --dry-run             # 5. 确认没有遗留的机器在计费
 | `setup` | `setup` 命令失败 | `dgpu logs` 看报错，改好后重新 `submit` |
 | `exit_code` | 训练命令非 0 退出 | `dgpu logs` 看报错，改好代码后重新 `submit`。`retry` 用的还是旧代码 |
 | `stalled` | GPU 利用率为 0，且 60 分钟没有新日志 | 看日志最后几行，常见是数据加载卡住 |
+| `runner_crashed` | 机器上的 dgpu 进程崩溃，看门狗收尾 | `dgpu retry <任务ID>` 从 checkpoint 接着跑 |
+| `signalled` | 机器上的 dgpu 收到停止信号（容器被平台停止等），已提前收尾上传 | `dgpu retry <任务ID>` 从 checkpoint 接着跑 |
 | `final_sync` | 最后一次上传失败 | `dgpu status` 列出没传上去的文件，这些文件已经丢失 |
 
 ## 7. 数据怎么到机器上
 
 `data` 里每一项可以是 R2 路径，也可以是本地目录：
 
-- **R2 路径** `r2://<bucket>/<路径>`：机器启动后把它拷到 `$DGPU_DATA/<路径最后一段>`。例如 `r2://my-dgpu/datasets/coco8` 到 `$DGPU_DATA/coco8`。令牌要能读这个 bucket。
-- **本地目录**，例如 `./datasets/small-set`：`submit` 时先上传到你 bucket 的 `dgpu/datasets/<内容哈希>/`，机器再从那里拉取。内容没变就不重传。超过 5 GB 时先告诉你上传量并要求确认。
+- **R2 路径** `r2://<bucket>/<路径>`：机器启动后把它拷到 `$DGPU_DATA/<路径最后一段>`。例如 `r2://my-dgpu/datasets/coco8` 到 `$DGPU_DATA/coco8`。机器用配置里那个存储的令牌读取：bucket 不是配置里的 bucket 时，`offers` 和 `submit` 会提醒你确认令牌能读它（不会拒绝），读不了的话任务以 `FAILED(data_sync)` 结束。
+- **本地目录**，例如 `./datasets/small-set`：`submit` 时先上传到你 bucket 的 `dgpu/datasets/<内容哈希>/`，机器再从那里拉取。内容没变就不重传。合计超过 5 GB 时先告诉你上传量并要求确认。
+- **单个文件最大 5 GiB**：dgpu 只做单段上传，本地目录里有超过 5 GiB 的文件时，`submit` 在上传任何东西之前就报错。这种数据先用 rclone 传到 bucket（如 `rclone copy ./big-set <remote>:<bucket>/datasets/big-set`），再在 `data` 里写成 `r2://<bucket>/datasets/big-set`。
+- 目录名（路径最后一段，也就是 `$DGPU_DATA` 下的名字）只能用英文字母、数字、点、下划线和连字符，两项不能同名。
 
 为什么不直接挂载 R2：租来的机器是没有特权的普通容器，大多不能用 FUSE 挂载；就算能挂，训练时一个个小文件走网络读取也会拖慢训练。所以 dgpu 在训练开始前把数据一次拷到本地盘，训练代码看到的就是普通目录。
 

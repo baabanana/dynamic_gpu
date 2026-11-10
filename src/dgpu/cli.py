@@ -197,7 +197,7 @@ def cli(ctx: click.Context, config_path: str | None) -> None:
 def submit(
     ctx: click.Context, job_file: Path, backend: str | None, wait_: bool, retries: int, yes: bool
 ) -> None:
-    """打包、创建实例，等到第一次心跳后输出任务 ID。"""
+    """打包、创建实例，等实例通过 preflight（GPU、磁盘、存储检查）后输出任务 ID。"""
     app: _App = ctx.obj
     deps = app.deps()
     spec = _load_spec(deps, job_file, backend)

@@ -47,10 +47,11 @@ env:                            # 可选，传给训练代码；值写成字符�
   EPOCHS: "100"
 ```
 
-- 必填：`version`、`name`、`backend`、`image`、`code`、`run`、`gpu`、`limits`。`image` 和价格上限只填要用的后端即可。
+- 必填：`version`、`name`、`backend`（或提交时 `--backend`）、`image`、`run`、`gpu`、`limits`。`code` 默认 `.`。`image` 和价格上限只填要用的后端即可；价格上限是整台机器每小时的总价（全部卡加磁盘；AutoDL 是整个容器，不是每卡）。
 - 镜像里要有 `python3`（3.8 或更新）和 `bash`。Vast 用公开 Docker 镜像，写固定 tag。AutoDL 填镜像 UUID；公共镜像较旧（如 CUDA 11.8、Python 3.8），要新环境得请用户在 AutoDL 网站保存私有镜像。
-- 代码打包：git 仓库里打包 git 跟踪的和没被忽略的文件，否则按 `.dgpuignore`；`.git`、`.env*`、`*.pem`、`*.key` 总是排除。超过 200 MB 会报错，所以数据、权重、输出不要放在代码目录里。
-- `data` 每一项拷到 `$DGPU_DATA/<路径最后一段>`。大量小文件最好先打成 tar，在 `setup` 里解压。
+- 代码打包：git 仓库里打包 git 跟踪的和没被忽略的文件，否则按 `.dgpuignore`；`.git`、`.env*`、`*.pem`、`*.key` 总是排除，`data` 里在代码目录中的本地目录也不进代码包。超过 200 MB 会报错，所以权重、输出不要放在代码目录里。
+- `data` 每一项拷到 `$DGPU_DATA/<路径最后一段>`；这个名字只能用字母、数字、点、下划线、连字符。大量小文件最好先打成 tar，在 `setup` 里解压。
+- 本地数据里单个文件超过 5 GiB 时 `submit` 直接报错：请用户先用 rclone 传到 bucket，再写成 `r2://<bucket>/<目录>`。`r2://` 的 bucket 不是配置里的 bucket 时 dgpu 会提醒，转告用户确认 R2 token 能读它。
 - 写完先跑 `dgpu offers job.yaml`：它会检查 job.yaml，不花钱。
 
 ## 3. 训练代码要做的事
@@ -91,11 +92,11 @@ Ultralytics YOLO：直接用 dgpu 仓库的 `examples/yolo/`，`train.py` 已经
 
 1. **报价**：`dgpu offers job.yaml`（AutoDL 加 `--backend autodl`）。把 GPU 型号、每小时价格、预估总价告诉用户，并说明最坏花费约为“价格上限 × max_hours”。
 2. **确认上限**：和用户确认 `max_hours` 和价格上限，用户同意后才提交。新代码先用小的 epoch 和 `max_hours` 跑一次。
-3. **提交**：`dgpu submit job.yaml`。它要等机器启动、发出第一次心跳才返回任务 ID，可能要十几分钟，所以用 Bash 的 `run_in_background: true` 运行。不要随手打断：打断会销毁已创建的机器，任务也就结束了。还没返回时，`dgpu list` 能看到正在启动的任务。
+3. **提交**：`dgpu submit job.yaml`。它要等机器启动、机器上的 dgpu 检查过 GPU、磁盘和存储才返回任务 ID（检查不过会自动换机），可能要十几分钟，所以用 Bash 的 `run_in_background: true` 运行。不要随手打断：打断会销毁已创建的机器，任务也就结束了。还没返回时，`dgpu list` 能看到正在启动的任务。
    - 本地数据超过 5 GB 时 `submit` 会要求确认，后台运行没法回答。先用 `du -sh <目录>` 看大小告诉用户，用户同意后加 `--yes`。
 4. **等结果**：`dgpu wait <job>`，同样用 `run_in_background: true`，结束时会收到通知，按第 5 节的退出码处理。不要在前台反复轮询。
 5. **用户问进度时**：`dgpu status <job>`、`dgpu logs <job>`；`dgpu list` 列出所有任务。`dgpu logs <job> -f` 会一直跟随不退出，前台不要用。
-6. **取结果**：`dgpu pull <job> <本地目录>`，下载 `$DGPU_OUTPUT` 里的内容。
+6. **取结果**：`dgpu pull <job> <本地目录>`，把 `$DGPU_OUTPUT` 里的内容下载到 `<本地目录>/output/`（不写目录时是 `./<job>/output/`）；要 checkpoint 加 `--ckpt`。
 7. **收尾**：`dgpu gc --dry-run`，确认没有遗留机器。列出了机器就告诉用户，用户同意后运行 `dgpu gc`。
 
 用户要停止任务：`dgpu cancel <job>`，机器上的 dgpu 会先上传已有结果再销毁机器。它不响应时 `dgpu cancel <job> --force` 直接销毁，没上传的结果会丢失，先告诉用户。
@@ -166,6 +167,7 @@ FAILED 的原因：
 | `offers` 没有结果 | 价格上限太低、GPU 型号太少或没有库存。告诉用户，由用户决定是否放宽 |
 | 提交时说镜像 tag 不合法 | 写固定 tag，不用 `latest` |
 | 代码包超过 200 MB | 把数据、权重、输出移出代码目录，或写进 `.gitignore` / `.dgpuignore` |
+| 提交时说某个文件超过 5 GiB | 请用户用 rclone 把数据传到 bucket，`data` 里改写成 `r2://<bucket>/<目录>` |
 | 连续两次 `runner_timeout` | 镜像缺 `python3` 或 `bash`，换镜像 |
 | 日志里有 `libGL.so.1` | OpenCV 缺系统库：`setup` 里装 `libgl1`，或改装 `opencv-python-headless` |
 | 续跑后又从第 0 轮开始 | 训练代码没处理 `DGPU_RESUME`，或 checkpoint 没写进 `DGPU_CKPT` |

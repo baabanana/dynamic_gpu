@@ -12,6 +12,9 @@ dgpu 在机器上设置这些环境变量：
   EPOCHS   训练轮数，默认 100
   IMGSZ    输入尺寸，默认 640
 
+训练完成后先在 $DGPU_CKPT 里写完成标记（COMPLETE.json）和最终权重的备份（final/），再写
+$DGPU_OUTPUT/DONE。机器在这之间宕机时，重试从 checkpoint 认出已经训练完，只把权重放回输出目录。
+
 ultralytics 只在 main() 里 import，没装 ultralytics 也能导入本文件、测试辅助函数。
 要兼容 Python 3.8（AutoDL 的公共镜像比较旧）。
 """

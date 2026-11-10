@@ -9,7 +9,7 @@
 - 单写者：`attempt.json` 只用条件写更新；每次换机、重试都用新的 attempt 号，
   旧 runner 读到更大的 attempt 后自行退出。
 - 平台主 key 不进入存储和启动命令；存储凭据只出现在 `secrets-<n>.json` 里，
-  只通过预签名 URL 下发，第一次心跳后删除。
+  只通过预签名 URL 下发，runner 通过 preflight 后（或这次尝试结束时）删除。
 - 不静默：重试、换机、销毁、gc 都写 `events/`。
 - 存储是唯一事实来源：这里不保存任何本地状态。
 """
@@ -314,7 +314,7 @@ class Orchestrator:
         *,
         confirm_upload: Callable[[float], bool] | None = None,
     ) -> SubmitResult:
-        """提交任务：找机器、上传、创建实例，等到 runner 第一次心跳后返回。
+        """提交任务：找机器、上传、创建实例，等到 runner 通过 preflight 后返回。
 
         confirm_upload：本地数据超过 config.local_data_confirm_gb 时调用，参数是 GB 数，
         返回 False 则放弃。None 表示不需要确认（--yes）。
