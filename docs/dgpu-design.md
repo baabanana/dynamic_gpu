@@ -427,6 +427,41 @@ store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 - [ ] 集成与评审：接缝已修复；本地端到端测试 `tests/test_integration_e2e.py` 通过（真实的编排、bundle、bootstrap、runner、watchdog，存储和平台是本地替身，未接触真实平台）；第一轮评审（A、B）和第二轮复核（F1–F9）的问题已在本地修复并配回归测试，见[评审清单](dgpu-review-2026-11-10.md)，均未在真实平台验证
 - [ ] 真实环境验证（Vast E1–E5，AutoDL E1、E3）
 
+### 真实平台验证记录
+
+**2026-11-10，Vast + R2，提交 `74cab6c`（配置有误，见下）**
+
+- `dgpu doctor`、`dgpu offers`：通过，Vast 搜索返回 45 台符合条件的机器。
+- 两次 `dgpu submit` 共创建 5 台实例（RTX 3060，约 $0.067/h），全部被销毁，账户接口确认实例数为 0，花费约 $0.01。
+- 已验证：创建、标签、状态轮询（pending → loading → running）、bootstrap 和 runner 启动、runner 报告失败后 CLI 销毁并换机（attempt 递增）、收到 SIGTERM 后销毁实例并退出（两次）。
+- 发现并修复：下载 rclone 被 downloads.rclone.org 拒绝（Python 默认 User-Agent，`74cab6c`）；配置里的 endpoint 末尾带了 bucket 名，读写落到 `<bucket>/<bucket>/...`，实例上的 rclone 找不到 `spec.json`，runner 每次 preflight 失败（`2778039`：拒绝带路径的 endpoint，`doctor` 增加列举检查）。
+- 观察：未缓存镜像（6.2 GB）的机器从创建到 runner 启动约 7 分钟。
+- 未验证：Ctrl-C（SIGINT）路径。测试脚本把 `submit` 放在后台运行，后台进程忽略 SIGINT，这一步没有测到。
+- 遗留问题：SIGTERM 中止后有一个 `secrets-<n>.json` 没被删除（当时列举失败），需在正确配置下复查。
+
+**2026-11-11，Vast + R2，提交 `2778039`，任务 `probe-timeout-261111062221-cfcb`**
+
+命令 `dgpu submit`（`run` 写一个输出文件和一个 ckpt 文件后 `sleep 900`，`max_hours: 0.05`，上限 $0.20/h），不运行 `dgpu wait`，用脚本每 15 秒记录 `dgpu status` 和 Vast 实例列表。
+
+| 时间（UTC） | 事件 |
+|---|---|
+| 06:22:21 | 提交；实例 60174144（RTX 3060，$0.067/h）创建 |
+| 06:23:01 | runner 启动（镜像已缓存，创建到启动约 40 秒） |
+| 06:23:11 | 代码解压完成，`run` 开始 |
+| 06:25:58 | 到达 `max_hours`，SIGTERM 终止 `run` |
+| 06:26:00 | 最终同步，写 `TIMED_OUT` |
+| 06:26:22 之前 | 实例从 Vast 列表消失（runner 自毁），之后保持消失 |
+
+- **P1 自毁：通过。** 容器内用 `CONTAINER_API_KEY` 调 REST 销毁自身成功，没有 `self_destroy_failed` 事件；`dgpu gc --dry-run` 无遗留。
+- **E3 超时：通过。** 状态 `TIMED_OUT`，事件 `deadline_hit`。
+- **结果上传：通过。** `output/result.txt`、`ckpt/last.txt`、`logs/attempt-1.log` 及三份诊断日志都在存储里，`dgpu pull` 取回 `result.txt`，`dgpu logs` 能读到训练输出。
+- **降权：在 `vastai/pytorch:2.14.1-cu126-cuda-12.9-mini-py312-2026-10-23` 上生效。** `run` 以 uid 1002（用户 `dgpu`）运行，读不到 `launch.json`，`PIP_USER=1`；`nvidia-smi` 可用（驱动 535.154.05）。没有测 `pip install` 和杀进程。
+- 花费：余额 9.9896 → 9.9827，约 $0.007。
+- 观察：Vast 实例列表接口有一次瞬时返回空（06:23:49，实例实际在运行），15 秒后恢复。CLI 对“创建后短时间内查不到”的宽限是必要的；宽限期之外的瞬时空列表是否会被误判为实例消失，需要复查。
+- 观察：心跳里 `已同步 0`，而输出文件实际已上传，同步字节数的统计有误。
+
+仍未在真实平台验证：成功结束（`SUCCEEDED`）的任务、SIGINT、`cancel`、`retry` 续跑（E2）、坏镜像（E4）、`gc` 清理孤儿（E5）、`pip install` 在降权下可用、真实的 YOLO 训练（E1）、AutoDL 的全部内容。
+
 ## 9. 后续风险
 
 - **凭据暴露给房东**：凭据和训练数据都会落到租用机器的磁盘上，社区机器的房东可以读到。v1 用只授权相关 bucket 的专用 token，敏感数据打开 `datacenter_only`。Cloudflare 可能提供带 TTL 的临时凭据，尚未核实，后续可替换。
