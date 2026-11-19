@@ -1,8 +1,27 @@
 [project]
 name = "dgpu"
 version = "0.1.0"
-description = "一条命令在按需云 GPU（Vast.ai、AutoDL）上训练任意模型，用完自动销毁"
+description = "Train any model on on-demand cloud GPUs (Vast.ai, AutoDL) with one command; the machine is destroyed when the job ends"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Puze Li" }]
 requires-python = ">=3.11"
+keywords = ["gpu", "cloud", "training", "vast.ai", "autodl", "cloudflare-r2", "mlops", "claude-code"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+]
 dependencies = [
     "click>=8.1,<9",
     "pyyaml>=6,<7",
@@ -12,6 +31,12 @@ dependencies = [
 
 [project.scripts]
 dgpu = "dgpu.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/baabanana/dynamic_gpu"
+Documentation = "https://github.com/baabanana/dynamic_gpu/blob/dev/docs/usage.md"
+Issues = "https://github.com/baabanana/dynamic_gpu/issues"
+Changelog = "https://github.com/baabanana/dynamic_gpu/blob/dev/CHANGELOG.md"
 
 [dependency-groups]
 dev = [
@@ -27,6 +52,23 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dgpu"]
+
+[tool.hatch.build.targets.sdist]
+# 显式列出，免得工作区里没被忽略的文件（压缩包、本地数据）被打进源码包
+include = [
+    "/src",
+    "/tests",
+    "/docs",
+    "/examples/yolo/README.md",
+    "/examples/yolo/job.yaml",
+    "/examples/yolo/train.py",
+    "/skills",
+    "/README.md",
+    "/README.zh-CN.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/Makefile",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

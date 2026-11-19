@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability / 报告安全问题
+    url: https://github.com/baabanana/dynamic_gpu/security/advisories/new
+    about: Credential exposure or billing leaks. Please report privately, not in a public issue.
+  - name: Usage guide / 使用说明
+    url: https://github.com/baabanana/dynamic_gpu/blob/dev/docs/usage.md
+    about: Setup, job.yaml, commands and FAQ.

@@ -1,0 +1,27 @@
+name: Feature request / 功能建议
+description: Suggest a new capability, backend or improvement. / 建议新功能、新后端或改进。
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before proposing, check the non-goals in [design §2](https://github.com/baabanana/dynamic_gpu/blob/dev/docs/dgpu-design.md#2-目标与非目标):
+        multi-node training, FUSE mounts, spot instances and a long-running scheduler are currently out of scope.
+        提议前请先看设计第 2 节的非目标。
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / 要解决的问题
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal / 方案
+      description: How should it work? For a new backend, include the platform's API for searching offers, creating, labelling and destroying instances, and how an instance can destroy itself.
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Impact on billing and credentials / 对计费和凭据的影响
+      description: How does this keep the invariants (every outcome destroys the instance; platform keys never reach the instance)?

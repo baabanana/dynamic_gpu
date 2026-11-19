@@ -1,0 +1,67 @@
+name: Bug report / 问题报告
+description: Something went wrong with dgpu. / dgpu 出了问题。
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Is an instance possibly still billing?** Run `dgpu gc --dry-run` and check the platform console first.
+        **可能还有机器在计费？** 先运行 `dgpu gc --dry-run`，并到平台控制台确认。
+
+        **Never paste API keys, tokens, account IDs or bucket endpoints.** Replace them with placeholders.
+        If the bug exposes a credential or leaves instances running in a way an attacker could trigger, use
+        [private vulnerability reporting](https://github.com/baabanana/dynamic_gpu/security/advisories/new) instead.
+        **不要贴出 API key、token、账户 ID 或 bucket endpoint**，用占位符替换。涉及凭据泄漏的问题请私下报告。
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened? / 发生了什么
+      description: What you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where / 在哪里发生
+      options:
+        - Vast.ai (real platform)
+        - AutoDL (real platform)
+        - Local only (tests, offers, packaging, config)
+    validations:
+      required: true
+  - type: dropdown
+    id: billing
+    attributes:
+      label: Was an instance left running? / 有没有遗留的机器
+      options:
+        - "No"
+        - "Yes, and dgpu gc cleaned it up"
+        - "Yes, and I had to destroy it by hand"
+        - "Not sure"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: dgpu version or commit / 版本或提交
+      placeholder: "dgpu --version, or git rev-parse --short HEAD"
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Your OS and Python / 本机系统和 Python 版本
+      placeholder: "macOS 15.5, Python 3.12"
+  - type: textarea
+    id: job
+    attributes:
+      label: job.yaml (redacted) / job.yaml（去掉敏感信息）
+      render: yaml
+  - type: textarea
+    id: status
+    attributes:
+      label: Status, events and logs / 状态、事件和日志
+      description: |
+        Output of `dgpu status <job-id> --json`, and the relevant part of `dgpu logs <job-id>`.
+        Diagnostic logs are in your bucket at `dgpu/jobs/<job-id>/logs/attempt-<n>.{runner,watchdog,bootstrap}.log`.
+      render: text
