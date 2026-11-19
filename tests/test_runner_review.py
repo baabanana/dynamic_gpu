@@ -1,4 +1,5 @@
-"""Regression tests for the review of 2026-11-10, section B (docs/dgpu-review-2026-11-10.md).
+"""Regression tests for the review of 2026-11-10, section B
+(docs/history/dgpu-review-2026-11-10.md).
 
 Each test names the review item it covers. They run the real boot / runner / watchdog
 processes (or the classes in-process) against the fake rclone and nvidia-smi from

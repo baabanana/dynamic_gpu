@@ -1,7 +1,7 @@
 # dgpu：一条命令在按需云 GPU 上训练任意模型，用完自动销毁
 
-状态：设计已确认（2026-11-10）。4.12 AutoDL 后端、4.13 存储与凭据下发为新增草案，随[实施方案](dgpu-implementation-plan.md)一起确认
-分支：`feature/dgpu-mvp`　关联：[平台调研笔记](research/cloud-gpu-2026-11/)、[实施方案](dgpu-implementation-plan.md)
+状态：设计已确认（2026-11-10）。4.12 AutoDL 后端、4.13 存储与凭据下发为新增草案，随[实施方案](history/dgpu-implementation-plan.md)一起确认
+分支：`feature/dgpu-mvp`　关联：[平台调研笔记](research/cloud-gpu-2026-11/)、[实施方案](history/dgpu-implementation-plan.md)
 
 ## 1. 背景与问题
 
@@ -416,7 +416,7 @@ store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 
 ## 7. 实施步骤
 
-按[实施方案](dgpu-implementation-plan.md)分阶段进行：骨架与契约 → 并行开发与云上探针 → 集成与评审 → 真实环境验收 → 合入。
+按[实施方案](history/dgpu-implementation-plan.md)分阶段进行：骨架与契约 → 并行开发与云上探针 → 集成与评审 → 真实环境验收 → 合入。
 
 ## 8. 实现状态与验证记录
 
@@ -424,7 +424,7 @@ store = "r2"        # 探针 A2 之后可能改为国内对象存储 profile
 - [x] 阶段 0：骨架与契约（2026-11-10，`make check`：19 个测试通过；`layout.py`、`states.py` 在 Python 3.9 下可导入）
 - [ ] 探针 P1–P4、A1–A5
 - [x] 工作包 A–G（2026-11-10 合并）
-- [ ] 集成与评审：接缝已修复；本地端到端测试 `tests/test_integration_e2e.py` 通过（真实的编排、bundle、bootstrap、runner、watchdog，存储和平台是本地替身，未接触真实平台）；第一轮评审（A、B）和第二轮复核（F1–F9）的问题已在本地修复并配回归测试，见[评审清单](dgpu-review-2026-11-10.md)，均未在真实平台验证
+- [ ] 集成与评审：接缝已修复；本地端到端测试 `tests/test_integration_e2e.py` 通过（真实的编排、bundle、bootstrap、runner、watchdog，存储和平台是本地替身，未接触真实平台）；第一轮评审（A、B）和第二轮复核（F1–F9）的问题已在本地修复并配回归测试，见[评审清单](history/dgpu-review-2026-11-10.md)，均未在真实平台验证
 - [ ] 真实环境验证（Vast E1–E5，AutoDL E1、E3）
 
 ### 真实平台验证记录

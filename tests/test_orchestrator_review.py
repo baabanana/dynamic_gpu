@@ -1,4 +1,4 @@
-"""评审（docs/dgpu-review-2026-11-10.md）A 节每一条的回归测试，以及“需要真实平台确认的怀疑”
+"""评审（docs/history/dgpu-review-2026-11-10.md）A 节每一条的回归测试，以及“需要真实平台确认的怀疑”
 里能在本地防住的部分。每个测试在修复之前都会失败。
 
 runner 和平台由 test_orchestrator_support.World 模拟，时间由注入的 sleep 推进。

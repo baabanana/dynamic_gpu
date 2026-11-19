@@ -1,4 +1,4 @@
-"""第二轮复核（docs/dgpu-review-2026-11-10.md 第 E 节）编排一侧的回归测试：F1、F3、F4、F5。
+"""第二轮复核（docs/history/dgpu-review-2026-11-10.md 第 E 节）编排一侧的回归测试：F1、F3、F4、F5。
 
 runner 和平台由 test_orchestrator_support.World 模拟，时间由注入的 sleep 推进；平台“晚一点才
 看得见”的实例用 test_orchestrator_review.LaggyBackend。每个测试在修复之前都会失败。

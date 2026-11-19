@@ -1,4 +1,5 @@
-"""Second-round review (docs/dgpu-review-2026-11-10.md, section E), instance side: F2 and F6.
+"""Second-round review (docs/history/dgpu-review-2026-11-10.md, section E), instance side:
+F2 and F6.
 
 Real runner / watchdog processes (or in-process instances) against the fake rclone of
 test_runner_fakes.py. Each test fails without its fix.
