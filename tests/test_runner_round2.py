@@ -171,3 +171,15 @@ def test_f7_fallback_reason_reaches_the_heartbeat_the_event_and_one_log_line(har
     (event,) = _events(h, states.EV_RUN_AS_ROOT)
     assert event["data"]["reason_text"] == privsep.REASON_TEXT["not_root"]
     assert h.log_text().count("训练进程没有降权") == 1
+
+
+def test_f7_training_user_reaches_the_heartbeat_before_the_next_beat(harness):
+    """The heartbeat carrying the training user is written as soon as the user is decided, not
+    on the next heartbeat tick: a job far shorter than the heartbeat interval still shows in
+    dgpu status whether the training was dropped."""
+    h = harness
+    h.prepare(run="true", heartbeat_interval_s=3600)
+    h.run_to_end()
+    assert h.status()["phase"] == states.SUCCEEDED, h.diagnostics()
+    identity = h.heartbeat().get("identity")
+    assert identity and identity["dropped"] is False and identity["reason"] == "not_root"

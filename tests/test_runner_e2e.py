@@ -53,6 +53,17 @@ def _first_heartbeat(h: Harness) -> dict:
     return h.wait_for(h.heartbeat, what="the first heartbeat")
 
 
+def _training_wrote_ckpt(h: Harness) -> dict:
+    """Wait until the training (run writes $DGPU_CKPT/c.pt first) has really started.
+
+    The first heartbeat comes before preflight and the code download, so it does not mean the
+    training is running yet; on a slow machine a signal sent right after it reaches the runner
+    before the training wrote anything, and then there is nothing to upload.
+    """
+    h.wait_for(lambda: (h.work / "ckpt" / "c.pt").exists(), what="the training to write c.pt")
+    return h.wait_for(h.child, what="the training process record")
+
+
 # ---------------------------------------------------------------- normal end
 
 
@@ -231,7 +242,7 @@ def test_cancel_flag_stops_training_and_uploads(harness):
     harness.prepare(run="echo ck > $DGPU_CKPT/c.pt; echo started; sleep 300")
     harness.start()
     harness.wait_running()
-    _first_heartbeat(harness)
+    _training_wrote_ckpt(harness)
     harness.set_attempt(cancel=True)
     harness.wait_done()
     assert harness.status()["phase"] == states.CANCELLED, harness.diagnostics()
@@ -348,7 +359,8 @@ def test_storage_outage_during_training_keeps_training_and_catches_up(harness):
     harness.prepare(run=run)
     harness.start()
     harness.wait_running()
-    _first_heartbeat(harness)
+    # the outage has to hit the training, not the code download before it
+    harness.wait_for(lambda: (harness.work / "output" / "f1.txt").exists(), what="training")
     harness.set_offline(True)
     time.sleep(1.0)
     harness.set_offline(False)
@@ -475,8 +487,7 @@ def test_runner_killed_watchdog_syncs_reports_and_destroys(harness):
     harness.prepare(run="echo c > $DGPU_CKPT/c.pt; echo started; sleep 300")
     harness.start()
     harness.wait_running()
-    _first_heartbeat(harness)
-    child = harness.child()
+    child = _training_wrote_ckpt(harness)
     os.kill(harness.pid("runner"), signal.SIGKILL)
     harness.wait_done()
     status = harness.status()
@@ -495,8 +506,7 @@ def test_runner_sigterm_tears_down_cleanly(harness):
     harness.prepare(run="echo c > $DGPU_CKPT/c.pt; echo started; sleep 300")
     harness.start()
     harness.wait_running()
-    _first_heartbeat(harness)
-    child = harness.child()
+    child = _training_wrote_ckpt(harness)
     os.kill(harness.pid("runner"), signal.SIGTERM)
     harness.wait_done()
     status = harness.status()

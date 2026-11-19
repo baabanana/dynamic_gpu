@@ -711,6 +711,9 @@ def test_success_pulls_outputs_uploads_local_data_once_and_leaves_nothing(cloud,
     result = cloud.submit("e2e-ok", data=["./datasets/mydata"])
     assert result.attempt == 1 and result.phase in (states.RUNNING, states.SUCCEEDED)
     job_id = result.job_id
+    # wait 看到终态后会自己再销毁一遍还在的实例（兜底），和 runner 的自毁抢先后。先等 runner
+    # 自毁落地，再 wait：这个测试要证明的是 runner 自己销毁了实例，而不是 CLI 替它销毁
+    cloud.wait_for(lambda: cloud.backend.self_destroyed, "the runner to destroy its instance")
     assert cloud.orch.wait(job_id) == states.SUCCEEDED, cloud.diagnostics()
 
     status = cloud.status_doc(job_id)
@@ -789,6 +792,11 @@ def test_lost_instance_is_retried_and_resumes_from_checkpoint(cloud):
     cloud.wait_for(
         lambda: cloud.store.exists(layout.ckpt_prefix(job_id) + "state.json"),
         "attempt 1 to sync its checkpoint",
+    )
+    # 日志和 checkpoint 分别同步：宕机前也要等日志传上去，否则宕机时还没同步的日志本来就会丢
+    cloud.wait_for(
+        lambda: "checkpoint written" in "\n".join(_collect_logs(cloud, job_id, attempt=1)),
+        "attempt 1 to sync its log",
     )
     cloud.backend.crash_host(first)
     assert first in cloud.backend.instances  # 平台上还在（计费）

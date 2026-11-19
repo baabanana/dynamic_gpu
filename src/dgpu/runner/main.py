@@ -385,6 +385,9 @@ class Runner:
 
         self._hb_thread = None  # type: Optional[threading.Thread]
         self._hb_stop = threading.Event()
+        # 心跳文档的生成和写入串行：主线程立刻写的心跳不会被心跳线程更早生成、更晚写完的
+        # 旧文档覆盖（例如训练身份刚确定时，评审 F7）
+        self._hb_lock = threading.Lock()
         self._sync_thread = None  # type: Optional[threading.Thread]
         self._sync_stop = threading.Event()
         self._sync_fail_count = 0
@@ -789,25 +792,30 @@ class Runner:
             guard=self._may_write,
         )
 
-    def _put_heartbeat(self) -> float:
-        doc = states.new_heartbeat_doc(
-            self.job_id,
-            self.attempt,
-            self.phase,
-            self.step,
-            gpu_util=self.gpu_util,
-            last_log_at=self.sink.last_output_wall if self.sink else None,
-            synced_bytes=self.synced_bytes,
-            last_sync_at=self.last_sync_at,
-        )
-        if self.identity_summary is not None:
-            # 训练进程的身份（是否降权、没降权的原因）：dgpu status 显示（评审 F7）
-            doc["identity"] = self.identity_summary
-        data = json.dumps(doc, sort_keys=True).encode("utf-8")
-        self.rclone.rcat(
-            layout.heartbeat_key(self.job_id), data, tag="heartbeat", guard=self._may_write
-        )
-        return doc["ts"]
+    def _put_heartbeat(self, interrupt: Optional[Callable[[], bool]] = None) -> float:
+        with self._hb_lock:
+            doc = states.new_heartbeat_doc(
+                self.job_id,
+                self.attempt,
+                self.phase,
+                self.step,
+                gpu_util=self.gpu_util,
+                last_log_at=self.sink.last_output_wall if self.sink else None,
+                synced_bytes=self.synced_bytes,
+                last_sync_at=self.last_sync_at,
+            )
+            if self.identity_summary is not None:
+                # 训练进程的身份（是否降权、没降权的原因）：dgpu status 显示（评审 F7）
+                doc["identity"] = self.identity_summary
+            data = json.dumps(doc, sort_keys=True).encode("utf-8")
+            self.rclone.rcat(
+                layout.heartbeat_key(self.job_id),
+                data,
+                tag="heartbeat",
+                guard=self._may_write,
+                interrupt=interrupt,
+            )
+            return doc["ts"]
 
     def _storage_failure(self, message: str) -> StepFailed:
         """启动阶段存储不可用：记 preflight_failed（存储恢复前只留在本地队列）。"""
@@ -850,9 +858,10 @@ class Runner:
         if self.fenced.is_set() or self._hb_stop.is_set():
             return
         try:
-            self._put_heartbeat()
+            # 停止标志交给 rclone 轮询：_stop_heartbeat_thread 的 abort 可能早于 rclone 进程启动
+            self._put_heartbeat(interrupt=self._hb_stop.is_set)
         except RcloneError as exc:
-            if not exc.blocked:
+            if not exc.blocked and not self._hb_stop.is_set():  # 停止时被中止不算同步失败
                 self._note_sync_failure("heartbeat", str(exc))
 
     # ---------------------------------------------------------------- preflight
@@ -1137,6 +1146,13 @@ class Runner:
             write_json_atomic(self.paths.privsep, self.identity.to_dict())
         except OSError as exc:
             diag(COMPONENT, "cannot write privsep marker: %s" % exc)
+        # 立刻写一次带身份的心跳，不等下一个心跳周期：训练很快结束（或很快失败）时，
+        # dgpu status 也能看到训练进程是否降权。写失败只记录，心跳线程随后还会写。
+        try:
+            self._put_heartbeat()
+        except RcloneError as exc:
+            if not exc.blocked:
+                diag(COMPONENT, "heartbeat after deciding the training user failed: %s" % exc)
         self._note(self.identity.describe())
         if not self.identity.active:
             self.events.emit(

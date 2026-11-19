@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from dgpu import layout, states
 from dgpu.runner.rclone import Rclone, RcloneError
@@ -58,7 +58,9 @@ class Events:
                 if self._stop.is_set():
                     return
                 try:
-                    self.flush(block=False)
+                    # 停止标志也交给 rclone 轮询：stop_flusher 的 abort 可能早于 rclone 进程启动
+                    # （检查完 _stop 之后、Popen 之前），那时 abort 杀不到它，要靠这里收住
+                    self.flush(block=False, interrupt=self._stop.is_set)
                 except Exception as exc:  # 上传失败只记录，事件留在本地
                     diag(self.source, "event flusher error: %s" % exc)
 
@@ -109,10 +111,17 @@ class Events:
         except OSError:
             return 0
 
-    def flush(self, block: bool = False, timeout: Optional[float] = None) -> bool:
+    def flush(
+        self,
+        block: bool = False,
+        timeout: Optional[float] = None,
+        interrupt: Optional[Callable[[], bool]] = None,
+    ) -> bool:
         """上传队列里的事件。block=False 时如果另一个线程正在上传就直接返回；
-        block=True 时等锁最多 timeout 秒。"""
-        return flush_spool(self.rclone, self.job_id, self.spool_dir, self._lock, block, timeout)
+        block=True 时等锁最多 timeout 秒。interrupt() 为真时中止正在进行的上传。"""
+        return flush_spool(
+            self.rclone, self.job_id, self.spool_dir, self._lock, block, timeout, interrupt
+        )
 
 
 def flush_spool(
@@ -122,6 +131,7 @@ def flush_spool(
     lock: Optional[threading.Lock] = None,
     block: bool = True,
     timeout: Optional[float] = None,
+    interrupt: Optional[Callable[[], bool]] = None,
 ) -> bool:
     if rclone is None:
         return False
@@ -140,7 +150,13 @@ def flush_spool(
             return True
         try:
             limit = rclone.small_timeout if timeout is None else timeout
-            rclone.move_up(spool_dir, layout.events_prefix(job_id), timeout=limit, tag="events")
+            rclone.move_up(
+                spool_dir,
+                layout.events_prefix(job_id),
+                timeout=limit,
+                tag="events",
+                interrupt=interrupt,
+            )
             return True
         except RcloneError as exc:
             diag("events", "event upload failed, kept locally: %s" % exc)

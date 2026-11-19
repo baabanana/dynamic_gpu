@@ -894,6 +894,42 @@ def test_events_emit_never_waits_for_storage(harness):
     assert events.pending() == 2, "events stay spooled when the upload is aborted"
 
 
+def test_event_flusher_stops_even_when_the_abort_misses_the_upload(harness):
+    """stop_flusher's abort can land before the upload's rclone process exists (after the
+    flusher checked its stop flag, before Popen), and then kills nothing. The upload must still
+    stop promptly: the flusher hands its stop flag to rclone, which polls it."""
+    harness.add_rule("move", "", mode="hang")
+    rclone = Rclone(
+        str(harness.bin / "rclone"),
+        {
+            "endpoint": "https://x.invalid",
+            "bucket": harness.bucket,
+            "access_key_id": "k",
+            "secret_access_key": "s",
+        },
+        str(harness.work / "rclone.conf"),
+        base_env=harness.env(),
+        poll_s=0.02,
+        small_timeout=30.0,
+    )
+    rclone.abort = lambda tag=None: 0  # the abort arrives too early and misses the process
+    events = Events(
+        rclone,
+        harness.job_id,
+        1,
+        states.SRC_RUNNER,
+        str(harness.work / "spool"),
+        str(harness.work / "tmp"),
+    )
+    events.start_flusher(30.0)
+    events.emit(states.EV_DEADLINE_HIT, "deadline")
+    harness.wait_for(lambda: rclone._procs, what="the event upload to be in flight")
+    stop_started = time.monotonic()
+    events.stop_flusher(5.0)
+    assert time.monotonic() - stop_started < 3.0
+    assert events.pending() == 1, "the event stays spooled when the upload is interrupted"
+
+
 def test_login_profile_cannot_reexport_secrets_or_drop_path(harness):
     """`bash -lc`: a login profile that re-exports credentials, resets PATH and overrides a
     dgpu variable is neutralised before the training command runs."""

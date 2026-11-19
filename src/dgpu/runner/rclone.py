@@ -269,11 +269,13 @@ class Rclone:
         timeout: Optional[float] = None,
         tag: Optional[str] = None,
         guard: Optional[Callable[[], bool]] = None,
+        interrupt: Optional[Callable[[], bool]] = None,
     ) -> None:
         result = self.run(
             ["rcat", self.path(key)],
             timeout=self.small_timeout if timeout is None else timeout,
             data=data,
+            interrupt=interrupt,
             tag=tag,
             guard=guard,
         )
@@ -345,9 +347,10 @@ class Rclone:
         prefix: str,
         timeout: Optional[float] = None,
         tag: Optional[str] = None,
+        interrupt: Optional[Callable[[], bool]] = None,
     ) -> None:
         args = ["move", local_dir, self.path(prefix)]
-        self._check("move", self.run(args, timeout=timeout, tag=tag))
+        self._check("move", self.run(args, timeout=timeout, interrupt=interrupt, tag=tag))
 
     def lsjson(
         self,
